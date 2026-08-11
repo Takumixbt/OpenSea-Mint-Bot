@@ -1,0 +1,17 @@
+# Never commit real secrets, saved login sessions, or local logs.
+.env
+.env.*
+!.env.example
+session.json
+__pycache__/
+*.pyc
+*.log
+*.key
+*.pem
+dryrun.out
+dryrun.err
+
+# Radar state: follow-graph snapshots, candidate cache, offline Notion queue.
+# These are local memory, not source, and the snapshots reveal which accounts
+# you are watching.
+radar/state/
