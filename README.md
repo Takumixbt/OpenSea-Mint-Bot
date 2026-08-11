@@ -13,6 +13,22 @@ It supports:
 Use a separate wallet. Never commit or share `.env`, `PRIVATE_KEY`, or
 `session.json`.
 
+## Install the project
+
+The easiest Windows method is:
+
+1. Open this GitHub repository.
+2. Select **Code → Download ZIP**.
+3. Extract the ZIP file.
+4. Open the extracted `OpenSea-Mint-Bot` folder in PowerShell or Terminal.
+
+Git users can clone it instead:
+
+```powershell
+git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
+cd OpenSea-Mint-Bot
+```
+
 ## Quick start
 
 Open PowerShell in the repository folder, then run:

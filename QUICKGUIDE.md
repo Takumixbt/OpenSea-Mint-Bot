@@ -10,6 +10,19 @@ This project has two different routes. Pick one:
 The Python bot is the real minting route. The browser helper is only a page
 assistant and does not replace it.
 
+## Install the project
+
+1. Open the GitHub repository and select **Code → Download ZIP**.
+2. Extract the ZIP file.
+3. Open the extracted `OpenSea-Mint-Bot` folder in PowerShell or Terminal.
+
+You do not need Git for this method. If Git is already installed, you can use:
+
+```powershell
+git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
+cd OpenSea-Mint-Bot
+```
+
 ## First-time setup
 
 Open PowerShell in the repository folder and run:
