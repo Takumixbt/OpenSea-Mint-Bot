@@ -25,9 +25,11 @@ The easiest Windows method is:
 Git users can clone it instead:
 
 ```powershell
-git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
+git clone <paste-the-HTTPS-URL-from-GitHub>
 cd OpenSea-Mint-Bot
 ```
+
+Copy the HTTPS URL from the repository's **Code → Local → HTTPS** menu.
 
 ## Quick start
 

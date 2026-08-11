@@ -19,9 +19,11 @@ assistant and does not replace it.
 You do not need Git for this method. If Git is already installed, you can use:
 
 ```powershell
-git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
+git clone <paste-the-HTTPS-URL-from-GitHub>
 cd OpenSea-Mint-Bot
 ```
+
+Copy the HTTPS URL from the repository's **Code → Local → HTTPS** menu.
 
 ## First-time setup
 
