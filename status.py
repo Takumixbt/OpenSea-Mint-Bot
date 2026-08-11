@@ -176,6 +176,22 @@ def check_networks(no_network: bool):
                 address = Web3.to_checksum_address(os.environ["WALLET_ADDRESS"])
                 w3.eth.get_transaction_count(address, "pending")
                 add("OK", "Alchemy RPC", f"connected to chain {live_chain}; wallet nonce readable")
+                balance = w3.eth.get_balance(address)
+                balance_native = float(Web3.from_wei(balance, "ether"))
+                gas_ceiling = w3.to_wei(config.MAX_FEE_CAP_GWEI, "gwei") * config.GAS_LIMIT_MAX
+                conservative_required = config.MAX_MINT_VALUE_WEI + gas_ceiling
+                required_native = float(Web3.from_wei(conservative_required, "ether"))
+                if balance <= 0:
+                    add("BLOCKED", "Gas balance", "wallet has 0 native coin; fund it before a live run")
+                elif balance < conservative_required:
+                    add(
+                        "WARN",
+                        "Gas balance",
+                        f"{balance_native:.12f} native available; conservative configured ceiling is "
+                        f"{required_native:.12f} (the actual estimate may be lower)",
+                    )
+                else:
+                    add("OK", "Gas balance", f"{balance_native:.12f} native available")
     except Exception as exc:
         add("BLOCKED", "Alchemy RPC", f"read-only check failed ({type(exc).__name__})")
 

@@ -48,6 +48,10 @@ class Minter:
         self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
         return self._cached_nonce
 
+    def native_balance(self):
+        """Return the wallet's native-coin balance without signing anything."""
+        return self.w3.eth.get_balance(self.address)
+
     def _gas_fees(self):
         # Bid a tip a bit above the current going rate to jump the queue, then
         # cap the total per the config so a spike can never overpay.

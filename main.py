@@ -182,6 +182,15 @@ def main():
 
     # --- Set up the blockchain side ---
     minter = Minter(rpc_url, private_key, wallet_address, chain_id)
+    try:
+        balance = minter.native_balance()
+    except Exception as e:
+        log(f"Could not read the wallet's gas balance: {type(e).__name__}.")
+        sys.exit(1)
+    if balance <= 0:
+        log("Wallet has 0 native coin for gas. Fund it on the target chain before "
+            "starting a live run. Nothing was signed or sent.")
+        sys.exit(1)
     warmed = False
 
     # --- Wait / warm-up / fire loop ---
