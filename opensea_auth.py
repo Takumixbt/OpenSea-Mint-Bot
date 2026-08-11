@@ -19,10 +19,12 @@ from eth_account.messages import encode_defunct
 
 import config
 
-# The statement line OpenSea shows inside the signature request. If login is
-# rejected, this exact text may need to match OpenSea's current wording - the
-# README explains how to read the real one from your browser once.
-SIWE_STATEMENT = "Welcome to OpenSea! Sign to confirm you own this wallet."
+# This is the statement used by OpenSea's current website SIWE flow.
+SIWE_STATEMENT = (
+    "Click to sign in and accept the OpenSea Terms of Service "
+    "(https://opensea.io/tos) and Privacy Policy "
+    "(https://opensea.io/privacy)."
+)
 
 
 def _now_iso():
@@ -36,13 +38,14 @@ def _build_siwe_message(address, nonce, issued_at):
     # This must match the standard EIP-4361 layout byte-for-byte, because we
     # sign THIS exact text and OpenSea rebuilds the same text from the fields
     # we send it. Any difference (a missing blank line, wrong slash) breaks it.
+    signin_uri = config.opensea_signin_uri()
     return (
         f"{config.OPENSEA_DOMAIN} wants you to sign in with your Ethereum account:\n"
         f"{address}\n"
         f"\n"
         f"{SIWE_STATEMENT}\n"
         f"\n"
-        f"URI: {config.OPENSEA_URI}\n"
+        f"URI: {signin_uri}\n"
         f"Version: 1\n"
         f"Chain ID: {config.TARGET_CHAIN_ID}\n"
         f"Nonce: {nonce}\n"
@@ -117,7 +120,7 @@ def get_authenticated_client(private_key, address, force_fresh=False):
     print("No fresh session found - signing in to OpenSea with your wallet...")
 
     # Step 1: ask OpenSea for a one-time nonce.
-    nonce_resp = client.get(config.AUTH_NONCE_URL)
+    nonce_resp = client.post(config.AUTH_NONCE_URL)
     nonce_resp.raise_for_status()
     try:
         nonce = nonce_resp.json().get("nonce") or nonce_resp.json().get("data", {}).get("nonce")
@@ -137,18 +140,21 @@ def get_authenticated_client(private_key, address, force_fresh=False):
     if not signature.startswith("0x"):
         signature = "0x" + signature
 
-    # Step 3: send the PARSED fields (not the raw signed string) plus the
-    # signature. OpenSea's verify endpoint rebuilds the message from these
-    # fields itself, and also wants chainArch/connectorId describing the wallet.
+    # Step 3: send the PARSED message fields (not the raw signed string) plus
+    # the signature. This is the shape used by OpenSea's current website; the
+    # endpoint rebuilds the signed message from the nested message object.
     payload = {
-        "domain": config.OPENSEA_DOMAIN,
-        "address": lower_address,
-        "statement": SIWE_STATEMENT,
-        "uri": config.OPENSEA_URI,
-        "version": "1",
-        "chainId": config.TARGET_CHAIN_ID,
-        "nonce": nonce,
-        "issuedAt": issued_at,
+        "message": {
+            "domain": config.OPENSEA_DOMAIN,
+            "address": lower_address,
+            "statement": SIWE_STATEMENT,
+            "uri": config.opensea_signin_uri(),
+            "version": "1",
+            "chainId": str(config.TARGET_CHAIN_ID),
+            "nonce": nonce,
+            "issuedAt": issued_at,
+            "accountType": "Ethereum",
+        },
         "signature": signature,
         "chainArch": "EVM",
         "connectorId": "injected",

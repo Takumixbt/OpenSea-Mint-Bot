@@ -144,7 +144,7 @@ except (InvalidOperation, ValueError):
 
 
 # ---------------------------------------------------------------------------
-# OPENSEA ENDPOINTS AND HEADERS  (verified live 2026-07-18)
+# OPENSEA ENDPOINTS AND HEADERS  (verified live 2026-08-11)
 # ---------------------------------------------------------------------------
 # recon_check.py re-checks that these are still what OpenSea uses. If OpenSea
 # changes something, recon_check.py will tell you which line here to update.
@@ -153,16 +153,26 @@ except (InvalidOperation, ValueError):
 # (The public api.opensea.io one does NOT expose the mint calldata.)
 GQL_ENDPOINT = "https://gql.opensea.io/graphql"
 
-# The login/auth endpoints (Sign-In-With-Ethereum). These are best-guess paths
-# based on the article + live recon; if login fails, see the README section
-# "If login stops working" for how to read the real paths from your browser.
-AUTH_NONCE_URL = "https://gql.opensea.io/auth/siwe/nonce"
-AUTH_VERIFY_URL = "https://gql.opensea.io/auth/siwe/verify"
+# The website currently sends SIWE login requests to its same-origin internal
+# API. The old gql.opensea.io/auth/* route returns 404 and must not be used.
+AUTH_NONCE_URL = "https://opensea.io/__api/auth/siwe/nonce"
+AUTH_VERIFY_URL = "https://opensea.io/__api/auth/siwe/verify"
 
 # The website OpenSea's SIWE message is scoped to. The trailing slash matters -
 # the signed message must match byte-for-byte or OpenSea rejects the login.
 OPENSEA_DOMAIN = "opensea.io"
 OPENSEA_URI = "https://opensea.io/"
+
+
+def opensea_signin_uri():
+    """Return the OpenSea page URI used in the SIWE message."""
+    try:
+        slug = target_collection_slug()
+    except ValueError:
+        slug = None
+    if slug:
+        return f"https://opensea.io/collection/{slug}/overview"
+    return OPENSEA_URI
 
 # Extra header OpenSea requires on every GraphQL call. Without it, even a
 # correctly-logged-in request is rejected. Confirmed still present in the
