@@ -353,7 +353,11 @@ def main():
             written += 1
     log("")
     log(f"Sweep complete. {written} row(s) recorded.")
-    log(f"Watchlist: {settings.NOTION_DATABASE_URL}")
+    watchlist_url = settings.notion_database_url()
+    if watchlist_url:
+        log(f"Watchlist: {watchlist_url}")
+    else:
+        log(f"Watchlist: local board at {settings.LOCAL_BOARD_FILE}")
     log("Tick 'Armed' on anything you want minted automatically, then leave "
         "radar_watch.py running.")
 

@@ -86,10 +86,12 @@ def check_environment():
     else:
         add("INFO", "Official OpenSea API key", "not configured; the existing bot uses its internal website flow")
 
-    if filled("NOTION_TOKEN"):
-        add("OK", "Radar Notion token", "present")
+    if filled("NOTION_TOKEN") and filled("NOTION_DATABASE_ID"):
+        add("OK", "Radar Notion settings", "token and database ID are present")
+    elif filled("NOTION_TOKEN") or filled("NOTION_DATABASE_ID"):
+        add("WARN", "Radar Notion settings", "token and database ID must both be set; using the local board")
     else:
-        add("WARN", "Radar Notion token", "absent; radar will use its local offline board")
+        add("WARN", "Radar Notion settings", "not configured; radar will use its local offline board")
 
 
 def check_dependencies():

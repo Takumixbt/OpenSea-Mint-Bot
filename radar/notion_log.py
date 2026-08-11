@@ -8,9 +8,9 @@ Two-way on purpose:
 That tick is the whole safety model. Notion is the control surface: the radar
 proposes, you authorize, the executor fires.
 
-Auth uses a Notion internal integration token (NOTION_TOKEN in .env). If that
-is missing, writes go to a local queue file instead of being lost, so an
-unattended sweep never silently drops a find.
+Auth uses a Notion internal integration token and a user-owned database ID from
+.env. If either is missing, writes go to a local queue file instead of being
+lost, so an unattended sweep never silently drops a find.
 """
 
 import os
@@ -22,13 +22,12 @@ from . import settings, store
 
 API = "https://api.notion.com/v1"
 
-# The database created for this system. The MCP-side data source id lives in
-# settings; the REST API addresses the database itself.
-DATABASE_ID = "b590585246864b7999cbe767e7031853"
-
-
 def _token():
     return os.getenv("NOTION_TOKEN")
+
+
+def _database_id():
+    return settings.notion_database_id()
 
 
 def _headers():
@@ -40,7 +39,7 @@ def _headers():
 
 
 def enabled():
-    return bool(_token())
+    return bool(_token() and _database_id())
 
 
 # --- property builders ------------------------------------------------------
@@ -156,7 +155,7 @@ def upsert(candidate, log=print):
                                     headers=_headers(), json={"properties": props})
             else:
                 resp = client.post(f"{API}/pages", headers=_headers(), json={
-                    "parent": {"database_id": DATABASE_ID},
+                    "parent": {"database_id": _database_id()},
                     "properties": props,
                 })
             resp.raise_for_status()
@@ -214,7 +213,7 @@ def mark_result(page_id, result, tx_hash=None, status=None, log=print):
 
 def _query(filter_body):
     with httpx.Client(timeout=30.0) as client:
-        resp = client.post(f"{API}/databases/{DATABASE_ID}/query",
+        resp = client.post(f"{API}/databases/{_database_id()}/query",
                            headers=_headers(), json=filter_body)
         resp.raise_for_status()
         return resp.json().get("results", [])
@@ -262,10 +261,10 @@ def local_armed_rows(log=print):
     """
     Read armed rows from the offline board instead of Notion.
 
-    Getting a NOTION_TOKEN means a manual trip through notion.so/my-integrations
-    and a share step, and the executor should not be dead in the water until
-    that happens. So `radar/state/board.json` is a full stand-in: same rows,
-    same fields, and `"armed": true` means exactly what a ticked checkbox means.
+    Connecting Notion requires an integration, a database ID, and a share step,
+    and the executor should not be dead in the water until that happens. So
+    `radar/state/board.json` is a full stand-in: same rows, same fields, and
+    `"armed": true` means exactly what a ticked checkbox means.
 
     The safety model is unchanged. Nothing in this codebase writes that flag;
     scan.py writes rows with armed=false and preserves whatever is already set.
@@ -300,7 +299,7 @@ def armed_rows(log=print):
     """
     if not enabled():
         rows = local_armed_rows(log=log)
-        log(f"No NOTION_TOKEN, reading the offline board: {len(rows)} armed row(s).")
+        log(f"Notion is not configured, reading the offline board: {len(rows)} armed row(s).")
         return rows
     try:
         results = _query({
@@ -414,10 +413,10 @@ def _record_result_locally(page_id, result, tx_hash, status):
 
 def flush_queue(log=print):
     """
-    Push anything that was queued while NOTION_TOKEN was missing.
+    Push anything that was queued while Notion was not configured.
     """
     if not enabled():
-        log("Still no NOTION_TOKEN - nothing flushed.")
+        log("Notion is not configured - nothing flushed.")
         return 0
     queued = store.read_jsonl(settings.NOTION_QUEUE_FILE)
     sent = 0

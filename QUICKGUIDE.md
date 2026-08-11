@@ -12,10 +12,9 @@ assistant and does not replace it.
 
 ## First-time setup
 
-Open PowerShell and run:
+Open PowerShell in the repository folder and run:
 
 ```powershell
-cd C:\Users\Takum\free-mint-bot
 python --version
 python -m pip install -r requirements.txt
 ```

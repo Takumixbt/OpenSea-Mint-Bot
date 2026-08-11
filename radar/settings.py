@@ -202,18 +202,26 @@ INFO_FLAGS = {"clean", "no-x-account"}
 # NOTION
 # ---------------------------------------------------------------------------
 
-# The "Free Mint Radar - Robinhood Chain" database created for this system.
-NOTION_DATA_SOURCE_ID = "00ce057e-419b-45d7-8cc8-8c85e78995bb"
-NOTION_DATABASE_URL = "https://app.notion.com/p/b590585246864b7999cbe767e7031853"
+# Optional Notion settings. They are read at runtime so loading .env after this
+# module is imported still works. Leave them blank to use the local board.
+def notion_database_id():
+    return os.getenv("NOTION_DATABASE_ID", "").strip()
+
+
+def notion_database_url():
+    return os.getenv("NOTION_DATABASE_URL", "").strip()
+
+
 NOTION_VERSION = "2022-06-28"
 
-# When NOTION_TOKEN is absent from .env the radar still works: rows are appended
-# to this file instead, and can be flushed to Notion later. Never a silent loss.
+# When the Notion settings are absent from .env the radar still works: rows are
+# appended to this file instead, and can be flushed to Notion later. Never a
+# silent loss.
 NOTION_QUEUE_FILE = os.path.join(os.path.dirname(__file__), "state", "notion_queue.jsonl")
 
-# The offline mirror of the watchlist. Getting a NOTION_TOKEN requires a manual
-# trip through notion.so/my-integrations, and the executor should not be dead in
-# the water until that happens. So the board can also live here as plain JSON:
+# The offline mirror of the watchlist. Connecting Notion requires a manual
+# integration and share step, and the executor should not be dead in the water
+# until that happens. So the board can also live here as plain JSON:
 # arm a row by setting "armed": true, and the watcher treats it exactly like a
 # ticked Notion checkbox. Same safety model either way - nothing in the codebase
 # ever sets that flag, only a human does.

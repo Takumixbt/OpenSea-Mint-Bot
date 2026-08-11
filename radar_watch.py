@@ -205,9 +205,9 @@ def main():
 
     if not notion_log.enabled():
         # Not fatal. The offline board is a full stand-in for the Notion one, so
-        # the executor works before the token exists. It is only empty if no
+        # the executor works before Notion is configured. It is only empty if no
         # sweep has run yet, which is a different problem and says so.
-        log(f"No NOTION_TOKEN, using the offline board at {settings.LOCAL_BOARD_FILE}")
+        log(f"Notion is not configured, using the offline board at {settings.LOCAL_BOARD_FILE}")
         log('Arm a row there by setting "armed": true. Nothing else sets it.')
 
     log("LIVE mode: armed rows will be minted for real." if not args.dry_run

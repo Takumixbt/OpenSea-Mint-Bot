@@ -26,7 +26,8 @@
 # expect roughly (handles x 3s) plus API time per run. Never run this from a
 # VPS or datacenter IP - X limits those aggressively.
 #
-# Hand-picked by the operator, 2026-08-05. NFT/CT early movers and curators.
+# Starter list of public NFT/CT accounts. Review, replace, and maintain this
+# list for your own use.
 
 Tma_420
 BR4ted

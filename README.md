@@ -15,14 +15,20 @@ Use a separate wallet. Never commit or share `.env`, `PRIVATE_KEY`, or
 
 ## Quick start
 
-From PowerShell:
+Open PowerShell in the repository folder, then run:
 
 ```powershell
-cd C:\Users\Takum\free-mint-bot
 python -m pip install -r requirements.txt
 ```
 
-If `.env` does not exist, create it from `.env.example` and fill in:
+If `.env` does not exist, create and open it:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Fill in:
 
 ```text
 ALCHEMY_API_KEY=...
@@ -95,7 +101,7 @@ See [TAMPERMONKEY.md](TAMPERMONKEY.md).
 - `recon_check.py` — checks for OpenSea website changes
 - `opensea_mint_assist.user.js` — optional browser helper
 - `QUICKGUIDE.md` — beginner setup
-- `RADAR.md` — optional discovery/radar component
+- `RADAR.md` — optional Robinhood Chain discovery/radar component
 
 OpenSea may change its website or restrict automation. This bot does not
 guarantee a mint and should only be used where automation is permitted.
