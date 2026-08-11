@@ -1,4 +1,4 @@
-# Tampermonkey route
+# OpenSea Mint Bot — Tampermonkey helper
 
 This is an optional browser helper. It is not the Python mint bot.
 

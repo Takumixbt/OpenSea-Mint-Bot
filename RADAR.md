@@ -1,4 +1,4 @@
-# Free Mint Radar (Robinhood Chain)
+# OpenSea Mint Bot Radar
 
 Finds free mints before they are public, screens them for scams, ranks them into
 a Notion watchlist, and mints the ones you authorize.
