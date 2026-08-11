@@ -24,9 +24,21 @@ This is an optional browser helper. It is not the Python mint bot.
 7. If a visible Mint/Claim button appears, click it yourself.
 8. Review the wallet popup carefully and confirm it manually.
 
-Auto-click can be enabled only when OpenSea has authorized the automation. When
-enabled, the helper clicks at most one visible page button and immediately
-disarms. It never presses Confirm inside MetaMask or Rabby.
+## Fast mode
+
+For an opt-in fast route:
+
+1. Enable **Auto-arm on page load**.
+2. Enable **Auto-click one page button**.
+3. Keep **Require visible free/0-value evidence** enabled for free mints.
+4. Reload the OpenSea page before the drop.
+
+The helper watches the page continuously and clicks at most one matching button
+as soon as it becomes visible. It immediately disarms after the click. For a
+paid mint, disable the free-only checkbox only after verifying the price yourself.
+
+The wallet popup is still manual. Tampermonkey cannot safely sign or press
+Confirm inside MetaMask or Rabby, so the final approval remains yours.
 
 ## How to verify it is working
 

@@ -22,7 +22,8 @@
   } catch (_) {}
 
   var state = {
-    armed: false,
+    autoArm: saved.autoArm === true,
+    armed: saved.autoArm === true,
     autoClick: saved.autoClick === true,
     freeOnly: saved.freeOnly !== false,
     clicked: false,
@@ -32,11 +33,14 @@
   var panel;
   var statusLine;
   var armButton;
+  var autoArmBox;
   var autoClickBox;
   var freeOnlyBox;
+  var scanQueued = false;
 
   function savePreferences() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      autoArm: state.autoArm,
       autoClick: state.autoClick,
       freeOnly: state.freeOnly,
     }));
@@ -115,6 +119,15 @@
     candidate.click();
   }
 
+  function scheduleScan() {
+    if (scanQueued) return;
+    scanQueued = true;
+    window.requestAnimationFrame(function () {
+      scanQueued = false;
+      scan();
+    });
+  }
+
   function makePanel() {
     panel = document.createElement("section");
     panel.id = "local-opensea-mint-assist";
@@ -143,7 +156,7 @@
     controls.style.cssText = "display:flex;gap:6px;align-items:center;margin-bottom:8px";
 
     armButton = document.createElement("button");
-    armButton.textContent = "Arm once";
+    armButton.textContent = state.armed ? "Disarm" : "Arm once";
     armButton.style.cssText = "padding:6px 9px;border:0;border-radius:6px;background:#2081e2;color:white;cursor:pointer";
     armButton.addEventListener("click", function () {
       state.armed = !state.armed;
@@ -159,6 +172,24 @@
     closeButton.addEventListener("click", function () { panel.remove(); panel = null; });
     controls.appendChild(closeButton);
     panel.appendChild(controls);
+
+    var autoArmLabel = document.createElement("label");
+    autoArmBox = document.createElement("input");
+    autoArmBox.type = "checkbox";
+    autoArmBox.checked = state.autoArm;
+    autoArmBox.addEventListener("change", function () {
+      state.autoArm = autoArmBox.checked;
+      if (state.autoArm) {
+        state.armed = true;
+        state.clicked = false;
+        armButton.textContent = "Disarm";
+      }
+      savePreferences();
+      scheduleScan();
+    });
+    autoArmLabel.appendChild(autoArmBox);
+    autoArmLabel.appendChild(document.createTextNode(" Auto-arm on page load"));
+    panel.appendChild(autoArmLabel);
 
     var autoLabel = document.createElement("label");
     autoClickBox = document.createElement("input");
@@ -193,10 +224,10 @@
   function start() {
     if (!document.body) return window.setTimeout(start, 250);
     makePanel();
-    var observer = new MutationObserver(scan);
+    var observer = new MutationObserver(scheduleScan);
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-    window.setInterval(scan, 1000);
-    scan();
+    window.setInterval(scheduleScan, 250);
+    scheduleScan();
   }
 
   start();
