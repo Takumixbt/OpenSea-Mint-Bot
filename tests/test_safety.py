@@ -228,7 +228,7 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertNotIn("Alchemy", text)
         self.assertNotIn("ExtraDataLengthError", text)
         self.assertNotIn("OpenSea NFT index", text)
-        self.assertIn("1 network need", text)
+        self.assertIn("1 network needs", text)
 
     def test_single_network_wallet_screen_is_minimal(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)

@@ -1661,7 +1661,8 @@ class TelegramBot:
                 f"<b>{esc(pretty_chain(item.get('chain')))}</b>  ·  {esc(balance)}  ·  {esc(nft_text)}"
             )
         if issue_count:
-            lines.extend(["", f"⚠️ {issue_count} network{'s' if issue_count != 1 else ''} need a refresh."])
+            subject = "network needs" if issue_count == 1 else "networks need"
+            lines.extend(["", f"⚠️ {issue_count} {subject} a refresh."])
         records = snapshot.get("recent_mints") or []
         if records:
             lines.extend(["", self.render_mint_history(records, compact=True)])
