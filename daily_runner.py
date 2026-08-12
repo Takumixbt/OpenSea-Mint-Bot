@@ -718,7 +718,10 @@ class DailyMintService:
         now = time.time()
         with self.state_lock:
             cached = self.research_cache.get(cache_key)
-            if cached and now - float(cached.get("cached_at", 0)) < 300:
+            # Mint progress changes quickly after a stage opens. Keep this
+            # cache short so a research card cannot show five-minute-old
+            # supply while still avoiding duplicate requests from button taps.
+            if cached and now - float(cached.get("cached_at", 0)) < 30:
                 return dict(cached.get("value") or {})
 
         with self.scan_lock:
@@ -734,6 +737,10 @@ class DailyMintService:
                 nfts_payload = self._optional_research_call(
                     opensea_client.get_collection_nfts, client, slug, limit=3
                 )
+                try:
+                    public_drop = opensea_client.get_public_drop_info(client, slug)
+                except Exception:
+                    public_drop = {}
                 profiles = {}
                 identifiers = []
                 owner = collection.get("owner") if isinstance(collection, dict) else None
@@ -758,6 +765,7 @@ class DailyMintService:
                 client.close()
 
         collection = collection if isinstance(collection, dict) else {}
+        public_drop = public_drop if isinstance(public_drop, dict) else {}
         contracts = collection.get("contracts") or []
         contract_address = self._contract_for_chain(contracts, chain_hint)
         twitter_username = str(collection.get("twitter_username") or "").strip()
@@ -809,6 +817,12 @@ class DailyMintService:
         if not stats_currency:
             chain_settings = config.CHAIN_CONFIGS.get(research_chain) or {}
             stats_currency = str(chain_settings.get("native") or "").strip().upper()
+        live_total_supply = public_drop.get("total_supply")
+        total_supply = (
+            live_total_supply
+            if live_total_supply is not None
+            else collection.get("total_supply")
+        )
         value = {
             "slug": slug,
             "name": str(collection.get("name") or slug),
@@ -832,7 +846,9 @@ class DailyMintService:
             "safelist_status": str(collection.get("safelist_status") or ""),
             "is_disabled": bool(collection.get("is_disabled")),
             "is_nsfw": bool(collection.get("is_nsfw")),
-            "total_supply": collection.get("total_supply"),
+            "total_supply": total_supply,
+            "max_supply": public_drop.get("max_supply"),
+            "supply_source": "live_drop" if live_total_supply is not None else "collection_index",
             "unique_item_count": collection.get("unique_item_count"),
             "owner": owner_value,
             "editors": editor_values,

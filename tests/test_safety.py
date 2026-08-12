@@ -462,8 +462,8 @@ class TelegramSafetyTests(unittest.TestCase):
         )
         text = bot.render_schedule_candidate(candidate)
         self.assertIn("A &amp; &lt;carefully described&gt; collection.", text)
-        self.assertIn('<a href="https://example.com/project">🌐 Website</a>', text)
-        self.assertIn('<a href="https://x.com/example">𝕏 X</a>', text)
+        self.assertIn('<a href="https://example.com/project">Website</a>', text)
+        self.assertIn('<a href="https://x.com/example">X</a>', text)
         self.assertIn('<a href="https://basescan.org/address/0x0000000000000000000000000000000000000001">🔗 Contract</a>', text)
         self.assertIn('<a href="https://opensea.io/collection/demo-drop">Demo &amp; Drop</a>', text)
 
@@ -483,7 +483,7 @@ class TelegramSafetyTests(unittest.TestCase):
         }
         text = bot.render_research(research)
 
-        self.assertIn('<a href="https://x.com/demo">𝕏</a>', text)
+        self.assertIn('<a href="https://x.com/demo">X</a>', text)
         self.assertIn("Attributed owner", text)
         self.assertIn(
             f'<a href="https://basescan.org/address/{owner}">',
@@ -577,6 +577,68 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertIn("hmmmm #9998", text)
         self.assertNotIn("𝕏 X", text)
 
+    def test_research_report_prefers_live_mint_progress_and_marks_stale_owners(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        text = bot.render_research({
+            "name": "War Paint",
+            "total_supply": 5,
+            "max_supply": 135,
+            "stats_total": {"num_owners": 0},
+            "twitter_url": "https://x.com/OrangeHare_io",
+            "discord_url": "https://discord.gg/example",
+        })
+
+        self.assertIn("<b>Mint progress:</b> 5 / 135 minted", text)
+        self.assertIn("<b>Owners:</b> Indexing…", text)
+        self.assertIn('<a href="https://x.com/OrangeHare_io">X</a>', text)
+        self.assertIn('<a href="https://discord.gg/example">Discord</a>', text)
+        self.assertNotIn("𝕏", text)
+
+    def test_research_report_preserves_legitimate_zero_supply(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        text = bot.render_research({
+            "name": "Upcoming Drop",
+            "total_supply": 0,
+            "max_supply": 135,
+            "stats_total": {"num_owners": 0},
+        })
+
+        self.assertIn("<b>Mint progress:</b> 0 / 135 minted", text)
+        self.assertIn("<b>Owners:</b> 0", text)
+
+    def test_public_drop_info_reads_live_supply_and_schedule(self):
+        payload = {
+            "totalSupply": 5,
+            "maxSupply": 135,
+            "stages": [{
+                "stageIndex": 1,
+                "label": "Allowlist",
+                "startTime": "2026-08-12T15:00:00.000Z",
+                "endTime": "2026-08-13T15:00:00.000Z",
+                "price": {"token": {
+                    "unit": 0.0008,
+                    "contractAddress": "0x0000000000000000000000000000000000000000",
+                }},
+            }],
+        }
+
+        class Response:
+            status_code = 200
+            text = '<html>"dropBySlug":' + __import__("json").dumps(payload) + "</html>"
+
+        class Client:
+            def get(self, *args, **kwargs):
+                return Response()
+
+        info = opensea_client.get_public_drop_info(Client(), "war-paint")
+        self.assertEqual(info["total_supply"], 5)
+        self.assertEqual(info["max_supply"], 135)
+        self.assertEqual(len(info["stages"]), 1)
+        self.assertEqual(
+            opensea_client.get_public_drop_schedule(Client(), "war-paint"),
+            info["stages"],
+        )
+
     def test_candidate_menu_has_info_and_image_actions_with_safe_callbacks(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         keyboard = bot.candidate_detail_keyboard(1, CANDIDATE)
@@ -645,6 +707,43 @@ class TelegramSafetyTests(unittest.TestCase):
 
 
 class DailyRunnerSafetyTests(unittest.TestCase):
+    def test_research_collection_overrides_stale_index_supply_with_live_drop(self):
+        original_root = daily_runner.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daily_runner.ROOT = Path(temp_dir)
+                service = DailyMintService(
+                    "alchemy",
+                    "private",
+                    "0x0000000000000000000000000000000000000001",
+                    "opensea",
+                )
+                with (
+                    patch.object(
+                        opensea_client,
+                        "get_collection_details",
+                        return_value={"name": "War Paint", "total_supply": 0},
+                    ),
+                    patch.object(
+                        opensea_client,
+                        "get_public_drop_info",
+                        return_value={"total_supply": 5, "max_supply": 135, "stages": []},
+                    ),
+                    patch.object(
+                        service,
+                        "_optional_research_call",
+                        return_value={},
+                    ),
+                ):
+                    research = service.research_collection("war-paint", chain_hint="ethereum")
+
+                self.assertEqual(research["total_supply"], 5)
+                self.assertEqual(research["max_supply"], 135)
+                self.assertEqual(research["supply_source"], "live_drop")
+                service.shutdown()
+        finally:
+            daily_runner.ROOT = original_root
+
     def test_concurrent_attempts_cannot_execute_the_same_candidate_twice(self):
         original_root = daily_runner.ROOT
         try:

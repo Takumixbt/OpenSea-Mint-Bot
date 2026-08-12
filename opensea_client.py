@@ -495,8 +495,8 @@ def get_drop_schedule(client, slug, api_key):
     return info["name"], info["stages"]
 
 
-def get_public_drop_schedule(client, slug):
-    """Read all public mint stages embedded in an OpenSea collection page.
+def get_public_drop_info(client, slug):
+    """Read live drop supply and stages embedded in an OpenSea collection page.
 
     This is a read-only fallback for discovery when OpenSea's documented
     per-drop detail endpoint is temporarily unavailable. The official API
@@ -517,14 +517,16 @@ def get_public_drop_schedule(client, slug):
     marker = '"dropBySlug":'
     position = text.find(marker)
     if position < 0:
-        return []
+        return {}
     try:
         payload, _ = json.JSONDecoder().raw_decode(text, position + len(marker))
     except (TypeError, ValueError, json.JSONDecodeError):
-        return []
+        return {}
+    if not isinstance(payload, dict):
+        return {}
     raw_stages = payload.get("stages") if isinstance(payload, dict) else []
     if not isinstance(raw_stages, list):
-        return []
+        raw_stages = []
     stages = []
     for position, stage in enumerate(raw_stages):
         if not isinstance(stage, dict):
@@ -546,7 +548,26 @@ def get_public_drop_schedule(client, slug):
             "maxPerWallet": stage.get("maxTotalMintableByWallet"),
             "uuid": stage.get("uuid"),
         })
-    return stages
+    return {
+        "stages": stages,
+        # Preserve zero as a real value. ``or`` would incorrectly replace a
+        # legitimate pre-mint supply of zero with an older fallback value.
+        "total_supply": (
+            payload.get("totalSupply")
+            if payload.get("totalSupply") is not None
+            else payload.get("total_supply")
+        ),
+        "max_supply": (
+            payload.get("maxSupply")
+            if payload.get("maxSupply") is not None
+            else payload.get("max_supply")
+        ),
+    }
+
+
+def get_public_drop_schedule(client, slug):
+    """Return live public mint stages embedded in an OpenSea collection page."""
+    return get_public_drop_info(client, slug).get("stages") or []
 
 
 def get_mint_calldata(client, slug, stage_index, quantity, address, api_key):

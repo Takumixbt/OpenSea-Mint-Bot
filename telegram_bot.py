@@ -2303,11 +2303,11 @@ class TelegramBot:
         """Render safe embedded links with readable Telegram labels."""
         links = []
         for label, key in (
-            ("🌐 Website", "project_url"),
-            ("𝕏 X", "twitter_url"),
-            ("💬 Discord", "discord_url"),
-            ("✈️ Telegram", "telegram_url"),
-            ("📚 Wiki", "wiki_url"),
+            ("Website", "project_url"),
+            ("X", "twitter_url"),
+            ("Discord", "discord_url"),
+            ("Telegram", "telegram_url"),
+            ("Wiki", "wiki_url"),
         ):
             href = safe_http_url(candidate.get(key))
             if href:
@@ -2564,7 +2564,8 @@ class TelegramBot:
         safelist = str(research.get("safelist_status") or "").strip()
         if safelist and safelist.lower() not in {"unknown", "not_requested"}:
             self._append_research_row(collection_rows, "Safelist", safelist.replace("_", " ").title())
-        self._append_research_row(collection_rows, "Supply", self._research_supply(research))
+        supply_label = "Mint progress" if research.get("max_supply") is not None else "Supply"
+        self._append_research_row(collection_rows, supply_label, self._research_supply(research))
         self._append_research_row(collection_rows, "Floor", self._research_floor(research), hide_zero=True)
         self._append_research_row(
             collection_rows,
@@ -2575,9 +2576,7 @@ class TelegramBot:
         self._append_research_row(
             collection_rows, "All-time sales", self._research_metric(research, "stats_total", "sales"), hide_zero=True
         )
-        self._append_research_row(
-            collection_rows, "Owners", self._research_metric(research, "stats_total", "num_owners")
-        )
+        self._append_research_row(collection_rows, "Owners", self._research_owners(research))
         one_day_volume = self._research_metric(research, "stats_one_day", "volume", currency=True)
         one_day_sales = self._research_metric(research, "stats_one_day", "sales")
         self._append_research_row(collection_rows, "24h volume", one_day_volume, hide_zero=True)
@@ -2684,8 +2683,30 @@ class TelegramBot:
 
     @staticmethod
     def _research_supply(research):
-        total = research.get("total_supply") or research.get("unique_item_count")
-        return TelegramBot._format_research_number(total, count=True) if total not in (None, "") else "Unknown"
+        total = research.get("total_supply")
+        if total is None or total == "":
+            total = research.get("unique_item_count")
+        maximum = research.get("max_supply")
+        if total in (None, "") and maximum in (None, ""):
+            return "Unknown"
+        if total not in (None, "") and maximum not in (None, ""):
+            minted = TelegramBot._format_research_number(total, count=True)
+            cap = TelegramBot._format_research_number(maximum, count=True)
+            return f"{minted} / {cap} minted"
+        value = total if total not in (None, "") else maximum
+        return TelegramBot._format_research_number(value, count=True)
+
+    @staticmethod
+    def _research_owners(research):
+        owners = TelegramBot._research_metric(research, "stats_total", "num_owners")
+        try:
+            owner_count = float(str(owners).replace(",", ""))
+            supply = float(research.get("total_supply") or 0)
+        except (TypeError, ValueError):
+            return owners
+        if owner_count == 0 and supply > 0:
+            return "Indexing…"
+        return owners
 
     @staticmethod
     def _research_floor(research):
@@ -2712,12 +2733,12 @@ class TelegramBot:
     def research_links(self, research):
         links = []
         for label, key in (
-            ("🌐 Website", "project_url"),
-            ("𝕏", "twitter_url"),
-            ("📷 Instagram", "instagram_url"),
-            ("💬 Discord", "discord_url"),
-            ("✈️ Telegram", "telegram_url"),
-            ("📚 Wiki", "wiki_url"),
+            ("Website", "project_url"),
+            ("X", "twitter_url"),
+            ("Instagram", "instagram_url"),
+            ("Discord", "discord_url"),
+            ("Telegram", "telegram_url"),
+            ("Wiki", "wiki_url"),
         ):
             href = safe_http_url(research.get(key))
             if href:
@@ -2725,7 +2746,7 @@ class TelegramBot:
         username = str(research.get("instagram_username") or "").strip()
         if username and not any("Instagram" in item for item in links):
             links.append(
-                f'<a href="https://instagram.com/{esc(username)}">📷 Instagram</a>'
+                f'<a href="https://instagram.com/{esc(username)}">Instagram</a>'
             )
         # The collection title at the top already links to OpenSea. Keep this
         # section for external project/social destinations only.
