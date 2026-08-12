@@ -49,4 +49,4 @@ current UI text or button structure may differ; use the page manually or use the
 Python bot instead.
 
 The browser must remain open for this route. The helper does not read your
-private key, API key, wallet address, or local Python session.
+private key, API key, wallet address, or Python bot credentials.

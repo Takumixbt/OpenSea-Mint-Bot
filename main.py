@@ -1,17 +1,16 @@
 """
 The bot. Run it like this:
 
-    python main.py --dry-run     (safe: does everything EXCEPT send the tx)
     python main.py               (real: actually sends the mint transaction)
 
 What it does, in order:
-  1. Log in to OpenSea with your wallet (or reuse a saved session).
-  2. Read the drop's schedule and find when your chosen stage opens.
+  1. Read the drop's schedule from OpenSea's documented Drops API.
+  2. Find when your chosen stage opens.
   3. Wait, printing a countdown.
   4. At 5 seconds before open, "warm up" (open connections, pre-fetch nonce).
-  5. At 1.5 seconds before open, hammer OpenSea for the real mint calldata.
-  6. The instant valid calldata arrives, build + sign the transaction and send
-     it (or, in --dry-run, print exactly what it WOULD send and stop).
+  5. At the opening, ask OpenSea's supported Drops API for ready-to-sign mint data.
+  6. Verify its exact mint value against the selected stage and price cap,
+     then build, sign, and send the transaction.
   7. Wait for the transaction to confirm and report success or failure.
 """
 
@@ -20,13 +19,16 @@ import os
 import sys
 import time
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 import config
-import opensea_auth
 import opensea_client
 from minter import Minter
+
+
+ROOT = Path(__file__).resolve().parent
 
 
 def log(msg):
@@ -36,7 +38,7 @@ def log(msg):
 def redact_secrets(text):
     # Error messages from the network stack can embed the RPC url, which
     # contains the Alchemy key. Scrub every secret before anything is printed.
-    for name in ("ALCHEMY_API_KEY", "PRIVATE_KEY"):
+    for name in ("ALCHEMY_API_KEY", "PRIVATE_KEY", "OPENSEA_API_KEY"):
         value = os.getenv(name)
         if value and len(value) > 8:
             text = text.replace(value, f"<{name} hidden>")
@@ -45,27 +47,21 @@ def redact_secrets(text):
     return text
 
 
-def looks_like_auth_failure(exc):
-    import httpx
-    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
-        return True
-    msg = str(exc).lower()
-    return any(word in msg for word in ("unauthorized", "unauthenticated", "forbidden", "not logged in"))
-
-
 def load_env():
-    load_dotenv()
+    load_dotenv(ROOT / ".env")
     alchemy_key = os.getenv("ALCHEMY_API_KEY")
     key = os.getenv("PRIVATE_KEY")
     addr = os.getenv("WALLET_ADDRESS")
+    opensea_key = os.getenv("OPENSEA_API_KEY")
     missing = [n for n, v in
                [("ALCHEMY_API_KEY", alchemy_key), ("PRIVATE_KEY", key),
-                ("WALLET_ADDRESS", addr)] if not v]
+                ("WALLET_ADDRESS", addr), ("OPENSEA_API_KEY", opensea_key)]
+               if not v or "PASTE_" in v or "YOUR_" in v]
     if missing:
         print("Your .env is missing: " + ", ".join(missing))
-        print("Copy .env.example to .env and fill it in (see README steps 3-5).")
+        print("Copy .env.example to .env and fill in the four required values.")
         sys.exit(1)
-    return alchemy_key, key, addr
+    return alchemy_key, key, addr, opensea_key
 
 
 def build_rpc_url(alchemy_key, chain_id):
@@ -73,14 +69,12 @@ def build_rpc_url(alchemy_key, chain_id):
     Turns config.TARGET_CHAIN_ID into a real RPC url using the one Alchemy
     key in .env - no separate RPC url to set up per chain.
     """
-    subdomain = config.CHAIN_RPC_SUBDOMAINS.get(chain_id)
-    if not subdomain:
-        print(f"Chain ID {chain_id} isn't in config.CHAIN_RPC_SUBDOMAINS yet.")
-        print("Search \"Alchemy <chain name> RPC\", copy the subdomain from the "
-              "url it shows you, and add {chain_id}: \"that-subdomain\" to "
-              "CHAIN_RPC_SUBDOMAINS in config.py.")
+    try:
+        return config.rpc_url_for_chain(alchemy_key, chain_id)
+    except ValueError:
+        print(f"Chain ID {chain_id} is not configured in config.CHAIN_CONFIGS yet.")
+        print("Add its OpenSea chain slug, chain ID, and Alchemy RPC subdomain to config.py.")
         sys.exit(1)
-    return f"https://{subdomain}.g.alchemy.com/v2/{alchemy_key}"
 
 
 def find_target_stage(stages):
@@ -105,8 +99,11 @@ def _set_cli_price_cap(raw_value):
 
 def main():
     parser = argparse.ArgumentParser(description="OpenSea mint bot")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Run everything but do NOT send the transaction.")
+    parser.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="Required acknowledgement that this command may broadcast a real mint.",
+    )
     parser.add_argument(
         "--max-mint-price",
         metavar="NATIVE_COIN",
@@ -114,15 +111,17 @@ def main():
     )
     args = parser.parse_args()
 
+    if not args.confirm_live:
+        parser.error("live execution requires --confirm-live")
+    if os.getenv("ENABLE_LIVE_MINTS", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        parser.error("set ENABLE_LIVE_MINTS=true in .env before live execution")
+
     if args.max_mint_price is not None:
         _set_cli_price_cap(args.max_mint_price)
 
-    if args.dry_run:
-        log("DRY RUN mode: I will do everything except actually send the mint.")
-    else:
-        log("LIVE mode: I will send a real transaction if the mint opens.")
+    log("LIVE mode: I will send a real transaction if the mint opens.")
 
-    alchemy_key, private_key, wallet_address = load_env()
+    alchemy_key, private_key, wallet_address, opensea_api_key = load_env()
     chain_id = config.TARGET_CHAIN_ID
     rpc_url = build_rpc_url(alchemy_key, chain_id)
     log(f"Targeting chain ID {chain_id} via Alchemy.")
@@ -137,28 +136,21 @@ def main():
         log("Paste the OpenSea collection/drop URL into TARGET_COLLECTION_URL in config.py.")
         sys.exit(1)
 
-    # --- Log in to OpenSea ---
-    client = opensea_auth.get_authenticated_client(private_key, wallet_address)
-
-    # --- Read the schedule ---
-    # This first call doubles as the check that a reused saved session is
-    # actually still accepted; if OpenSea rejects it, log in fresh once.
+    # --- Read the schedule from OpenSea's documented API ---
+    client = opensea_client.get_api_client(opensea_api_key)
     try:
-        drop_name, stages = opensea_client.get_drop_schedule(client, slug)
+        drop_name, stages = opensea_client.get_drop_schedule(
+            client, slug, opensea_api_key)
     except Exception as e:
-        if not looks_like_auth_failure(e):
-            raise
-        log("Saved OpenSea session was rejected - signing in fresh...")
-        opensea_auth.discard_session()
+        log(f"Could not read the OpenSea drop schedule: {redact_secrets(str(e))[:300]}")
         client.close()
-        client = opensea_auth.get_authenticated_client(private_key, wallet_address,
-                                                       force_fresh=True)
-        drop_name, stages = opensea_client.get_drop_schedule(client, slug)
+        sys.exit(1)
     log(f"Found drop: {drop_name!r} with {len(stages)} stage(s):")
     for s in stages:
         when = (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['startTime']))
                 if s['startTime'] else "unknown")
-        log(f"    stage {s['stageIndex']}: opens {when}")
+        label = f" ({s['label']})" if s.get("label") else ""
+        log(f"    stage {s['stageIndex']}{label}: opens {when}")
 
     target = find_target_stage(stages)
     if not target or not target["startTime"]:
@@ -203,7 +195,8 @@ def main():
             # is fine - we keep the last known time and try again next poll.
             if seconds_left > config.WARMUP_LEAD_SECONDS + 5:
                 try:
-                    _, fresh_stages = opensea_client.get_drop_schedule(client, slug)
+                    _, fresh_stages = opensea_client.get_drop_schedule(
+                        client, slug, opensea_api_key)
                     fresh = find_target_stage(fresh_stages)
                     if fresh and fresh["startTime"] and fresh["startTime"] != open_time:
                         open_time = fresh["startTime"]
@@ -229,45 +222,59 @@ def main():
 
         time.sleep(0.05)
 
-    # --- Fire loop: hammer OpenSea for the real calldata ---
-    log("FIRING: asking OpenSea for the mint instructions (salt + signature)...")
+    # --- Fire loop: request official OpenSea mint transaction data ---
+    log("FIRING: requesting ready-to-sign mint data from OpenSea's API...")
     # If we started late (mint already open), still give ourselves the full
     # timeout window from now rather than exiting without a single attempt.
     deadline = max(open_time, time.time()) + config.FIRE_TIMEOUT_SECONDS
     calldata = None
     attempts = 0
     last_note = None
-    while time.time() < deadline:
+    while time.time() < deadline and attempts < config.FIRE_MAX_ATTEMPTS:
         attempts += 1
         calldata, note = opensea_client.get_mint_calldata(
-            client, slug, target["stageIndex"], config.MINT_QUANTITY, wallet_address)
+            client, slug, target["stageIndex"], config.MINT_QUANTITY,
+            wallet_address, opensea_api_key)
         if calldata:
             log(f"Got valid mint instructions after {attempts} attempt(s).")
             break
-        # Log each distinct reason once, not 7 times per second.
+        if note and note.startswith("STOP:"):
+            log(note[5:].strip())
+            break
+        # Log each distinct reason once so the run log stays readable.
         if note != last_note:
             log(f"    attempt {attempts}: {note} - retrying...")
             last_note = note
         time.sleep(config.FIRE_RETRY_SECONDS)
 
     if not calldata:
-        log("Never received valid mint instructions before the timeout. "
-            "The mint may not have opened, be sold out, or your wallet may not "
-            "be eligible for this stage. Nothing was sent.")
+        client.close()
+        log("No usable mint transaction was received. Nothing was signed or sent.")
+        sys.exit(1)
+
+    client.close()
+
+    # Bind the transaction to the exact stage price and quantity selected by
+    # the operator. Unknown/fractional schedule prices are refused rather than
+    # trusting a different value returned at fire time.
+    try:
+        unit_price = Decimal(str(target.get("price")))
+        if unit_price < 0 or unit_price != unit_price.to_integral_value():
+            raise ValueError
+        approved_value_wei = int(unit_price) * int(config.MINT_QUANTITY)
+    except (InvalidOperation, TypeError, ValueError):
+        log("OpenSea did not provide an exact stage price in wei. Refusing to sign or send.")
         sys.exit(1)
 
     # --- Build + sign the transaction ---
     log("Building and signing the transaction...")
     signed, summary = minter.build_transaction(
-        calldata["to"], calldata["data"], calldata["value"])
+        calldata["to"], calldata["data"], calldata["value"],
+        approved_value_wei=approved_value_wei,
+    )
     log("Transaction ready:")
     for k, v in summary.items():
         log(f"    {k}: {v}")
-
-    if args.dry_run:
-        log("DRY RUN: stopping here. Nothing was sent. The transaction above is "
-            "what I WOULD have broadcast. If it looks right, run without --dry-run.")
-        return
 
     # --- Send + confirm ---
     log("Sending the transaction to the network...")
@@ -282,7 +289,9 @@ def main():
                 "this wallet since warm-up). Refetching the nonce and retrying once...")
             minter.refresh_nonce()
             signed, summary = minter.build_transaction(
-                calldata["to"], calldata["data"], calldata["value"])
+                calldata["to"], calldata["data"], calldata["value"],
+                approved_value_wei=approved_value_wei,
+            )
             log(f"Rebuilt with nonce {summary['nonce']}.")
             tx_hash = minter.send(signed)
         else:

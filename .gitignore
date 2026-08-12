@@ -8,10 +8,8 @@ __pycache__/
 *.log
 *.key
 *.pem
-dryrun.out
-dryrun.err
+*.out
+*.err
 
-# Radar state: follow-graph snapshots, candidate cache, offline Notion queue.
-# These are local memory, not source, and the snapshots reveal which accounts
-# you are watching.
-radar/state/
+# Daily scanner state and candidate history are local runtime data.
+state/

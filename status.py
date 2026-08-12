@@ -1,24 +1,23 @@
-"""Read-only readiness report for the OpenSea mint bot.
+"""Read-only readiness report for the OpenSea Mint Bot.
 
 Run from this directory:
 
     python status.py
     python status.py --full-recon
 
-This script never signs, broadcasts, or changes wallet state. It intentionally
-prints only booleans and health facts; it never prints keys, API tokens, or the
-wallet address.
+This script never signs, broadcasts, or changes wallet state. It prints only
+health facts; it never prints keys, API tokens, or the wallet address.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib
-import json
 import os
 import subprocess
 import sys
-import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,7 +36,8 @@ def add(state: str, label: str, detail: str) -> None:
 
 def filled(name: str) -> bool:
     value = os.getenv(name, "").strip()
-    return bool(value) and "PASTE_" not in value and "YOUR_" not in value
+    upper = value.upper()
+    return bool(value) and "PASTE_" not in upper and "YOUR_" not in upper
 
 
 def check_config():
@@ -51,47 +51,72 @@ def check_config():
     if slug:
         add("OK", "Target collection", f"configured as {slug!r}")
     else:
-        add("BLOCKED", "Target collection", "paste an OpenSea collection/drop URL into config.py")
+        add("INFO", "Target collection", "not configured; use Telegram /scan or set a drop in config.py")
 
-    if config.TARGET_CHAIN_ID not in config.CHAIN_RPC_SUBDOMAINS:
-        add("BLOCKED", "Target chain", f"chain {config.TARGET_CHAIN_ID} has no RPC mapping")
+    target_chain = config.chain_slug_for_id(config.TARGET_CHAIN_ID)
+    if target_chain is None:
+        add("BLOCKED", "Target chain", f"chain {config.TARGET_CHAIN_ID} has no configured EVM RPC")
     else:
-        add("OK", "Target chain", f"chain ID {config.TARGET_CHAIN_ID}")
+        add("OK", "Target chain", f"{target_chain} (chain ID {config.TARGET_CHAIN_ID})")
 
-    if config.MINT_QUANTITY < 1:
-        add("BLOCKED", "Mint quantity", "MINT_QUANTITY must be at least 1")
+    if not isinstance(config.MINT_QUANTITY, int) or not 1 <= config.MINT_QUANTITY <= 100:
+        add("BLOCKED", "Mint quantity", "MINT_QUANTITY must be an integer from 1 through 100")
     else:
         add("OK", "Mint quantity", str(config.MINT_QUANTITY))
 
     if config.MAX_MINT_VALUE_WEI == 0:
-        add("OK", "Mint-value safety cap", "free-mint only (0 wei max)")
+        add("OK", "Mint-value safety cap", "free-mint only (0 native coin max)")
     else:
-        add(
-            "WARN",
-            "Mint-value safety cap",
-            f"paid mints allowed up to {config.MAX_MINT_PRICE_NATIVE} native coin",
-        )
+        add("WARN", "Mint-value safety cap", f"paid mints allowed up to {config.MAX_MINT_PRICE_NATIVE} native coin")
+
+    configured = config.monitored_chain_slugs()
+    unsupported = [slug for slug in configured if not config.chain_config(slug)]
+    supported = [slug for slug in configured if config.chain_config(slug)]
+    if not supported:
+        add("BLOCKED", "Daily scan chains", "MONITORED_CHAINS has no configured EVM chains")
+    elif unsupported:
+        add("WARN", "Daily scan chains", f"using {', '.join(supported)}; ignored unknown {', '.join(unsupported)}")
+    else:
+        add("OK", "Daily scan chains", ", ".join(supported))
+
+    try:
+        daily_limit = int(os.getenv("MAX_DAILY_MINTS", str(config.MAX_DAILY_MINTS)))
+        if daily_limit < 1:
+            raise ValueError
+        daily_gas = Decimal(os.getenv("MAX_DAILY_GAS_NATIVE", config.MAX_DAILY_GAS_NATIVE))
+        if daily_gas < 0 or not daily_gas.is_finite():
+            raise ValueError
+        add("OK", "Daily safety limits", f"up to {daily_limit} candidate attempts and configured gas cap")
+    except (InvalidOperation, TypeError, ValueError):
+        add("BLOCKED", "Daily safety limits", "MAX_DAILY_MINTS and MAX_DAILY_GAS_NATIVE must be valid non-negative values")
 
 
 def check_environment():
-    required = ("ALCHEMY_API_KEY", "PRIVATE_KEY", "WALLET_ADDRESS")
+    required = ("ALCHEMY_API_KEY", "PRIVATE_KEY", "WALLET_ADDRESS", "OPENSEA_API_KEY")
     missing = [name for name in required if not filled(name)]
     if missing:
         add("BLOCKED", "Required .env values", "missing or placeholder: " + ", ".join(missing))
     else:
-        add("OK", "Required .env values", "Alchemy key, private key, and wallet address are present")
+        add("OK", "Required .env values", "Alchemy key, private key, wallet address, and OpenSea API key are present")
 
     if filled("OPENSEA_API_KEY"):
         add("OK", "Official OpenSea API key", "present (not printed)")
     else:
-        add("INFO", "Official OpenSea API key", "not configured; the existing bot uses its internal website flow")
+        add("BLOCKED", "Official OpenSea API key", "required for discovery and mint-data requests")
 
-    if filled("NOTION_TOKEN") and filled("NOTION_DATABASE_ID"):
-        add("OK", "Radar Notion settings", "token and database ID are present")
-    elif filled("NOTION_TOKEN") or filled("NOTION_DATABASE_ID"):
-        add("WARN", "Radar Notion settings", "token and database ID must both be set; using the local board")
+    telegram_token = filled("TELEGRAM_BOT_TOKEN")
+    telegram_chat = filled("TELEGRAM_ALLOWED_CHAT_ID")
+    if telegram_token and telegram_chat:
+        add("OK", "Telegram control", "bot token and authorized chat ID are present")
+    elif telegram_token or telegram_chat:
+        add("WARN", "Telegram control", "set both TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_ID")
     else:
-        add("WARN", "Radar Notion settings", "not configured; radar will use its local offline board")
+        add("INFO", "Telegram control", "not configured; the CLI still works")
+
+    if os.getenv("ENABLE_LIVE_MINTS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        add("WARN", "Live switch", "enabled; use only with a funded throwaway wallet")
+    else:
+        add("OK", "Live switch", "disabled (safe default)")
 
 
 def check_dependencies():
@@ -124,117 +149,94 @@ def check_wallet_identity():
         add("BLOCKED", "Wallet identity", "PRIVATE_KEY is not a valid EVM private key")
 
 
-def check_session():
-    import config
-
-    path = ROOT / config.SESSION_FILE
-    if not path.exists():
-        add("WARN", "OpenSea session", "no saved session; the first run must complete wallet sign-in")
-        return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        saved_at = int(data.get("saved_at", 0))
-        cookies = data.get("cookies")
-        age_hours = max(0, (time.time() - saved_at) / 3600)
-        if not isinstance(cookies, dict) or not cookies:
-            add("WARN", "OpenSea session", "session file has no cookies; a fresh sign-in is required")
-            return False
-        if age_hours > 72:
-            add("WARN", "OpenSea session", f"saved session is {age_hours:.1f} hours old; refresh required")
-            return False
-        add("OK", "OpenSea session", f"saved session is {age_hours:.1f} hours old")
-        return True
-    except Exception:
-        add("WARN", "OpenSea session", "session file is unreadable; a fresh sign-in is required")
-        return False
-
-
 def check_networks(no_network: bool):
     import config
 
     if no_network:
         add("INFO", "Network checks", "skipped by --no-network")
         return
-
     if not all(filled(name) for name in ("ALCHEMY_API_KEY", "PRIVATE_KEY", "WALLET_ADDRESS")):
         add("BLOCKED", "Alchemy RPC", "skipped because required .env values are not ready")
         return
 
-    try:
-        from web3 import Web3
+    from web3 import Web3
 
-        subdomain = config.CHAIN_RPC_SUBDOMAINS[config.TARGET_CHAIN_ID]
-        rpc = f"https://{subdomain}.g.alchemy.com/v2/{os.environ['ALCHEMY_API_KEY']}"
-        w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-        if not w3.is_connected():
-            add("BLOCKED", "Alchemy RPC", "could not connect")
-        else:
+    address = Web3.to_checksum_address(os.environ["WALLET_ADDRESS"])
+    chains = [slug for slug in config.monitored_chain_slugs() if config.chain_config(slug)]
+
+    def inspect_chain(slug):
+        settings = config.chain_config(slug)
+        try:
+            rpc = config.rpc_url_for_chain(os.environ["ALCHEMY_API_KEY"], settings["chain_id"])
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 6}))
+            if not w3.is_connected():
+                return "BLOCKED", "could not connect"
             live_chain = int(w3.eth.chain_id)
-            if live_chain != config.TARGET_CHAIN_ID:
-                add("BLOCKED", "Alchemy RPC", f"connected to chain {live_chain}, expected {config.TARGET_CHAIN_ID}")
-            else:
-                address = Web3.to_checksum_address(os.environ["WALLET_ADDRESS"])
-                w3.eth.get_transaction_count(address, "pending")
-                add("OK", "Alchemy RPC", f"connected to chain {live_chain}; wallet nonce readable")
-                balance = w3.eth.get_balance(address)
-                balance_native = float(Web3.from_wei(balance, "ether"))
-                gas_ceiling = w3.to_wei(config.MAX_FEE_CAP_GWEI, "gwei") * config.GAS_LIMIT_MAX
-                conservative_required = config.MAX_MINT_VALUE_WEI + gas_ceiling
-                required_native = float(Web3.from_wei(conservative_required, "ether"))
-                if balance <= 0:
-                    add("BLOCKED", "Gas balance", "wallet has 0 native coin; fund it before a live run")
-                elif balance < conservative_required:
-                    add(
-                        "WARN",
-                        "Gas balance",
-                        f"{balance_native:.12f} native available; conservative configured ceiling is "
-                        f"{required_native:.12f} (the actual estimate may be lower)",
-                    )
-                else:
-                    add("OK", "Gas balance", f"{balance_native:.12f} native available")
-    except Exception as exc:
-        add("BLOCKED", "Alchemy RPC", f"read-only check failed ({type(exc).__name__})")
+            if live_chain != settings["chain_id"]:
+                return "BLOCKED", f"connected to chain {live_chain}, expected {settings['chain_id']}"
+            w3.eth.get_transaction_count(address, "pending")
+            balance = w3.eth.get_balance(address)
+            balance_native = Decimal(balance) / Decimal(10 ** 18)
+            gas_ceiling = (
+                Decimal(config.MAX_FEE_CAP_GWEI)
+                * Decimal(config.GAS_LIMIT_MAX)
+                / Decimal(10 ** 9)
+            )
+            if balance <= 0:
+                return "WARN", f"connected; wallet has 0 {settings['native']} for gas"
+            if balance_native < gas_ceiling:
+                return (
+                    "WARN",
+                    f"connected; balance {balance_native:.12f} {settings['native']} is below "
+                    f"the configured worst-case gas envelope {gas_ceiling} {settings['native']}",
+                )
+            return "OK", f"connected; balance {balance_native:.12f} {settings['native']}"
+        except Exception as exc:
+            return "BLOCKED", f"read-only check failed ({type(exc).__name__})"
 
+    checked = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(chains) or 1)) as executor:
+        futures = {executor.submit(inspect_chain, slug): slug for slug in chains}
+        for future in as_completed(futures):
+            checked[futures[future]] = future.result()
+    for slug in chains:
+        state, detail = checked[slug]
+        add(state, f"RPC {slug}", detail)
+
+
+def check_official_opensea_api():
+    """Check the API key and configured target-drop route without minting."""
+    import config
+
+    if not filled("OPENSEA_API_KEY"):
+        return
     try:
         import httpx
 
-        response = httpx.post(
-            config.GQL_ENDPOINT,
+        response = httpx.get(
+            f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/drops",
             headers={
-                "content-type": "application/json",
+                "accept": "application/json",
                 "user-agent": config.USER_AGENT,
-                "x-app-id": config.APP_ID_HEADER,
+                "x-api-key": os.environ["OPENSEA_API_KEY"],
             },
-            json={"query": "query{__typename}"},
+            params={"type": "upcoming", "limit": 1, "chains": "ethereum"},
             timeout=15,
         )
-        body = response.json()
-        if response.status_code < 500 and isinstance(body, dict) and ("data" in body or "errors" in body):
-            add("OK", "OpenSea GraphQL endpoint", f"responded with HTTP {response.status_code}")
+        if response.status_code == 200 and isinstance(response.json(), dict):
+            add("OK", "OpenSea Drops API", "API key accepted and discovery route is readable")
+        elif response.status_code in (401, 403):
+            add("BLOCKED", "OpenSea Drops API", f"API key rejected (HTTP {response.status_code})")
+        elif response.status_code == 429:
+            add("WARN", "OpenSea Drops API", "rate limited (HTTP 429); try again later")
         else:
-            add("BLOCKED", "OpenSea GraphQL endpoint", f"unexpected HTTP {response.status_code} response")
+            add("BLOCKED", "OpenSea Drops API", f"unexpected HTTP {response.status_code} response")
     except Exception as exc:
-        add("BLOCKED", "OpenSea GraphQL endpoint", f"read-only check failed ({type(exc).__name__})")
-
-
-def check_radar():
-    path = ROOT / "radar" / "state" / "board.json"
-    if not path.exists():
-        add("INFO", "Radar board", "no local board found yet")
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        rows = data.get("rows") or []
-        armed = sum(1 for row in rows if row.get("armed") is True)
-        pending = sum(1 for row in rows if row.get("result") == "Pending")
-        stamp = data.get("updated_at") or "unknown"
-        add("INFO", "Radar board", f"{len(rows)} rows, {armed} armed, {pending} pending; updated {stamp}")
-    except Exception:
-        add("WARN", "Radar board", "local board is unreadable")
+        add("BLOCKED", "OpenSea Drops API", f"read-only check failed ({type(exc).__name__})")
 
 
 def run_full_recon():
-    print("\n--- full OpenSea drift check ---")
+    print("\n--- OpenSea API audit ---")
     completed = subprocess.run(
         [sys.executable, str(ROOT / "recon_check.py")],
         cwd=ROOT,
@@ -247,43 +249,47 @@ def run_full_recon():
     if completed.stderr:
         print(completed.stderr, end="", file=sys.stderr)
     if completed.returncode == 0:
-        add("OK", "Full OpenSea drift check", "no CHANGED/FAIL items")
+        add("OK", "OpenSea API audit", "no blocking audit items")
     else:
-        add("BLOCKED", "Full OpenSea drift check", f"recon_check.py exited {completed.returncode}")
+        add("BLOCKED", "OpenSea API audit", f"recon_check.py exited {completed.returncode}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only NFT mint bot readiness report")
+    parser = argparse.ArgumentParser(description="Read-only OpenSea Mint Bot readiness report")
     parser.add_argument("--no-network", action="store_true", help="skip RPC and OpenSea endpoint checks")
-    parser.add_argument("--full-recon", action="store_true", help="also run the slower OpenSea bundle drift check")
+    parser.add_argument("--full-recon", action="store_true", help="also run the OpenSea API audit")
     args = parser.parse_args()
 
-    print(f"Mint bot status — {ROOT}")
+    print(f"OpenSea Mint Bot status — {ROOT}")
     print("Read-only checks only; no transaction is signed or broadcast.\n")
     check_config()
     check_environment()
     check_dependencies()
     check_wallet_identity()
-    session_ready = check_session()
     check_networks(args.no_network)
-    check_radar()
+    if args.no_network:
+        add("INFO", "OpenSea Drops API", "skipped by --no-network")
+    else:
+        check_official_opensea_api()
     if args.full_recon:
         run_full_recon()
 
     blocked = sum(1 for state, _, _ in results if state == "BLOCKED")
     warnings = sum(1 for state, _, _ in results if state == "WARN")
     target_ready = any(label == "Target collection" and state == "OK" for state, label, _ in results)
+    telegram_ready = filled("TELEGRAM_BOT_TOKEN") and filled("TELEGRAM_ALLOWED_CHAT_ID")
 
     print("\nSummary")
     if blocked:
         print(f"NOT READY — {blocked} blocking check(s), {warnings} warning(s).")
     elif not target_ready:
-        print("NOT READY — set TARGET_COLLECTION_URL to a real OpenSea drop first.")
-    elif not session_ready:
-        print("SETUP READY, NOT INSTANT-READY — complete one OpenSea sign-in, then dry-run the target drop.")
+        if telegram_ready:
+            print("TELEGRAM READY — set TARGET_COLLECTION_URL only if you also want the one-drop CLI.")
+        else:
+            print("CLI NOT READY — set TARGET_COLLECTION_URL to use the one-drop CLI; Telegram discovery can still scan.")
     else:
-        print("CONFIGURED — still run a dry run for the specific drop before live use.")
-    return 1 if blocked or not target_ready else 0
+        print("CONFIGURED — review the specific drop, quantity, price cap, and gas balance before live use.")
+    return 1 if blocked or (not target_ready and not telegram_ready) else 0
 
 
 if __name__ == "__main__":
