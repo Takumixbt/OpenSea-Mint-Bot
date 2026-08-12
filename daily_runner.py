@@ -332,6 +332,11 @@ class DailyMintService:
             order = {slug: index for index, slug in enumerate(chains)}
             results.sort(key=lambda item: order.get(item["chain"], 999))
         recent_mints = self.mint_history(limit=8)
+        if chain_slug:
+            recent_mints = [
+                item for item in recent_mints
+                if str(item.get("chain") or "").lower() == chain_slug
+            ]
         chain_results = {item["chain"]: item for item in results}
         for record in recent_mints:
             slug = str(record.get("slug") or "").lower()
@@ -353,6 +358,7 @@ class DailyMintService:
             "address": self.wallet_address,
             "chains": results,
             "recent_mints": recent_mints,
+            "selected_chain": chain_slug,
             "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
 

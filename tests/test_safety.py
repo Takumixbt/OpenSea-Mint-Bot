@@ -202,9 +202,10 @@ class TelegramSafetyTests(unittest.TestCase):
     def test_funding_preview_shows_balance_need_and_recheck(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         text = bot._funding_block(dict(CANDIDATE, price_wei=10**16, quantity=1))
-        self.assertIn("Estimated amount needed", text)
+        self.assertIn("Funds needed", text)
+        self.assertIn("<b>Total: 0.011 ETH</b>", text)
         self.assertIn("0.011 ETH", text)
-        self.assertIn("rechecks", text)
+        self.assertIn("Rechecked", text)
 
     def test_wallet_screen_reports_balances_nfts_and_clickable_transaction(self):
         service = FakeTelegramService()
@@ -212,8 +213,32 @@ class TelegramSafetyTests(unittest.TestCase):
         text = bot.render_wallet(service.wallet_snapshot())
         self.assertIn("0.0123 ETH", text)
         self.assertIn("2 NFTs", text)
-        self.assertIn("OpenSea sees 1 owned", text)
+        self.assertIn("1 owned", text)
         self.assertIn("https://basescan.org/tx/0xabc", text)
+
+    def test_wallet_overview_hides_provider_names_and_raw_errors(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        snapshot = FakeTelegramService().wallet_snapshot()
+        snapshot["chains"][0].update({
+            "nft_source": "Alchemy fallback",
+            "notices": ["OpenSea NFT index was unavailable; count shown from Alchemy."],
+            "errors": ["balance: ExtraDataLengthError: internal stack trace"],
+        })
+        text = bot.render_wallet(snapshot)
+        self.assertNotIn("Alchemy", text)
+        self.assertNotIn("ExtraDataLengthError", text)
+        self.assertNotIn("OpenSea NFT index", text)
+        self.assertIn("1 network need", text)
+
+    def test_single_network_wallet_screen_is_minimal(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        snapshot = FakeTelegramService().wallet_snapshot("base")
+        snapshot["selected_chain"] = "base"
+        text = bot.render_wallet(snapshot)
+        self.assertIn("<b>💼 Base</b>", text)
+        self.assertIn("<b>Balance</b>", text)
+        self.assertIn("<b>NFTs</b>", text)
+        self.assertNotIn("Tap a network", text)
 
     def test_explorer_links_cover_robinhood_transactions(self):
         self.assertEqual(

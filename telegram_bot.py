@@ -180,6 +180,21 @@ def format_native_wei(value, symbol="native"):
     return f"{text} {symbol}"
 
 
+def format_wallet_balance(value, symbol="native"):
+    """Format wallet balances for a compact Telegram dashboard."""
+    try:
+        amount = Decimal(int(value)) / Decimal(10 ** 18)
+    except (TypeError, ValueError):
+        return "Unavailable"
+    if amount == 0:
+        return f"0 {symbol}"
+    if amount < Decimal("0.000001"):
+        return f"<0.000001 {symbol}"
+    decimals = 8 if amount < Decimal("0.01") else 4
+    text = format(amount, f".{decimals}f").rstrip("0").rstrip(".")
+    return f"{text} {symbol}"
+
+
 class TelegramAPI:
     def __init__(self, token):
         self.token = token
@@ -1597,71 +1612,95 @@ class TelegramBot:
     def render_wallet(self, snapshot):
         address = str(snapshot.get("address") or "")
         account_url = f"https://opensea.io/{address}" if address else ""
-        lines = [
-            "<b>💼 Wallet</b>",
-            embedded_link(f"{address[:8]}…{address[-6:]}" if len(address) > 16 else address, account_url),
-            "",
-            "<b>Balances and NFTs</b>",
-        ]
+        short_address = f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
+        chain_items = snapshot.get("chains") or []
+        selected_chain = snapshot.get("selected_chain")
         total_nfts = 0
         all_exact = True
-        for item in snapshot.get("chains") or []:
-            balance = format_native_wei(item.get("balance_wei"), item.get("native"))
+        issue_count = 0
+        for item in chain_items:
             count = item.get("nft_count")
             if count is None:
-                nft_text = "NFT count unavailable"
                 all_exact = False
             else:
                 total_nfts += int(count)
                 capped = bool(item.get("nft_count_capped"))
                 all_exact = all_exact and not capped
-                nft_text = f"{count}{'+' if capped else ''} NFT{'s' if count != 1 else ''}"
-            lines.append(
-                f"• <b>{esc(pretty_chain(item.get('chain')))}</b> — {esc(balance)} · {esc(nft_text)}"
-                + (f" <i>({esc(item.get('nft_source'))})</i>" if item.get("nft_source") else "")
-            )
             if item.get("errors"):
-                lines.append(f"  <i>{esc('; '.join(item['errors'])[:180])}</i>")
-            elif item.get("notices"):
-                lines.append(f"  <i>{esc('; '.join(item['notices'])[:180])}</i>")
-        lines.extend([
+                issue_count += 1
+
+        if selected_chain and len(chain_items) == 1:
+            item = chain_items[0]
+            count = item.get("nft_count")
+            count_text = "Unavailable" if count is None else f"{count}{'+' if item.get('nft_count_capped') else ''}"
+            lines = [
+                f"<b>💼 {esc(pretty_chain(selected_chain))}</b>",
+                embedded_link(short_address, account_url),
+                "",
+                f"<b>Balance</b>\n{esc(format_wallet_balance(item.get('balance_wei'), item.get('native')))}",
+                "",
+                f"<b>NFTs</b>\n{esc(count_text)}",
+            ]
+            if item.get("errors"):
+                lines.extend(["", "⚠️ Some wallet data could not load. Try refreshing."])
+            records = snapshot.get("recent_mints") or []
+            if records:
+                lines.extend(["", self.render_mint_history(records, compact=True)])
+            return "\n".join(lines)
+
+        lines = [
+            "<b>💼 My wallet</b>",
+            f"{embedded_link(short_address, account_url)} · <b>{esc(total_nfts)}{'+' if not all_exact else ''} NFTs</b>",
             "",
-            f"<b>Total indexed:</b> {esc(total_nfts)}{'+' if not all_exact else ''} NFTs",
-            "<i>NFT totals use OpenSea with an Alchemy fallback and may briefly lag the blockchain.</i>",
-            "",
-            self.render_mint_history(snapshot.get("recent_mints") or [], compact=True),
-        ])
+        ]
+        for item in chain_items:
+            count = item.get("nft_count")
+            nft_text = "— NFTs" if count is None else f"{count}{'+' if item.get('nft_count_capped') else ''} NFT{'s' if count != 1 else ''}"
+            balance = format_wallet_balance(item.get("balance_wei"), item.get("native"))
+            lines.append(
+                f"<b>{esc(pretty_chain(item.get('chain')))}</b>  ·  {esc(balance)}  ·  {esc(nft_text)}"
+            )
+        if issue_count:
+            lines.extend(["", f"⚠️ {issue_count} network{'s' if issue_count != 1 else ''} need a refresh."])
+        records = snapshot.get("recent_mints") or []
+        if records:
+            lines.extend(["", self.render_mint_history(records, compact=True)])
+        lines.extend(["", "<i>Tap a network below for details.</i>"])
         return "\n".join(lines)
 
     def render_mint_history(self, records, compact=False):
-        lines = ["<b>Recent mint activity</b>"] if compact else ["<b>🧾 Mint history</b>", ""]
+        lines = ["<b>Latest mint</b>"] if compact else ["<b>🧾 Mint history</b>", ""]
         if not records:
-            lines.append("No mint attempts have been saved yet.")
+            lines.append("No mints yet.")
             return "\n".join(lines)
-        for record in records[: 5 if compact else 10]:
+        for record in records[: 1 if compact else 10]:
             status = str(record.get("status") or "unknown").lower()
             icon = {"confirmed": "✅", "sent": "⏳", "reverted": "❌", "failed": "⚠️"}.get(status, "•")
             name = short_text(record.get("name") or record.get("slug") or "Mint", 30)
             tx_hash = record.get("tx_hash")
-            tx = embedded_link("transaction", explorer_tx_url(record.get("chain"), tx_hash)) if tx_hash else "no transaction"
+            tx = embedded_link("View transaction", explorer_tx_url(record.get("chain"), tx_hash)) if tx_hash else "No transaction"
             indexed = record.get("indexed_owned_count")
             if status == "confirmed" and indexed is not None:
                 ownership = (
-                    f" · {record.get('ownership_source') or 'index'} sees {indexed} owned"
-                    if indexed else " · confirmed; NFT index not seen yet"
+                    f" · {indexed} owned"
+                    if indexed else " · NFT updating"
                 )
             else:
                 ownership = ""
             lines.append(
-                f"{icon} <b>{esc(name)}</b> · {esc(pretty_chain(record.get('chain', 'unknown')))} · {tx}{esc(ownership)}"
+                f"{icon} <b>{esc(name)}</b>\n{esc(pretty_chain(record.get('chain', 'unknown')))} · {tx}{esc(ownership)}"
             )
-        if compact and len(records) > 5:
-            lines.append("<i>Open Mint history to see more.</i>")
         return "\n".join(lines)
 
     def wallet_keyboard(self, snapshot=None):
         chains = [item.get("chain") for item in (snapshot or {}).get("chains", [])]
-        rows = [[self.button("🔄 Refresh all", "wallet"), self.button("🧾 Mint history", "wallet:mints")]]
+        selected_chain = (snapshot or {}).get("selected_chain")
+        if selected_chain:
+            return self.markup([
+                [self.button("🔄 Refresh", f"wallet:chain:{selected_chain}"), self.button("🧾 Mint history", "wallet:mints")],
+                [self.button("‹ All networks", "wallet"), self.button("🏠 Home", "home")],
+            ])
+        rows = [[self.button("🔄 Refresh", "wallet"), self.button("🧾 Mint history", "wallet:mints")]]
         for start in range(0, len(chains), 2):
             rows.append([
                 self.button(pretty_chain(chain), f"wallet:chain:{chain}")
@@ -2156,32 +2195,24 @@ class TelegramBot:
         try:
             snapshot = self.service.funding_snapshot(candidate)
         except Exception as exc:
-            return (
-                "<b>💳 Funding check:</b> unavailable\n"
-                f"<i>{esc(redact_secrets(exc))}. Live execution will run the final balance check again.</i>"
-            )
+            return "<b>💳 Funds needed</b>\n⚠️ Could not check right now. Try again."
         native = snapshot.get("native") or "native"
         estimated_ok = snapshot.get("estimated_shortfall_wei", 0) == 0
-        maximum_ok = snapshot.get("maximum_shortfall_wei", 0) == 0
-        if estimated_ok and maximum_ok:
-            verdict = "✅ Funded through the configured hard gas ceiling"
-        elif estimated_ok:
-            verdict = "🟡 Funded at current fees; below the absolute worst-case ceiling"
+        if estimated_ok:
+            verdict = "✅ Ready"
         else:
             verdict = (
-                "❌ Short by about "
+                "❌ Add about "
                 + format_native_wei(snapshot.get("estimated_shortfall_wei"), native)
-                + " at the current fee estimate"
             )
         return (
-            "<b>💳 Funding check (right now)</b>\n"
-            f"<b>Wallet:</b> {esc(format_native_wei(snapshot.get('balance_wei'), native))}\n"
-            f"<b>Mint value:</b> {esc(format_native_wei(snapshot.get('mint_value_wei'), native))}\n"
-            f"<b>Estimated gas reserve:</b> {esc(format_native_wei(snapshot.get('estimated_gas_wei'), native))}\n"
-            f"<b>Estimated amount needed:</b> {esc(format_native_wei(snapshot.get('estimated_total_wei'), native))}\n"
-            f"<b>Absolute configured ceiling:</b> {esc(format_native_wei(snapshot.get('maximum_total_wei'), native))}\n"
+            "<b>💳 Funds needed</b>\n"
+            f"Mint: {esc(format_native_wei(snapshot.get('mint_value_wei'), native))}\n"
+            f"Gas estimate: {esc(format_native_wei(snapshot.get('estimated_gas_wei'), native))}\n"
+            f"<b>Total: {esc(format_native_wei(snapshot.get('estimated_total_wei'), native))}</b>\n"
+            f"Wallet: {esc(format_native_wei(snapshot.get('balance_wei'), native))}\n"
             f"{esc(verdict)}\n"
-            "<i>The bot rechecks the live balance and exact calldata before signing.</i>"
+            "<i>Rechecked before minting.</i>"
         )
 
     def _rich_candidate(self, candidate):

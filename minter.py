@@ -10,13 +10,21 @@ The private key is used only to sign, in memory. It is never printed or saved.
 """
 
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 import config
+
+
+POA_CHAIN_IDS = {137}
 
 
 class Minter:
     def __init__(self, rpc_url, private_key, address, chain_id):
         self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
+        if int(chain_id) in POA_CHAIN_IDS:
+            # Polygon includes a longer proof-of-authority extraData field.
+            # web3.py requires this compatibility layer before reading blocks.
+            self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self._private_key = private_key
         self.address = Web3.to_checksum_address(address)
         self.chain_id = chain_id
