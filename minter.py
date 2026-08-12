@@ -22,6 +22,7 @@ class Minter:
         self.chain_id = chain_id
         self._cached_nonce = None
         self._cached_gas_fees = None
+        self.last_receipt = None
 
     def warm_up(self):
         """
@@ -55,6 +56,34 @@ class Minter:
     def native_balance(self):
         """Return the wallet's native-coin balance without signing anything."""
         return self.w3.eth.get_balance(self.address)
+
+    def funding_preview(self, mint_value_wei=0):
+        """Return a read-only funding envelope; never build, sign, or send."""
+        live_chain_id, _ = self.warm_up()
+        balance_wei = int(self.native_balance())
+        max_fee_wei, priority_fee_wei = self._gas_fees()
+        mint_value_wei = int(mint_value_wei)
+        if mint_value_wei < 0:
+            raise ValueError("mint value cannot be negative")
+        estimated_gas_wei = int(config.GAS_LIMIT_FALLBACK) * int(max_fee_wei)
+        maximum_gas_wei = int(config.GAS_LIMIT_MAX) * int(
+            self.w3.to_wei(config.MAX_FEE_CAP_GWEI, "gwei")
+        )
+        estimated_total_wei = mint_value_wei + estimated_gas_wei
+        maximum_total_wei = mint_value_wei + maximum_gas_wei
+        return {
+            "chain_id": live_chain_id,
+            "balance_wei": balance_wei,
+            "mint_value_wei": mint_value_wei,
+            "estimated_gas_wei": estimated_gas_wei,
+            "maximum_gas_wei": maximum_gas_wei,
+            "estimated_total_wei": estimated_total_wei,
+            "maximum_total_wei": maximum_total_wei,
+            "estimated_shortfall_wei": max(0, estimated_total_wei - balance_wei),
+            "maximum_shortfall_wei": max(0, maximum_total_wei - balance_wei),
+            "max_fee_per_gas_wei": int(max_fee_wei),
+            "priority_fee_per_gas_wei": int(priority_fee_wei),
+        }
 
     def _gas_fees(self, refresh=False):
         if self._cached_gas_fees is not None and not refresh:
@@ -179,4 +208,5 @@ class Minter:
         succeeded, False if it was mined but reverted, raises on timeout.
         """
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        self.last_receipt = receipt
         return receipt["status"] == 1

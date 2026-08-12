@@ -14,7 +14,7 @@ import opensea_client
 import nft_card
 from daily_runner import DailyMintService, quantity_limit, validate_quantity
 from minter import Minter
-from telegram_bot import TelegramBot
+from telegram_bot import TelegramBot, explorer_tx_url
 
 
 CANDIDATE = {
@@ -121,6 +121,44 @@ class FakeTelegramService:
     def inspect_drop(self, value):
         return [dict(self.last_candidates[0])]
 
+    def funding_snapshot(self, candidate):
+        return {
+            "native": "ETH",
+            "balance_wei": 2 * 10**16,
+            "mint_value_wei": 10**16,
+            "estimated_gas_wei": 10**15,
+            "maximum_gas_wei": 25 * 10**15,
+            "estimated_total_wei": 11 * 10**15,
+            "maximum_total_wei": 35 * 10**15,
+            "estimated_shortfall_wei": 0,
+            "maximum_shortfall_wei": 15 * 10**15,
+        }
+
+    def wallet_snapshot(self, chain_slug=None):
+        return {
+            "address": "0x0000000000000000000000000000000000000001",
+            "chains": [{
+                "chain": chain_slug or "base",
+                "native": "ETH",
+                "balance_wei": 12300000000000000,
+                "nft_count": 2,
+                "nft_count_capped": False,
+                "errors": [],
+            }],
+            "recent_mints": self.mint_history(),
+        }
+
+    def mint_history(self, limit=10):
+        return [{
+            "name": "Demo Drop",
+            "slug": "demo-drop",
+            "chain": "base",
+            "status": "confirmed",
+            "tx_hash": "0xabc",
+            "indexed_owned_count": 1,
+            "ownership_source": "OpenSea",
+        }]
+
 
 class FakeEngine:
     def __init__(self):
@@ -161,6 +199,55 @@ class FakeMintClient:
 
 
 class TelegramSafetyTests(unittest.TestCase):
+    def test_funding_preview_shows_balance_need_and_recheck(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        text = bot._funding_block(dict(CANDIDATE, price_wei=10**16, quantity=1))
+        self.assertIn("Estimated amount needed", text)
+        self.assertIn("0.011 ETH", text)
+        self.assertIn("rechecks", text)
+
+    def test_wallet_screen_reports_balances_nfts_and_clickable_transaction(self):
+        service = FakeTelegramService()
+        bot = TelegramBot(FakeAPI(), service, 123)
+        text = bot.render_wallet(service.wallet_snapshot())
+        self.assertIn("0.0123 ETH", text)
+        self.assertIn("2 NFTs", text)
+        self.assertIn("OpenSea sees 1 owned", text)
+        self.assertIn("https://basescan.org/tx/0xabc", text)
+
+    def test_explorer_links_cover_robinhood_transactions(self):
+        self.assertEqual(
+            explorer_tx_url("robinhood", "0xabc"),
+            "https://robinhoodchain.blockscout.com/tx/0xabc",
+        )
+
+    def test_settings_offer_background_accent_brand_and_preview(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        callbacks = {
+            button.get("callback_data")
+            for row in bot.settings_keyboard()["inline_keyboard"]
+            for button in row
+        }
+        self.assertTrue({"settings:bg", "settings:accent", "settings:brand", "settings:preview"} <= callbacks)
+
+    def test_confirmed_mint_sends_clickable_pnl_receipt_card(self):
+        api = FakeAPI()
+        bot = TelegramBot(api, FakeTelegramService(), 123)
+        bot.send_mint_receipt(123, {
+            "candidate": dict(CANDIDATE, quantity=1),
+            "tx_hash": "0xabc",
+            "confirmed": True,
+            "actual_gas_wei": 100000000000000,
+            "summary": {"value_wei": 0},
+            "broadcast_at": time.time(),
+        })
+        self.assertEqual(len(api.photos), 1)
+        caption = api.photos[0][1]["caption"]
+        self.assertIn("Confirmed on-chain", caption)
+        self.assertIn("https://basescan.org/tx/0xabc", caption)
+        buttons = api.photos[0][1]["reply_markup"]["inline_keyboard"]
+        self.assertTrue(any(button.get("url") == "https://basescan.org/tx/0xabc" for row in buttons for button in row))
+
     def test_scan_flow_requires_one_network_and_has_no_all_chains_button(self):
         api = FakeAPI()
         bot = TelegramBot(api, FakeTelegramService(), 123)
@@ -492,6 +579,28 @@ class TelegramSafetyTests(unittest.TestCase):
             from PIL import Image
             with Image.open(path) as image:
                 self.assertEqual(image.size, (1200, 675))
+
+    def test_mint_receipt_card_generates_with_custom_controls(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                "NFT_CARD_BACKGROUND": "",
+                "NFT_CARD_BRAND_NAME": "My NFT Desk",
+                "NFT_CARD_ACCENT_COLOR": "#FF4D8D",
+            },
+        ):
+            path = nft_card.build_mint_card(
+                dict(
+                    CANDIDATE,
+                    receipt_status="confirmed",
+                    mint_value_display="0 ETH",
+                    gas_display="0.0001 ETH",
+                    minted_at=1,
+                ),
+                {},
+                output_dir=temp_dir,
+            )
+            self.assertTrue(path.is_file())
 
     def test_mint_card_background_can_be_installed_and_reset(self):
         from PIL import Image

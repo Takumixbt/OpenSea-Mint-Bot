@@ -154,6 +154,36 @@ def get_collection_nfts(client, slug, api_key, limit=1, cursor=None):
     return nfts, payload.get("next") or payload.get("next_cursor")
 
 
+def get_account_nfts(client, chain, address, api_key, limit=200, cursor=None):
+    """Return NFTs owned by an account on one OpenSea-supported chain."""
+    if _api_key_missing(api_key):
+        raise RuntimeError("OPENSEA_API_KEY is missing or still a placeholder.")
+    chain = str(chain or "").strip().lower()
+    if not chain or not re.fullmatch(r"[a-z0-9_-]+", chain):
+        raise ValueError("the OpenSea chain slug is invalid")
+    address = str(address or "").strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
+        raise ValueError("the wallet address is invalid")
+    try:
+        limit = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit = 200
+    endpoint = (
+        f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/chain/{quote(chain, safe='-_.~')}"
+        f"/account/{address}/nfts"
+    )
+    params = {"limit": limit}
+    if cursor:
+        params["next"] = str(cursor)
+    payload = _get_json(client, endpoint, api_key, params=params)
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenSea returned an invalid account NFT response.")
+    nfts = payload.get("nfts") or payload.get("items") or payload.get("data") or []
+    if not isinstance(nfts, list):
+        raise RuntimeError("OpenSea returned an invalid account NFT list.")
+    return nfts, payload.get("next") or payload.get("next_cursor")
+
+
 def get_nft(client, chain, contract_address, identifier, api_key):
     """Return one OpenSea NFT record from a parsed asset URL."""
     if _api_key_missing(api_key):

@@ -47,6 +47,9 @@ Send `/start` for the button dashboard. Main commands:
 /schedules            inspect or cancel schedules
 /mint 1               review candidate 1 and confirm it
 /settings             price cap and mint-card background
+/wallet               balances, NFT totals, and latest mint status
+/wallet base          check one network only
+/mints                recent mint results and transaction links
 /status               runtime status
 ```
 
@@ -65,11 +68,23 @@ The scanner is chain-by-chain in Telegram and covers midnight to midnight at
 cannot guarantee it finds every mint. Paste a known collection URL into
 `/schedule` when timing matters.
 
-### Mint-card background
+### Mint cards and receipts
 
 Open **Settings → Set card background**, then send a JPG/PNG/WEBP or a direct
 image URL. The bot crops it to 1200×675 and stores it locally. **Reset card
-background** restores the built-in design.
+background** restores the built-in design. Settings also controls the accent
+color and brand name, and includes a preview button.
+
+Before a mint is confirmed, Telegram shows the exact mint value, current
+wallet balance, a current-fee gas estimate, total estimated funding needed,
+and the configured absolute ceiling. The balance and exact transaction are
+checked again immediately before signing.
+
+After a transaction is sent, the bot posts a branded mint P&L receipt with the
+mint value, actual gas when mined, total spent, a clickable chain-explorer
+link, and estimated unrealized P&L when a same-currency OpenSea floor is
+available. `/wallet` shows native balances, indexed NFT totals, and recent mint
+status. A transaction may be confirmed on-chain before the NFT index updates.
 
 ## VPS
 

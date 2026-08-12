@@ -50,7 +50,9 @@ def build_mint_card(candidate, research=None, output_dir=None):
                            fill=(5, 11, 22, 105), outline=accent, width=2)
     draw.rounded_rectangle((64, 60, CARD_WIDTH - 64, 148), radius=22,
                            fill=panel)
-    draw.text((92, 79), "NFT MINT CARD", font=_font(24, bold=True), fill=accent)
+    receipt_status = str(candidate.get("receipt_status") or "").strip().lower()
+    header = "NFT MINT P&L" if receipt_status else "NFT MINT CARD"
+    draw.text((92, 79), header, font=_font(24, bold=True), fill=accent)
     brand = os.getenv("NFT_CARD_BRAND_NAME", "OpenSea Mint Bot").strip() or "OpenSea Mint Bot"
     brand_width = _text_width(draw, brand, _font(23, bold=True))
     draw.text((CARD_WIDTH - 92 - brand_width, 82), brand,
@@ -80,20 +82,38 @@ def build_mint_card(candidate, research=None, output_dir=None):
     draw.rounded_rectangle((84, 292, 610, 590), radius=24, fill=panel)
     draw.rounded_rectangle((638, 292, CARD_WIDTH - 84, 590), radius=24, fill=panel_light)
 
-    left_fields = [
-        ("STATUS", _status(candidate)),
-        ("PRICE", str(candidate.get("price_display") or "Price unknown")),
-        ("ACCESS", str(candidate.get("access_label") or "Unknown")),
-        ("QUANTITY", str(candidate.get("quantity") or 1)),
-        ("OPENS", _time(candidate.get("start_time"))),
-    ]
-    right_fields = [
-        ("SUPPLY", _supply(candidate, research)),
-        ("FLOOR", _floor(research)),
-        ("24H VOLUME", _volume(research)),
-        ("OWNERS", _owners(research)),
-        ("CONTRACT", _short_address(research.get("contract_address") or candidate.get("contract_address"))),
-    ]
+    if receipt_status:
+        left_fields = [
+            ("STATUS", _receipt_status(candidate)),
+            ("MINT VALUE", str(candidate.get("mint_value_display") or candidate.get("price_display") or "Unknown")),
+            ("GAS ENVELOPE", str(candidate.get("gas_display") or "Unknown")),
+            ("QUANTITY", str(candidate.get("quantity") or 1)),
+            ("MINTED", _time(candidate.get("minted_at"))),
+        ]
+    else:
+        left_fields = [
+            ("STATUS", _status(candidate)),
+            ("PRICE", str(candidate.get("price_display") or "Price unknown")),
+            ("ACCESS", str(candidate.get("access_label") or "Unknown")),
+            ("QUANTITY", str(candidate.get("quantity") or 1)),
+            ("OPENS", _time(candidate.get("start_time"))),
+        ]
+    if receipt_status:
+        right_fields = [
+            ("TOTAL SPENT", str(candidate.get("spent_display") or "Unknown")),
+            ("FLOOR VALUE", str(candidate.get("floor_value_display") or "Unavailable")),
+            ("EST. P&L", str(candidate.get("pnl_display") or "Unavailable")),
+            ("FLOOR", _floor(research)),
+            ("CONTRACT", _short_address(research.get("contract_address") or candidate.get("contract_address"))),
+        ]
+    else:
+        right_fields = [
+            ("SUPPLY", _supply(candidate, research)),
+            ("FLOOR", _floor(research)),
+            ("24H VOLUME", _volume(research)),
+            ("OWNERS", _owners(research)),
+            ("CONTRACT", _short_address(research.get("contract_address") or candidate.get("contract_address"))),
+        ]
     _draw_fields(draw, left_fields, 112, 312, 53, accent, white, muted)
     _draw_fields(draw, right_fields, 666, 312, 53, accent, white, muted)
 
@@ -217,6 +237,15 @@ def _status(candidate):
         pass
     price = str(candidate.get("price_display") or "").strip()
     return "PAID MINT" if price else "CHECK PRICE"
+
+
+def _receipt_status(candidate):
+    status = str(candidate.get("receipt_status") or "").lower()
+    return {
+        "confirmed": "CONFIRMED",
+        "reverted": "REVERTED",
+        "sent": "SENT / PENDING",
+    }.get(status, status.upper() or "UNKNOWN")
 
 
 def _time(value):

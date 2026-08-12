@@ -100,6 +100,12 @@ class MintEngine:
         result["status"] = "sent"
         try:
             result["confirmed"] = minter.wait_for_confirmation(tx_hash)
+            receipt = minter.last_receipt or {}
+            gas_used = int(receipt.get("gasUsed") or 0)
+            effective_gas_price = int(receipt.get("effectiveGasPrice") or 0)
+            result["actual_gas_wei"] = gas_used * effective_gas_price
+            result["gas_used"] = gas_used
+            result["block_number"] = receipt.get("blockNumber")
         except Exception as exc:
             # The transaction hash is authoritative once send() returns. A
             # receipt timeout must not erase it or make a retry look safe.

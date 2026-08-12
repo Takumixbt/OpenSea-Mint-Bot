@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -10,11 +11,13 @@ import time
 import uuid
 
 from dotenv import load_dotenv
+import httpx
 
 import config
 import discovery
 import opensea_client
 from mint_engine import MintEngine
+from minter import Minter
 
 
 ROOT = Path(__file__).resolve().parent
@@ -101,8 +104,12 @@ class DailyMintService:
     def __init__(self, alchemy_key, private_key, wallet_address, opensea_api_key, notify=None):
         load_dotenv(ROOT / ".env")
         self.engine = MintEngine(alchemy_key, private_key, wallet_address, opensea_api_key)
+        self.alchemy_key = alchemy_key
+        self.private_key = private_key
+        self.wallet_address = wallet_address
         self.api_key = opensea_api_key
         self.notify = notify or (lambda message: print(message, flush=True))
+        self.notify_result = None
         self.state_path = ROOT / config.DAILY_STATE_FILE
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.schedule_path = ROOT / config.MINT_SCHEDULES_STATE_FILE
@@ -151,6 +158,241 @@ class DailyMintService:
     def supported_chains(self):
         """Return configured chains that have an EVM signer/RPC mapping."""
         return [slug for slug in self.configured_chains() if config.chain_config(slug)]
+
+    def funding_snapshot(self, candidate):
+        """Return the wallet balance and read-only gas envelope for one mint."""
+        candidate = dict(candidate or {})
+        chain_slug = str(candidate.get("chain") or "").lower()
+        chain = config.chain_config(chain_slug)
+        if not chain:
+            raise ValueError(f"chain '{chain_slug or 'unknown'}' has no configured RPC")
+        quantity = validate_quantity(
+            candidate, candidate.get("quantity") or config.MINT_QUANTITY
+        )
+        if candidate.get("price_wei") is None:
+            raise ValueError("mint price is unknown; refresh the OpenSea stage first")
+        mint_value_wei = int(candidate["price_wei"]) * quantity
+        minter = Minter(
+            config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
+            self.private_key,
+            self.wallet_address,
+            int(chain["chain_id"]),
+        )
+        snapshot = minter.funding_preview(mint_value_wei)
+        snapshot.update({
+            "chain": chain_slug,
+            "native": chain.get("native") or "native coin",
+            "quantity": quantity,
+        })
+        return snapshot
+
+    def wallet_snapshot(self, chain_slug=None, max_pages=5):
+        """Read native balances, OpenSea NFT counts, and recent local mint status."""
+        if chain_slug:
+            chain_slug = str(chain_slug).strip().lower()
+            if not config.chain_config(chain_slug):
+                raise ValueError(f"chain '{chain_slug}' has no configured RPC")
+            chains = [chain_slug]
+        else:
+            chains = self.supported_chains()
+        try:
+            max_pages = max(1, min(20, int(max_pages)))
+        except (TypeError, ValueError):
+            max_pages = 5
+
+        def read_chain(slug):
+            chain = config.chain_config(slug) or {}
+            entry = {
+                "chain": slug,
+                "native": chain.get("native") or "native",
+                "balance_wei": None,
+                "nft_count": None,
+                "nft_count_capped": False,
+                "samples": [],
+                "collections": {},
+                "contracts": {},
+                "nft_source": None,
+                "errors": [],
+                "notices": [],
+            }
+            try:
+                minter = Minter(
+                    config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
+                    self.private_key,
+                    self.wallet_address,
+                    int(chain["chain_id"]),
+                )
+                live_chain, _ = minter.warm_up()
+                if live_chain != int(chain["chain_id"]):
+                    raise RuntimeError("RPC chain mismatch")
+                entry["balance_wei"] = int(minter.native_balance())
+            except Exception as exc:
+                entry["errors"].append(f"balance: {type(exc).__name__}: {redact_secrets(exc)}")
+            try:
+                count = 0
+                cursor = None
+                samples = []
+                collections = {}
+                contracts = {}
+                client = opensea_client.get_api_client(self.api_key)
+                try:
+                    for _ in range(max_pages):
+                        nfts, cursor = opensea_client.get_account_nfts(
+                            client, slug, self.wallet_address, self.api_key,
+                            limit=200, cursor=cursor,
+                        )
+                        count += len(nfts)
+                        for nft in nfts:
+                            if not isinstance(nft, dict):
+                                continue
+                            collection = nft.get("collection")
+                            if isinstance(collection, dict):
+                                collection = collection.get("slug")
+                            collection = str(collection or "").strip().lower()
+                            if collection:
+                                collections[collection] = collections.get(collection, 0) + 1
+                            contract = str(nft.get("contract") or "").strip().lower()
+                            if contract:
+                                contracts[contract] = contracts.get(contract, 0) + 1
+                        if len(samples) < 3:
+                            samples.extend(nfts[: 3 - len(samples)])
+                        if not cursor:
+                            break
+                    entry["nft_count"] = count
+                    entry["nft_count_capped"] = bool(cursor)
+                    entry["samples"] = samples
+                    entry["collections"] = collections
+                    entry["contracts"] = contracts
+                    entry["nft_source"] = "OpenSea"
+                finally:
+                    client.close()
+            except Exception as exc:
+                opensea_error = f"{type(exc).__name__}: {redact_secrets(exc)}"
+                try:
+                    rpc_url = config.rpc_url_for_chain(
+                        self.alchemy_key, int(chain["chain_id"])
+                    )
+                    prefix, separator, key = rpc_url.rpartition("/v2/")
+                    if not separator or not key:
+                        raise RuntimeError("Alchemy NFT endpoint is unavailable")
+                    response = httpx.get(
+                        f"{prefix}/nft/v3/{key}/getNFTsForOwner",
+                        params={
+                            "owner": self.wallet_address,
+                            "withMetadata": "true",
+                            "pageSize": 100,
+                        },
+                        timeout=15.0,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    owned = payload.get("ownedNfts") or []
+                    total = payload.get("totalCount")
+                    if total is None or not isinstance(owned, list):
+                        raise RuntimeError("Alchemy returned an invalid NFT response")
+                    collections = {}
+                    contracts = {}
+                    for nft in owned:
+                        contract = (nft or {}).get("contract") or {}
+                        contract_address = str(contract.get("address") or "").strip().lower()
+                        if contract_address:
+                            contracts[contract_address] = contracts.get(contract_address, 0) + 1
+                        metadata = contract.get("openSeaMetadata") or {}
+                        collection = str(
+                            metadata.get("collectionSlug")
+                            or metadata.get("collectionName")
+                            or ""
+                        ).strip().lower()
+                        if collection:
+                            collections[collection] = collections.get(collection, 0) + 1
+                    entry["nft_count"] = int(total)
+                    entry["nft_count_capped"] = False
+                    entry["samples"] = owned[:3]
+                    entry["collections"] = collections
+                    entry["contracts"] = contracts
+                    entry["nft_source"] = "Alchemy fallback"
+                    entry["notices"].append(
+                        "OpenSea NFT index was unavailable; count shown from Alchemy."
+                    )
+                except Exception as fallback_exc:
+                    entry["errors"].append(
+                        f"NFTs unavailable: OpenSea {opensea_error}; "
+                        f"Alchemy {type(fallback_exc).__name__}: {redact_secrets(fallback_exc)}"
+                    )
+            return entry
+
+        results = []
+        if chains:
+            with ThreadPoolExecutor(
+                max_workers=min(6, len(chains)), thread_name_prefix="wallet-status"
+            ) as pool:
+                futures = {pool.submit(read_chain, slug): slug for slug in chains}
+                for future in as_completed(futures):
+                    results.append(future.result())
+            order = {slug: index for index, slug in enumerate(chains)}
+            results.sort(key=lambda item: order.get(item["chain"], 999))
+        recent_mints = self.mint_history(limit=8)
+        chain_results = {item["chain"]: item for item in results}
+        for record in recent_mints:
+            slug = str(record.get("slug") or "").lower()
+            contract = str(record.get("contract_address") or "").lower()
+            chain_result = chain_results.get(str(record.get("chain") or "").lower())
+            if (
+                (slug or contract) and chain_result
+                and chain_result.get("nft_count") is not None
+            ):
+                owned_count = 0
+                if contract:
+                    owned_count = int((chain_result.get("contracts") or {}).get(contract, 0))
+                if not owned_count and chain_result.get("nft_source") == "OpenSea" and slug:
+                    owned_count = int((chain_result.get("collections") or {}).get(slug, 0))
+                record["indexed_owned_count"] = owned_count
+                record["ownership_source"] = chain_result.get("nft_source")
+                record["ownership_scan_capped"] = bool(chain_result.get("nft_count_capped"))
+        return {
+            "address": self.wallet_address,
+            "chains": results,
+            "recent_mints": recent_mints,
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+
+    def mint_history(self, limit=10):
+        """Return recent local execution records without exposing any secret."""
+        records = []
+        with self.state_lock:
+            for key, item in (self._state.get("results") or {}).items():
+                record = dict(item or {})
+                record.setdefault("candidate_key", key)
+                records.append(record)
+            for schedule in self._schedules:
+                result = schedule.get("result") or {}
+                if not result and schedule.get("status") not in {"failed", "completed"}:
+                    continue
+                candidate = schedule.get("candidate") or {}
+                record = dict(result)
+                record.update({
+                    "name": candidate.get("name") or candidate.get("slug"),
+                    "slug": candidate.get("slug"),
+                    "contract_address": candidate.get("contract_address"),
+                    "chain": candidate.get("chain"),
+                    "quantity": candidate.get("quantity") or config.MINT_QUANTITY,
+                    "at": schedule.get("updated_at"),
+                    "status": result.get("status") or schedule.get("status"),
+                    "error": schedule.get("error"),
+                })
+                records.append(record)
+        records.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+        unique = []
+        seen = set()
+        for record in records:
+            identity = record.get("tx_hash") or ":".join(str(record.get(key) or "") for key in (
+                "chain", "slug", "status", "at"
+            ))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(record)
+        return unique[: max(1, int(limit))]
 
     def status_snapshot(self):
         """Return UI-safe runner facts without exposing wallet or API secrets."""
@@ -816,10 +1058,19 @@ class DailyMintService:
             return
 
         result_summary = {
-            "status": result.get("status"),
+            "status": (
+                "confirmed" if result.get("confirmed") is True
+                else "reverted" if result.get("confirmed") is False
+                else "sent" if result.get("tx_hash")
+                else result.get("status")
+            ),
             "tx_hash": result.get("tx_hash"),
             "confirmed": result.get("confirmed"),
             "launch_delay_ms": result.get("launch_delay_ms"),
+            "mint_value_wei": result.get("summary", {}).get("value_wei", 0),
+            "gas_wei": result.get("worst_case_gas_wei", 0),
+            "actual_gas_wei": result.get("actual_gas_wei"),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         with self.state_lock:
             stored = self._find_schedule_locked(schedule.get("id"))
@@ -828,7 +1079,10 @@ class DailyMintService:
                 stored["result"] = result_summary
                 stored["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 self._save_schedules()
-        self.notify(self._schedule_result_message(schedule, result))
+        if callable(self.notify_result):
+            self.notify_result(schedule, result)
+        else:
+            self.notify(self._schedule_result_message(schedule, result))
 
     def _schedule_result_message(self, schedule, result):
         candidate = schedule.get("candidate") or {}
@@ -937,7 +1191,10 @@ class DailyMintService:
             try:
                 day = self._today()
                 result = self._execute_candidate(candidate, day, scheduled_at=start)
-                self.notify(self._result_message(result))
+                if callable(self.notify_result):
+                    self.notify_result(None, result)
+                else:
+                    self.notify(self._result_message(result))
             except Exception as exc:
                 failure_day = self._today()
                 with self.state_lock:
@@ -1006,6 +1263,10 @@ class DailyMintService:
                     state = self._day_state(self._today())
                     state.setdefault("results", {})[key] = {
                         "chain": candidate.get("chain"),
+                        "name": candidate.get("name") or candidate.get("slug"),
+                        "slug": candidate.get("slug"),
+                        "contract_address": candidate.get("contract_address"),
+                        "quantity": candidate.get("quantity") or config.MINT_QUANTITY,
                         "status": "failed",
                         "error": f"{type(exc).__name__}: {redact_secrets(exc)}",
                         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1014,6 +1275,11 @@ class DailyMintService:
                 raise
             result_state = {
                 "chain": candidate.get("chain"),
+                "name": candidate.get("name") or candidate.get("slug"),
+                "slug": candidate.get("slug"),
+                "contract_address": candidate.get("contract_address"),
+                "quantity": candidate.get("quantity") or config.MINT_QUANTITY,
+                "mint_value_wei": result.get("summary", {}).get("value_wei", 0),
                 "status": (
                     "confirmed" if result.get("tx_hash") and result.get("confirmed") is True
                     else "reverted" if result.get("tx_hash") and result.get("confirmed") is False
@@ -1021,11 +1287,12 @@ class DailyMintService:
                     else result["status"]
                 ),
                 "gas_wei": result.get("worst_case_gas_wei", 0),
+                "actual_gas_wei": result.get("actual_gas_wei"),
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             if result.get("tx_hash"):
                 result_state["tx_hash"] = result["tx_hash"]
-                result_state["confirmed"] = bool(result.get("confirmed"))
+                result_state["confirmed"] = result.get("confirmed")
             with self.state_lock:
                 state = self._day_state(self._today())
                 results = state.setdefault("results", {})
