@@ -304,6 +304,16 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertFalse(any("dry" in callback.lower() for callback in callbacks))
         self.assertNotIn("dry", bot.help_text().lower())
 
+    def test_result_card_reports_measured_broadcast_delay(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        text = bot.render_result({
+            "candidate": CANDIDATE,
+            "tx_hash": "0xabc",
+            "confirmed": True,
+            "launch_delay_ms": 187,
+        })
+        self.assertIn("Broadcast delay:</b> 187 ms", text)
+
     def test_final_refresh_refuses_a_price_change_after_confirmation(self):
         service = FakeTelegramService()
         service.last_candidates = [dict(CANDIDATE, price_wei=0)]
@@ -598,6 +608,22 @@ class DailyRunnerSafetyTests(unittest.TestCase):
 
 
 class DiscoverySafetyTests(unittest.TestCase):
+    def test_high_resolution_wait_does_not_fire_early(self):
+        from mint_engine import MintEngine
+
+        target = time.time() + 0.05
+        MintEngine._wait_until(target)
+        self.assertGreaterEqual(time.time(), target)
+
+    def test_fast_retry_profile_is_bounded_and_front_loaded(self):
+        self.assertEqual(config.FIRE_MAX_ATTEMPTS, 10)
+        self.assertLessEqual(config.FIRE_RETRY_DELAYS_SECONDS[0], 0.20)
+        self.assertLess(sum(config.FIRE_RETRY_DELAYS_SECONDS[:4]), 2.0)
+        self.assertLessEqual(
+            sum(config.FIRE_RETRY_DELAYS_SECONDS[: config.FIRE_MAX_ATTEMPTS - 1]),
+            config.FIRE_TIMEOUT_SECONDS,
+        )
+
     def test_live_engine_approves_exact_total_mint_value(self):
         engine = daily_runner.MintEngine("alchemy", "private", "wallet", "opensea")
         paid = dict(CANDIDATE, price_wei=10, quantity=3)

@@ -1,5 +1,6 @@
-"""Shared mint execution used by the CLI and Telegram daily runner."""
+"""Shared low-latency mint execution used by Telegram and the CLI."""
 
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 import config
@@ -20,18 +21,46 @@ class MintEngine:
         daily_gas_used_wei=0,
         daily_gas_cap_wei=None,
         quantity=None,
+        scheduled_at=None,
     ):
         """Build, sign, and broadcast one explicitly confirmed candidate mint."""
+        prepared_at = time.time()
         chain_id = int(candidate["chain_id"])
         rpc_url = config.rpc_url_for_chain(self.alchemy_key, chain_id)
         minter = Minter(rpc_url, self.private_key, self.wallet_address, chain_id)
-        live_chain, nonce = minter.warm_up()
+        client = opensea_client.get_api_client(self.opensea_api_key)
+
+        # RPC nonce/fee/balance reads and OpenSea TLS setup are independent,
+        # so do them concurrently during the pre-launch window.
+        def warm_rpc():
+            live_chain, nonce = minter.warm_up()
+            return live_chain, nonce, minter.native_balance()
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mint-warmup") as pool:
+                rpc_future = pool.submit(warm_rpc)
+                api_future = pool.submit(
+                    opensea_client.prewarm_drop_route,
+                    client,
+                    candidate["slug"],
+                    self.opensea_api_key,
+                )
+                live_chain, nonce, balance = rpc_future.result()
+                api_future.result()
+        except Exception:
+            client.close()
+            raise
         if live_chain != chain_id:
+            client.close()
             raise RuntimeError(f"RPC chain mismatch: got {live_chain}, expected {chain_id}")
-        if minter.native_balance() <= 0:
+        if balance <= 0:
+            client.close()
             raise RuntimeError("wallet has no native coin for gas")
 
-        client = opensea_client.get_api_client(self.opensea_api_key)
+        launch_at = float(scheduled_at or 0)
+        if launch_at > time.time():
+            self._wait_until(launch_at)
+        request_started_at = time.time()
         try:
             calldata = self._request_calldata(client, candidate, quantity or config.MINT_QUANTITY)
         finally:
@@ -58,8 +87,15 @@ class MintEngine:
             "nonce": nonce,
             "summary": summary,
             "worst_case_gas_wei": worst_case_gas,
+            "prepared_at": prepared_at,
+            "request_started_at": request_started_at,
         }
         tx_hash = minter.send(signed)
+        result["broadcast_at"] = time.time()
+        if launch_at > 0:
+            result["launch_delay_ms"] = max(
+                0, round((result["broadcast_at"] - launch_at) * 1000)
+            )
         result["tx_hash"] = tx_hash
         result["status"] = "sent"
         try:
@@ -92,8 +128,26 @@ class MintEngine:
                 raise RuntimeError(note[5:].strip())
             if note != last_note:
                 last_note = note
-            time.sleep(config.FIRE_RETRY_SECONDS)
+            if attempts >= config.FIRE_MAX_ATTEMPTS:
+                break
+            delays = config.FIRE_RETRY_DELAYS_SECONDS
+            delay = delays[min(attempts - 1, len(delays) - 1)]
+            remaining = deadline - time.time()
+            if remaining > 0:
+                time.sleep(min(delay, remaining))
         raise RuntimeError("no usable mint transaction arrived before the fire timeout")
+
+    @staticmethod
+    def _wait_until(target_epoch):
+        """Wait accurately without busy-spinning for the whole warm-up window."""
+        while True:
+            remaining = float(target_epoch) - time.time()
+            if remaining <= 0:
+                return
+            if remaining > 0.10:
+                time.sleep(max(0.001, remaining - 0.05))
+            else:
+                time.sleep(min(0.005, remaining))
 
     @staticmethod
     def _approved_value(candidate, quantity):

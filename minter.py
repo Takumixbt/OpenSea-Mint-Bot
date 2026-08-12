@@ -21,6 +21,7 @@ class Minter:
         self.address = Web3.to_checksum_address(address)
         self.chain_id = chain_id
         self._cached_nonce = None
+        self._cached_gas_fees = None
 
     def warm_up(self):
         """
@@ -42,6 +43,9 @@ class Minter:
         # waiting in the pool, we take the next number after it instead of
         # colliding with it.
         self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
+        # Fetch fee data during warm-up so the critical path needs only gas
+        # estimation and the final balance guard after calldata arrives.
+        self._cached_gas_fees = self._gas_fees(refresh=True)
         return live_chain_id, self._cached_nonce
 
     def refresh_nonce(self):
@@ -52,7 +56,9 @@ class Minter:
         """Return the wallet's native-coin balance without signing anything."""
         return self.w3.eth.get_balance(self.address)
 
-    def _gas_fees(self):
+    def _gas_fees(self, refresh=False):
+        if self._cached_gas_fees is not None and not refresh:
+            return self._cached_gas_fees
         # Bid a tip a bit above the current going rate to jump the queue, then
         # cap the total per the config so a spike can never overpay.
         try:
@@ -74,7 +80,9 @@ class Minter:
             max_fee = cap
         if priority_fee > cap:
             priority_fee = cap
-        return max_fee, priority_fee
+        fees = (max_fee, priority_fee)
+        self._cached_gas_fees = fees
+        return fees
 
     def build_transaction(self, to, data, value, approved_value_wei=None):
         """
