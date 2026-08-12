@@ -87,6 +87,28 @@ def get_drop_details(client, slug, api_key):
     return _get_json(client, endpoint, api_key)
 
 
+def prewarm_drop_route(client, slug, api_key):
+    """Open the API/TLS connection shortly before launch without minting."""
+    if _api_key_missing(api_key):
+        raise RuntimeError("OPENSEA_API_KEY is missing or still a placeholder.")
+    endpoint = f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/drops/{slug}"
+    try:
+        response = client.get(
+            endpoint,
+            headers=_api_headers(api_key),
+            timeout=3.0,
+        )
+    except httpx.HTTPError:
+        # Prewarming is an optimization. The real mint request still gets its
+        # own bounded retry path if this optional connection setup times out.
+        return False
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            f"OpenSea API authentication failed (HTTP {response.status_code}); check OPENSEA_API_KEY."
+        )
+    return response.status_code == 200
+
+
 def get_collection_details(client, slug, api_key):
     """Return OpenSea collection metadata used by Telegram detail cards."""
     if _api_key_missing(api_key):

@@ -79,12 +79,12 @@ TARGET_CHAIN_ID = 8453  # Base
 
 # How often (in seconds) to re-check the drop's schedule while we wait for it
 # to get close. A slow, polite poll - we are just watching the clock here.
-SCHEDULE_POLL_SECONDS = 15
+SCHEDULE_POLL_SECONDS = 5
 
 # How many seconds BEFORE the mint opens to start "warming up": opening the
 # network connections, pre-fetching the wallet's transaction number, and
 # confirming the chain id, so none of that slow work happens during the race.
-WARMUP_LEAD_SECONDS = 5
+WARMUP_LEAD_SECONDS = 10
 
 # How many seconds BEFORE the scheduled opening to leave the warm-up loop.
 # The supported Drops API rejects early requests with HTTP 409, so the first
@@ -92,13 +92,14 @@ WARMUP_LEAD_SECONDS = 5
 # before the drop is active.
 FIRE_LEAD_SECONDS = 0.0
 
-# The supported OpenSea API is rate-limited. Retry every five seconds only for
-# temporary "not active yet" or server errors; do not hammer the endpoint.
-FIRE_RETRY_SECONDS = 5.0
+# If OpenSea activates a route a fraction of a second late, retry quickly at
+# first, then back off. This keeps the first few seconds competitive without
+# creating an unbounded request loop.
+FIRE_RETRY_DELAYS_SECONDS = (0.20, 0.35, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
 
 # Hard cap on mint-data requests in one opening window. This prevents a bad
 # schedule or an API outage from creating an unbounded request loop.
-FIRE_MAX_ATTEMPTS = 5
+FIRE_MAX_ATTEMPTS = 10
 
 # Safety stop: if the mint instructions never arrive, give up this many seconds
 # AFTER the scheduled open time instead of looping forever.
@@ -246,7 +247,7 @@ DAILY_STATE_FILE = "state/daily_mints.json"
 # does not silently discard an armed mint. The scheduler resumes armed entries
 # when the bot starts; live entries still require ENABLE_LIVE_MINTS=true.
 MINT_SCHEDULES_STATE_FILE = "state/mint_schedules.json"
-SCHEDULE_POLL_SECONDS = 15
+SCHEDULE_POLL_SECONDS = 5
 
 # Telegram uses long polling, so a VPS only needs to keep this process online.
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25

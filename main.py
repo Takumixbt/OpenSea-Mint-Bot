@@ -245,7 +245,8 @@ def main():
         if note != last_note:
             log(f"    attempt {attempts}: {note} - retrying...")
             last_note = note
-        time.sleep(config.FIRE_RETRY_SECONDS)
+        delays = config.FIRE_RETRY_DELAYS_SECONDS
+        time.sleep(delays[min(attempts - 1, len(delays) - 1)])
 
     if not calldata:
         client.close()

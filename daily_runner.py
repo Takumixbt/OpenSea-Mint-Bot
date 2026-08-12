@@ -763,24 +763,25 @@ class DailyMintService:
         self.schedule_worker.start()
 
     def _schedule_loop(self):
-        """Wait for armed one-time schedules and execute them serially."""
+        """Start warm-up before launch, then fire at the exact scheduled second."""
         while not self.schedule_stop_event.is_set():
             due = None
             next_run = None
-            now = int(time.time())
+            now = time.time()
             with self.state_lock:
                 for item in self._schedules:
                     if item.get("status") != "armed":
                         continue
                     run_at = int(item.get("run_at") or 0)
-                    if run_at <= now:
+                    warm_at = max(0, run_at - config.WARMUP_LEAD_SECONDS)
+                    if warm_at <= now:
                         item["status"] = "running"
                         item["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                         self._save_schedules()
                         due = dict(item)
                         break
-                    if next_run is None or run_at < next_run:
-                        next_run = run_at
+                    if next_run is None or warm_at < next_run:
+                        next_run = warm_at
 
             if due is not None:
                 self._run_schedule(due)
@@ -788,7 +789,7 @@ class DailyMintService:
 
             wait_seconds = config.SCHEDULE_POLL_SECONDS
             if next_run is not None:
-                wait_seconds = min(wait_seconds, max(1, next_run - int(time.time())))
+                wait_seconds = min(wait_seconds, max(0.01, next_run - time.time()))
             self.schedule_wakeup.wait(wait_seconds)
             self.schedule_wakeup.clear()
 
@@ -798,6 +799,7 @@ class DailyMintService:
             result = self._execute_candidate(
                 candidate,
                 self._today(),
+                scheduled_at=float(schedule.get("run_at") or 0),
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {redact_secrets(exc)}"
@@ -817,6 +819,7 @@ class DailyMintService:
             "status": result.get("status"),
             "tx_hash": result.get("tx_hash"),
             "confirmed": result.get("confirmed"),
+            "launch_delay_ms": result.get("launch_delay_ms"),
         }
         with self.state_lock:
             stored = self._find_schedule_locked(schedule.get("id"))
@@ -830,10 +833,14 @@ class DailyMintService:
     def _schedule_result_message(self, schedule, result):
         candidate = schedule.get("candidate") or {}
         name = candidate.get("name", candidate.get("slug", "mint"))
+        speed = (
+            f" Broadcast delay: {result['launch_delay_ms']} ms."
+            if result.get("launch_delay_ms") is not None else ""
+        )
         if result.get("tx_hash") and result.get("confirmed") is True:
-            return f"SCHEDULE LIVE: {name} confirmed. Tx: {result['tx_hash']}"
+            return f"SCHEDULE LIVE: {name} confirmed.{speed} Tx: {result['tx_hash']}"
         if result.get("tx_hash"):
-            return f"SCHEDULE LIVE: {name} was sent but did not confirm. Tx: {result['tx_hash']}"
+            return f"SCHEDULE LIVE: {name} was sent but did not confirm.{speed} Tx: {result['tx_hash']}"
         return f"SCHEDULE LIVE: {name} finished without a transaction hash."
 
     def _find_schedule_locked(self, schedule_id):
@@ -922,13 +929,14 @@ class DailyMintService:
                 self.notify("Daily mint limit reached; remaining candidates were not attempted.")
                 return
             start = int(candidate.get("start_time") or 0)
-            while start > int(time.time()) and not self.stop_event.is_set():
-                self.stop_event.wait(min(60, max(1, start - int(time.time()))))
+            warm_at = max(0, start - config.WARMUP_LEAD_SECONDS)
+            while warm_at > time.time() and not self.stop_event.is_set():
+                self.stop_event.wait(min(60, max(0.01, warm_at - time.time())))
             if self.stop_event.is_set():
                 return
             try:
                 day = self._today()
-                result = self._execute_candidate(candidate, day)
+                result = self._execute_candidate(candidate, day, scheduled_at=start)
                 self.notify(self._result_message(result))
             except Exception as exc:
                 failure_day = self._today()
@@ -960,7 +968,7 @@ class DailyMintService:
                         f"{type(exc).__name__}: {redact_secrets(exc)}"
                     )
 
-    def _execute_candidate(self, candidate, day):
+    def _execute_candidate(self, candidate, day, scheduled_at=None):
         # A manual Telegram action and the daily worker share one wallet and
         # nonce space. Serialize the complete build/send path so they cannot
         # both pass the duplicate check and race with the same nonce.
@@ -988,6 +996,7 @@ class DailyMintService:
                     quantity=validate_quantity(
                         candidate, candidate.get("quantity") or config.MINT_QUANTITY
                     ),
+                    scheduled_at=scheduled_at,
                 )
             except Exception as exc:
                 # Record every failed/uncertain execution attempt before the

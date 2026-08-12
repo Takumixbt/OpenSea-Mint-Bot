@@ -55,6 +55,11 @@ exact selected price × quantity, configured price cap, gas cap, wallet balance,
 chain ID, daily attempt limit, and OpenSea eligibility. If OpenSea returns a
 different transaction value from the Telegram preview, it refuses to sign.
 
+One-time schedules warm the RPC, nonce, fee data, balance, and OpenSea HTTPS
+connection 10 seconds before launch. The first mint-data request starts at the
+scheduled second, followed by short bounded retries if OpenSea activates late.
+Completed schedule notifications include the measured broadcast delay.
+
 The scanner is chain-by-chain in Telegram and covers midnight to midnight at
 `DISCOVERY_UTC_OFFSET_HOURS`. OpenSea's public feeds are incomplete, so a scan
 cannot guarantee it finds every mint. Paste a known collection URL into

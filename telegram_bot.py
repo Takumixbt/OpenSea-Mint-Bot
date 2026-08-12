@@ -2061,25 +2061,29 @@ class TelegramBot:
             f"\n\n{supply_block}"
             f"<b>Links:</b> {links}"
         )
+        speed = (
+            f"\n<b>Broadcast delay:</b> {esc(result['launch_delay_ms'])} ms"
+            if result.get("launch_delay_ms") is not None else ""
+        )
         if result.get("tx_hash") and result.get("confirmed") is True:
             return (
                 "<b>✅ Mint confirmed</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>"
+                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>{speed}"
                 f"{details}"
             )
         if result.get("tx_hash") and result.get("confirmed") is False:
             return (
                 "<b>❌ Mint transaction reverted</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>"
+                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>{speed}"
                 f"{details}"
             )
         if result.get("tx_hash"):
             return (
                 "<b>⏳ Transaction sent; confirmation pending</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>\n\n"
+                f"<b>Transaction:</b> <code>{esc(result['tx_hash'])}</code>{speed}\n\n"
                 "Do not retry this mint. Check the transaction in the chain explorer."
                 f"{details}"
             )
