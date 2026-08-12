@@ -2072,9 +2072,8 @@ class TelegramBot:
         if not candidates:
             text = (
                 f"{title}\n\n"
-                "<b>No mint stages opening today were found.</b>\n"
-                "The bot checked OpenSea’s drop calendars and active collections. "
-                "Try again later as new drops appear throughout the day."
+                "<b>No live or upcoming mints found today.</b>\n"
+                "Check again later, or paste a collection link into <b>Look up an NFT</b>."
             )
         else:
             free_count = sum(1 for candidate in candidates if is_free_public_candidate(candidate))
@@ -2094,17 +2093,38 @@ class TelegramBot:
                     if price not in prices:
                         prices.append(price)
                 lines.extend([
-                    f"<b>{first + offset + 1}. {esc(short_text(candidate.get('name', candidate.get('slug', 'Unknown')), 42))}</b>",
-                    f"   ⛓ {esc(pretty_chain(candidate.get('chain', 'unknown')))} · {esc(len(options))} mint {option_word}",
-                    f"   💵 {esc(' / '.join(prices[:2]))}",
-                    f"   🕒 First opens {esc(format_time(min(item.get('start_time') or 0 for _, item in options)))}",
+                    f"{first + offset + 1}. <b>{embedded_link(short_text(candidate.get('name', candidate.get('slug', 'Unknown')), 42), candidate.get('opensea_url') or candidate.get('url'))}</b>",
+                    f"   {esc(len(options))} mint {option_word} · {esc(' / '.join(prices[:2]))}",
+                    f"   {esc(self._candidate_time_summary(options))}",
                     "",
                 ])
             text = "\n".join(lines).rstrip()
-        if errors:
-            safe_errors = ", ".join(esc(error) for error in errors[:6])
-            text += f"\n\n<b>Skipped checks:</b> {safe_errors}"
+        if errors and not candidates:
+            text += "\n\n⚠️ <i>Some OpenSea data could not load. Try Refresh.</i>"
         return text
+
+    @staticmethod
+    def _candidate_time_summary(options):
+        now = int(time.time())
+        active = []
+        upcoming = []
+        for _, candidate in options:
+            start = int(candidate.get("start_time") or 0)
+            end = candidate.get("end_time")
+            try:
+                end = int(end) if end is not None else None
+            except (TypeError, ValueError):
+                end = None
+            if start <= now and (end is None or end >= now):
+                active.append(candidate)
+            elif start > now:
+                upcoming.append(candidate)
+        if active:
+            return "🟢 Live now"
+        if upcoming:
+            opens = min(item.get("start_time") or 0 for item in upcoming)
+            return f"🕒 Opens {format_time(opens)}"
+        return "Stage timing unavailable"
 
     def render_candidate(self, candidate, index):
         candidate = self._rich_candidate(candidate)

@@ -1,6 +1,8 @@
 """Small client for OpenSea's documented Drops API."""
 
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+import json
 import re
 import time
 from urllib.parse import quote, unquote, urlsplit
@@ -106,6 +108,20 @@ def prewarm_drop_route(client, slug, api_key):
         raise RuntimeError(
             f"OpenSea API authentication failed (HTTP {response.status_code}); check OPENSEA_API_KEY."
         )
+    return response.status_code == 200
+
+
+def drop_detail_route_available(client, slug, api_key):
+    """Quickly report whether the detailed drop backend is currently healthy."""
+    endpoint = f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/drops/{slug}"
+    try:
+        response = client.get(
+            endpoint,
+            headers=_api_headers(api_key),
+            timeout=3.0,
+        )
+    except httpx.HTTPError:
+        return False
     return response.status_code == 200
 
 
@@ -296,7 +312,9 @@ def list_drops(client, api_key, chain_slug, drop_type="upcoming", limit=None, cu
     requested = limit or config.DISCOVERY_LIMIT_PER_CHAIN
     requested = max(1, min(100, int(requested)))
     endpoint = f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/drops"
-    params = {"type": drop_type, "limit": requested, "chains": chain_slug}
+    params = {"type": drop_type, "limit": requested}
+    if str(chain_slug or "").strip():
+        params["chains"] = str(chain_slug).strip()
     if cursor:
         params["cursor"] = cursor
     payload = _get_json(
@@ -475,6 +493,60 @@ def get_drop_schedule(client, slug, api_key):
     """Return ``(name, stages)`` in the format used by the one-drop runner."""
     info = get_drop_info(client, slug, api_key, include_metadata=False)
     return info["name"], info["stages"]
+
+
+def get_public_drop_schedule(client, slug):
+    """Read all public mint stages embedded in an OpenSea collection page.
+
+    This is a read-only fallback for discovery when OpenSea's documented
+    per-drop detail endpoint is temporarily unavailable. The official API
+    calendar remains the source of collection/chain identity.
+    """
+    endpoint = f"https://opensea.io/collection/{quote(str(slug), safe='-_.~')}"
+    try:
+        response = client.get(
+            endpoint,
+            headers={"accept": "text/html", "user-agent": config.USER_AGENT},
+            timeout=API_REQUEST_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"OpenSea page network error ({type(exc).__name__}).") from exc
+    if response.status_code != 200:
+        raise RuntimeError(f"OpenSea collection page failed (HTTP {response.status_code}).")
+    text = response.text
+    marker = '"dropBySlug":'
+    position = text.find(marker)
+    if position < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(text, position + len(marker))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    raw_stages = payload.get("stages") if isinstance(payload, dict) else []
+    if not isinstance(raw_stages, list):
+        return []
+    stages = []
+    for position, stage in enumerate(raw_stages):
+        if not isinstance(stage, dict):
+            continue
+        token = ((stage.get("price") or {}).get("token") or {})
+        unit = token.get("unit")
+        try:
+            price_wei = int(Decimal(str(unit)) * Decimal(10 ** 18))
+        except (InvalidOperation, TypeError, ValueError):
+            price_wei = None
+        stages.append({
+            "stageIndex": stage.get("stageIndex", position),
+            "startTime": _to_epoch(stage.get("startTime")),
+            "endTime": _to_epoch(stage.get("endTime")),
+            "label": stage.get("label"),
+            "stageType": stage.get("stageType"),
+            "price": price_wei,
+            "priceCurrencyAddress": token.get("contractAddress"),
+            "maxPerWallet": stage.get("maxTotalMintableByWallet"),
+            "uuid": stage.get("uuid"),
+        })
+    return stages
 
 
 def get_mint_calldata(client, slug, stage_index, quantity, address, api_key):

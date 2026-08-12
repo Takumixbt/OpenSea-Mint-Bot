@@ -507,7 +507,52 @@ class DailyMintService:
         with self.scan_lock:
             client = opensea_client.get_api_client(self.api_key)
             try:
-                info = opensea_client.get_drop_info(client, slug, self.api_key)
+                try:
+                    info = opensea_client.get_drop_info(client, slug, self.api_key)
+                except Exception as detail_error:
+                    info = None
+                    for drop_type in config.DISCOVERY_DROP_TYPES:
+                        cursor = None
+                        seen_cursors = set()
+                        for _ in range(max(1, config.DISCOVERY_MAX_PAGES_PER_CHAIN)):
+                            cards, next_cursor = opensea_client.list_drops(
+                                client, self.api_key, "", drop_type,
+                                config.DISCOVERY_LIMIT_PER_CHAIN, cursor,
+                            )
+                            for card in cards:
+                                if str(discovery._drop_slug(card) or "").lower() != slug.lower():
+                                    continue
+                                stages = discovery._calendar_stages(card)
+                                try:
+                                    page_stages = opensea_client.get_public_drop_schedule(
+                                        client, slug
+                                    )
+                                except Exception:
+                                    page_stages = []
+                                if page_stages:
+                                    stages = page_stages
+                                chain = str(card.get("chain") or "").strip().lower()
+                                if stages and chain:
+                                    info = {
+                                        "slug": slug,
+                                        "name": discovery._drop_name(card, slug),
+                                        "chain": chain,
+                                        "contract_address": card.get("contract_address") or "",
+                                        "opensea_url": card.get("opensea_url") or f"https://opensea.io/collection/{slug}",
+                                        "metadata": discovery._calendar_metadata(card),
+                                        "stages": stages,
+                                    }
+                                    break
+                            if info or not next_cursor or str(next_cursor) in seen_cursors:
+                                break
+                            seen_cursors.add(str(next_cursor))
+                            cursor = next_cursor
+                        if info:
+                            break
+                    if not info:
+                        raise RuntimeError(
+                            "OpenSea could not load this mint right now; try again shortly"
+                        ) from detail_error
             finally:
                 client.close()
         chain = (info.get("chain") or "").strip().lower()

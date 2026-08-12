@@ -342,7 +342,8 @@ class TelegramSafetyTests(unittest.TestCase):
 
         text = bot.render_candidates(service.last_candidates, [], page=1)
         self.assertIn("Page 2 of 2", text)
-        self.assertIn("10. Demo Drop 9", text)
+        self.assertIn("10. <b><a", text)
+        self.assertIn("Demo Drop 9</a></b>", text)
 
     def test_scan_groups_multiple_mint_windows_under_one_project(self):
         service = FakeTelegramService()
@@ -997,6 +998,96 @@ class DiscoverySafetyTests(unittest.TestCase):
             sorted(item.slug for item in candidates),
             ["featured-only", "recent-only", "shared", "upcoming-only"],
         )
+
+    def test_calendar_stage_is_used_when_drop_detail_route_is_unavailable(self):
+        day_start, _, _ = config.discovery_day_bounds()
+        stage_start = max(day_start + 60, int(time.time()) + 60)
+        card = {
+            "collection_slug": "calendar-mint",
+            "collection_name": "Calendar Mint",
+            "chain": "base",
+            "contract_address": "0x0000000000000000000000000000000000000002",
+            "opensea_url": "https://opensea.io/collection/calendar-mint",
+            "active_stage": {
+                "stage_type": "public_sale",
+                "label": "Public",
+                "price": "0",
+                "start_time": datetime.fromtimestamp(
+                    stage_start, timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+                "end_time": datetime.fromtimestamp(
+                    stage_start + 3600, timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+                "max_per_wallet": "2",
+            },
+        }
+        with patch.object(
+            discovery.opensea_client, "list_drops", return_value=([card], None)
+        ), patch.object(
+            discovery.opensea_client,
+            "get_drop_schedule",
+            side_effect=RuntimeError("OpenSea detail backend unavailable"),
+        ), patch.object(
+            discovery.opensea_client, "get_public_drop_schedule", return_value=[]
+        ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
+            config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
+        ):
+            candidates, errors = discovery.discover_mints(
+                object(), "key", ["base"], 24, today_only=True
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].slug, "calendar-mint")
+        self.assertEqual(candidates[0].opensea_url, card["opensea_url"])
+        self.assertEqual(candidates[0].contract_address, card["contract_address"])
+
+    def test_public_page_stage_fallback_adds_later_same_day_stage(self):
+        day_start, _, _ = config.discovery_day_bounds()
+        first = max(day_start + 60, int(time.time()) + 60)
+        later = first + 3600
+        card = {
+            "collection_slug": "two-stage",
+            "collection_name": "Two Stage",
+            "chain": "ethereum",
+            "opensea_url": "https://opensea.io/collection/two-stage",
+            "next_stage": {
+                "stage_type": "signed_presale", "label": "Allowlist",
+                "price": "1000000000000000", "start_time": first,
+                "end_time": later, "max_per_wallet": "1",
+            },
+        }
+        full_stages = [
+            {
+                "stageIndex": 1, "stageType": "signed_presale", "label": "Allowlist",
+                "price": 10**15, "startTime": first, "endTime": later,
+            },
+            {
+                "stageIndex": 0, "stageType": "public_sale", "label": "Public",
+                "price": 2 * 10**15, "startTime": later, "endTime": later + 3600,
+            },
+        ]
+        with patch.object(
+            discovery.opensea_client, "list_drops", return_value=([card], None)
+        ), patch.object(
+            discovery.opensea_client, "get_public_drop_schedule", return_value=full_stages
+        ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
+            config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
+        ):
+            candidates, errors = discovery.discover_mints(
+                object(), "key", ["ethereum"], 24, today_only=True
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual([item.stage_label for item in candidates], ["Allowlist", "Public"])
+
+    def test_scan_result_names_link_directly_to_opensea(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        text = bot.render_candidates([CANDIDATE], [])
+        self.assertIn(
+            '<a href="https://opensea.io/collection/demo-drop">Demo &amp; Drop</a>',
+            text,
+        )
+        self.assertNotIn("Skipped checks", text)
 
     def test_today_scan_excludes_an_active_stage_that_started_yesterday(self):
         day_start, _, _ = config.discovery_day_bounds()

@@ -95,6 +95,66 @@ def _ranked_collection_slug(item):
     return _drop_slug(item)
 
 
+def _calendar_stages(item):
+    """Normalize stage summaries already included in OpenSea's drop calendar."""
+    if not isinstance(item, dict):
+        return []
+    raw_stages = []
+    for key in ("active_stage", "activeStage", "next_stage", "nextStage"):
+        stage = item.get(key)
+        if isinstance(stage, dict) and stage not in raw_stages:
+            raw_stages.append(stage)
+    stages = []
+    for position, stage in enumerate(raw_stages):
+        stages.append({
+            "stageIndex": _nested_value(stage, "stageIndex", "stage_index", "index") or position,
+            "startTime": opensea_client._to_epoch(
+                _nested_value(stage, "startTime", "start_time")
+            ),
+            "endTime": opensea_client._to_epoch(
+                _nested_value(stage, "endTime", "end_time")
+            ),
+            "label": _nested_value(stage, "label", "name", "stageLabel"),
+            "stageType": _nested_value(stage, "stageType", "stage_type", "type"),
+            "price": _nested_value(stage, "price", "mintPrice", "mint_price"),
+            "priceCurrencyAddress": _nested_value(
+                stage, "priceCurrencyAddress", "price_currency_address"
+            ),
+            "maxPerWallet": _nested_value(stage, "maxPerWallet", "max_per_wallet"),
+            "uuid": _nested_value(stage, "uuid", "id"),
+        })
+    return stages
+
+
+def _calendar_has_stage_fields(item):
+    return isinstance(item, dict) and any(
+        key in item for key in ("active_stage", "activeStage", "next_stage", "nextStage")
+    )
+
+
+def _calendar_metadata(item):
+    """Return the useful collection fields included with a calendar card."""
+    if not isinstance(item, dict):
+        return {}
+    return {
+        "image_url": item.get("image_url") or item.get("imageUrl") or "",
+        "opensea_url": item.get("opensea_url") or item.get("openseaUrl") or "",
+    }
+
+
+def _stage_touches_day(stages, day_start, day_end):
+    """Return whether a summary stage starts or ends during the selected day."""
+    for stage in stages or []:
+        for key in ("startTime", "endTime"):
+            try:
+                value = int(stage.get(key))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if day_start <= value <= day_end:
+                return True
+    return False
+
+
 def _price_number(value):
     """Return a decimal display price, or None when the price is unknown."""
     if isinstance(value, dict):
@@ -322,16 +382,55 @@ def discover_mints(
                     errors.append(f"{chain_slug}/{drop_type}: {type(exc).__name__}")
                     break
 
+                page_stage_map = {}
+                if today_only and day_start is not None:
+                    page_targets = []
+                    for card in cards:
+                        slug = _drop_slug(card)
+                        summaries = _calendar_stages(card)
+                        if slug and _stage_touches_day(summaries, day_start, horizon):
+                            page_targets.append(slug)
+                    if page_targets:
+                        with ThreadPoolExecutor(
+                            max_workers=min(6, len(page_targets))
+                        ) as page_executor:
+                            page_futures = {
+                                page_executor.submit(
+                                    opensea_client.get_public_drop_schedule, client, slug
+                                ): slug
+                                for slug in page_targets
+                            }
+                            for future in as_completed(page_futures):
+                                try:
+                                    page_stage_map[page_futures[future]] = future.result()
+                                except Exception:
+                                    page_stage_map[page_futures[future]] = []
+
                 for card in cards:
                     slug = _drop_slug(card)
                     if not slug or slug in seen_slugs:
                         continue
                     seen_slugs.add(slug)
-                    try:
-                        name, stages = opensea_client.get_drop_schedule(client, slug, api_key)
-                    except Exception as exc:
-                        errors.append(f"{chain_slug}/{slug}: {type(exc).__name__}")
-                        continue
+                    stages = _calendar_stages(card)
+                    name = _drop_name(card, slug)
+                    # The calendar intentionally summarizes only the active
+                    # stage and one next stage. Read the collection page for
+                    # the complete stage list so later same-day public stages
+                    # are not omitted when the detail API is unavailable.
+                    page_stages = page_stage_map.get(slug) or []
+                    if page_stages:
+                        stages = page_stages
+                    # Current calendar responses include active_stage and
+                    # next_stage. Only use the detail route for older/partial
+                    # response shapes that omit both summaries.
+                    if not stages and not _calendar_has_stage_fields(card):
+                        try:
+                            name, stages = opensea_client.get_drop_schedule(client, slug, api_key)
+                        except Exception:
+                            # A calendar card with no stage summary is not a
+                            # usable mint option. Keep this out of user-facing
+                            # scan errors; later feeds may include richer data.
+                            continue
 
                     drop_candidates = build_drop_candidates(
                         slug,
@@ -339,13 +438,20 @@ def discover_mints(
                         chain_slug,
                         stages,
                         now=now,
+                        metadata=_calendar_metadata(card),
+                        contract_address=str(
+                            card.get("contract_address") or card.get("contractAddress") or ""
+                        ),
+                        opensea_url=str(
+                            card.get("opensea_url") or card.get("openseaUrl") or ""
+                        ),
                     )
                     for candidate in drop_candidates:
                         if candidate.start_time > horizon:
                             continue
-                        # "Today" means the stage itself opens between today's
-                        # midnight boundaries. A stage that opened yesterday can
-                        # still be active, but it belongs to yesterday's list.
+                        # "Today" is strictly midnight-to-midnight in the
+                        # configured timezone. A stage that started yesterday
+                        # belongs to yesterday even if it remains active.
                         if today_only and day_start is not None and candidate.start_time < day_start:
                             continue
                         if free_only and (
@@ -357,15 +463,30 @@ def discover_mints(
                         if existing is None or candidate.start_time < existing.start_time:
                             candidates[candidate.key()] = candidate
 
-                    if config.DISCOVERY_REQUEST_DELAY_SECONDS:
+                    if config.DISCOVERY_REQUEST_DELAY_SECONDS and not stages:
                         time.sleep(config.DISCOVERY_REQUEST_DELAY_SECONDS)
 
                 if not next_cursor or str(next_cursor) in seen_cursors:
+                    break
+                if today_only and drop_type in {"recently_minted", "featured"}:
+                    # These feeds are newest-first. One page is enough for a
+                    # midnight-to-midnight scan; older pages cannot add a stage
+                    # that begins later today.
                     break
                 seen_cursors.add(str(next_cursor))
                 cursor = next_cursor
 
         if include_ranked_fallback:
+            # The ranked fallback depends on the individual drop-detail route.
+            # OpenSea may temporarily return 503 there while its drop calendar
+            # remains healthy. Probe once instead of issuing up to 100 doomed
+            # detail requests and making Telegram wait several minutes.
+            probe_slug = next(iter(seen_slugs), None)
+            if probe_slug:
+                if not opensea_client.drop_detail_route_available(
+                    client, probe_slug, api_key
+                ):
+                    continue
             try:
                 ranked = opensea_client.list_top_collections(
                     client,
