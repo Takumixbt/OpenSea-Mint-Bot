@@ -36,7 +36,7 @@ class Minter:
             raise RuntimeError(
                 f"Chain mismatch: config.py's TARGET_CHAIN_ID is {self.chain_id} but "
                 f"the RPC actually connected to chain {live_chain_id}. Check "
-                f"CHAIN_RPC_SUBDOMAINS in config.py maps TARGET_CHAIN_ID to the right subdomain."
+                f"CHAIN_CONFIGS in config.py maps TARGET_CHAIN_ID to the right RPC."
             )
         # "pending" so that if this wallet somehow has a transaction already
         # waiting in the pool, we take the next number after it instead of
@@ -76,20 +76,28 @@ class Minter:
             priority_fee = cap
         return max_fee, priority_fee
 
-    def build_transaction(self, to, data, value):
+    def build_transaction(self, to, data, value, approved_value_wei=None):
         """
         Build the signed-but-not-yet-sent transaction from OpenSea's calldata.
         Returns (signed_tx, human_summary_dict).
         """
-        if int(value) > config.MAX_MINT_VALUE_WEI:
+        value = int(value)
+        if value < 0:
+            raise RuntimeError("OpenSea returned a negative mint value; refusing to build the transaction.")
+        if approved_value_wei is not None and value != int(approved_value_wei):
             raise RuntimeError(
-                f"OpenSea's mint instructions ask to send {int(value)} wei of the "
+                "OpenSea returned a mint value different from the amount approved "
+                f"in Telegram (approved {int(approved_value_wei)} wei; returned {value} wei). "
+                "Refresh the drop and confirm the current stage again. Nothing was signed or sent."
+            )
+        if value > config.MAX_MINT_VALUE_WEI:
+            raise RuntimeError(
+                f"OpenSea's mint instructions ask to send {value} wei of the "
                 f"chain's coin, but the configured cap is "
                 f"{config.MAX_MINT_PRICE_NATIVE} native coin. "
                 f"Refusing to build the transaction. If this paid drop is intended, "
-                f"raise MAX_MINT_PRICE_NATIVE in config.py deliberately."
+                f"raise MAX_MINT_PRICE_NATIVE in Telegram Settings or .env deliberately."
             )
-
         if self._cached_nonce is None:
             self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
 
@@ -99,7 +107,7 @@ class Minter:
             "from": self.address,
             "to": Web3.to_checksum_address(to),
             "data": data,
-            "value": int(value),
+            "value": value,
             "nonce": self._cached_nonce,
             "chainId": self.chain_id,
             "maxFeePerGas": max_fee,
@@ -118,11 +126,26 @@ class Minter:
         if tx["gas"] > config.GAS_LIMIT_MAX:
             tx["gas"] = config.GAS_LIMIT_MAX
 
+        # Refuse before signing if the current balance cannot cover both the
+        # mint value and this transaction's worst-case gas envelope. This is a
+        # read-only balance check; no transaction exists yet.
+        required_balance = tx["value"] + tx["gas"] * tx["maxFeePerGas"]
+        available_balance = self.native_balance()
+        if available_balance < required_balance:
+            required_native = self.w3.from_wei(required_balance, "ether")
+            available_native = self.w3.from_wei(available_balance, "ether")
+            raise RuntimeError(
+                "Wallet balance is below the mint value plus the estimated gas "
+                f"envelope (available {available_native} native coin; "
+                f"required about {required_native}). Nothing was signed or sent."
+            )
+
         signed = self.w3.eth.account.sign_transaction(tx, private_key=self._private_key)
 
         summary = {
             "to": tx["to"],
             "value_wei": tx["value"],
+            "worst_case_fee_wei": tx["gas"] * tx["maxFeePerGas"],
             "nonce": tx["nonce"],
             "chainId": tx["chainId"],
             "gas": tx["gas"],

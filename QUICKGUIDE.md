@@ -1,130 +1,67 @@
-# OpenSea Mint Bot — beginner quick guide
+# Quick guide
 
-This project has two different routes. Pick one:
-
-| Route | Needs OpenSea browser tab? | Signs the blockchain transaction? | Best for |
-|---|---:|---:|---|
-| Python bot | No | Yes, in live mode | Scheduled or unattended minting |
-| Tampermonkey helper | Yes | No | Watching the page and clicking once |
-
-The Python bot is the real minting route. The browser helper is only a page
-assistant and does not replace it.
-
-## Install the project
-
-1. Open the GitHub repository and select **Code → Download ZIP**.
-2. Extract the ZIP file.
-3. Open the extracted `OpenSea-Mint-Bot` folder in PowerShell or Terminal.
-
-You do not need Git for this method. If Git is already installed, you can use:
+## Windows
 
 ```powershell
-git clone <paste-the-HTTPS-URL-from-GitHub>
+git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
 cd OpenSea-Mint-Bot
-```
-
-Copy the HTTPS URL from the repository's **Code → Local → HTTPS** menu.
-
-## First-time setup
-
-Open PowerShell in the repository folder and run:
-
-```powershell
-python --version
 python -m pip install -r requirements.txt
-```
-
-If `.env` does not exist, create it once:
-
-```powershell
 Copy-Item .env.example .env
 notepad .env
-```
-
-Fill in `ALCHEMY_API_KEY`, `PRIVATE_KEY`, and `WALLET_ADDRESS`. Never paste the
-private key into GitHub, Discord, or a chat. Use a separate wallet containing
-only the amount you are willing to risk.
-
-## Configure an upcoming drop
-
-Open the settings file:
-
-```powershell
-notepad config.py
-```
-
-Paste the full OpenSea URL into:
-
-```python
-TARGET_COLLECTION_URL = "https://opensea.io/collection/example"
-```
-
-Then set the chain shown on the drop page:
-
-```python
-TARGET_CHAIN_ID = 8453  # Base example
-```
-
-Use the correct stage index. Stage `0` is only a default; an allowlist and
-public mint may have different stage indexes. Keep `MINT_QUANTITY = 1` until
-you have verified the wallet limit.
-
-Paid-mint safety is explicit:
-
-```python
-MAX_MINT_PRICE_NATIVE = "0"     # free-only
-MAX_MINT_PRICE_NATIVE = "0.02"  # free plus paid up to 0.02 native coin
-```
-
-The bot still needs native coin for gas even when the mint price is zero.
-
-## Check before running
-
-```powershell
+python -m unittest discover -s tests -v
 python status.py
 python recon_check.py
+python telegram_bot.py
 ```
 
-`status.py` is read-only. It never signs or broadcasts. Do not continue until
-the target collection, wallet identity, RPC, and dependencies are healthy.
+In Telegram, send `/start`. Use **Find today's mints** to choose one network,
+or **Schedule a mint** and paste a known OpenSea collection/drop URL. Pick the
+stage and quantity, review the exact total mint value, then confirm.
 
-## Safe rehearsal
+Use **Settings** to upload the NFT mint-card background and set the maximum mint
+price. `0` means free-only. Gas is separate.
 
-```powershell
-python main.py --dry-run
+## Ubuntu VPS
+
+Run these as a sudo user:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv
+sudo useradd --system --create-home --shell /usr/sbin/nologin openseabot
+sudo git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git /opt/opensea-mint-bot
+sudo python3 -m venv /opt/opensea-mint-bot/.venv
+sudo /opt/opensea-mint-bot/.venv/bin/pip install -r /opt/opensea-mint-bot/requirements.txt
+sudo cp /opt/opensea-mint-bot/.env.example /opt/opensea-mint-bot/.env
+sudo nano /opt/opensea-mint-bot/.env
+sudo chown -R openseabot:openseabot /opt/opensea-mint-bot
+sudo chmod 600 /opt/opensea-mint-bot/.env
+sudo cp /opt/opensea-mint-bot/deploy/opensea-mint-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now opensea-mint-bot
 ```
 
-For an upcoming drop, this process waits until the selected stage opens. A
-successful rehearsal ends with `Transaction ready` and `DRY RUN: stopping here`.
-Nothing is broadcast.
+Verify it:
 
-## Live run
-
-```powershell
-python main.py
+```bash
+sudo systemctl status opensea-mint-bot --no-pager
+sudo journalctl -u opensea-mint-bot -n 50 --no-pager
 ```
 
-Keep the PowerShell window and PC awake, connected to the internet, and running
-until the drop is finished. The main Python bot does not need Chrome, OpenSea,
-or MetaMask to be open.
+Stop the Windows copy before starting the VPS copy. Telegram permits only one
+polling instance per bot token.
 
-For a one-run paid cap without editing `config.py`:
+## Required `.env` values
 
-```powershell
-python main.py --max-mint-price 0.02
+```text
+ALCHEMY_API_KEY=...
+PRIVATE_KEY=0x...
+WALLET_ADDRESS=0x...
+OPENSEA_API_KEY=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ALLOWED_CHAT_ID=...
+ENABLE_LIVE_MINTS=true
+MAX_MINT_PRICE_NATIVE=0
 ```
 
-## If something fails
-
-- `TARGET_COLLECTION_URL` error: use a URL shaped like
-  `https://opensea.io/collection/<slug>` or `https://opensea.io/drops/<slug>`.
-- No stage time: OpenSea has not exposed a usable schedule; check the page and
-  stage index.
-- No mint instructions: the drop may not be open, may be sold out, may require
-  eligibility, or OpenSea may have changed its internal query.
-- Transaction refused for value: the mint price is above your cap.
-- Transaction reverted: somebody else may have taken the final supply; gas can
-  still be charged.
-
-The bot does not guarantee a win. It only makes the configured wallet's normal
-mint process faster.
+Never upload `.env` to GitHub or send the private key to Telegram.

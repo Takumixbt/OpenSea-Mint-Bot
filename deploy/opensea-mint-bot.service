@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenSea Mint Bot Telegram Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openseabot
+Group=openseabot
+WorkingDirectory=/opt/opensea-mint-bot
+EnvironmentFile=/opt/opensea-mint-bot/.env
+ExecStart=/opt/opensea-mint-bot/.venv/bin/python -u telegram_bot.py
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/opensea-mint-bot/state /opt/opensea-mint-bot/.env
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

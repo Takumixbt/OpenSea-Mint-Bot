@@ -6,8 +6,15 @@ private key and RPC url live in the separate .env file.
 Each setting has a plain-English comment saying what it does.
 """
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import os
 from urllib.parse import unquote, urlsplit
+
+from dotenv import load_dotenv
+
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ---------------------------------------------------------------------------
 # WHICH DROP ARE YOU TRYING TO MINT?
@@ -53,16 +60,17 @@ def target_collection_slug():
 # The bot prints every stage it finds when it runs, so you can see the choices.
 TARGET_STAGE_INDEX = 0
 
-# How many tokens to mint in the single transaction. Free drops usually allow 1.
+# How many tokens to mint in the single transaction. OpenSea accepts 1-100;
+# keep this at 1 unless the drop's wallet limit explicitly allows more.
 MINT_QUANTITY = 1
 
 # Which chain this drop is on. Check the collection's OpenSea page - the
 # chain is shown right there. Change this per drop; everything else (the RPC
-# connection) follows automatically from CHAIN_RPC_SUBDOMAINS below, using
+# connection) follows automatically from CHAIN_CONFIGS below, using
 # the single Alchemy key in your .env.
 #   1 = Ethereum, 8453 = Base, 137 = Polygon, 10 = Optimism,
 #   42161 = Arbitrum, 4663 = Robinhood Chain
-TARGET_CHAIN_ID = 8453
+TARGET_CHAIN_ID = 8453  # Base
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +86,19 @@ SCHEDULE_POLL_SECONDS = 15
 # confirming the chain id, so none of that slow work happens during the race.
 WARMUP_LEAD_SECONDS = 5
 
-# How many seconds BEFORE the mint opens to start hammering OpenSea for the
-# real mint instructions (the salt + signature calldata). OpenSea only hands
-# these out right at open time, so we start asking a moment early and retry
-# fast until it answers.
-FIRE_LEAD_SECONDS = 1.5
+# How many seconds BEFORE the scheduled opening to leave the warm-up loop.
+# The supported Drops API rejects early requests with HTTP 409, so the first
+# mint-data request is made at the scheduled opening rather than hammering it
+# before the drop is active.
+FIRE_LEAD_SECONDS = 0.0
 
-# When in the fast retry loop, how long (in seconds) to wait between attempts.
-# 0.15 = about 7 tries per second. Lower is more aggressive.
-FIRE_RETRY_SECONDS = 0.15
+# The supported OpenSea API is rate-limited. Retry every five seconds only for
+# temporary "not active yet" or server errors; do not hammer the endpoint.
+FIRE_RETRY_SECONDS = 5.0
+
+# Hard cap on mint-data requests in one opening window. This prevents a bad
+# schedule or an API outage from creating an unbounded request loop.
+FIRE_MAX_ATTEMPTS = 5
 
 # Safety stop: if the mint instructions never arrive, give up this many seconds
 # AFTER the scheduled open time instead of looping forever.
@@ -130,7 +142,7 @@ GAS_LIMIT_MAX = 500000
 # Use a human-readable value here: "0" means free-only; "0.02" allows a paid
 # mint up to 0.02 ETH/MATIC/etc. Free mints (value 0) still pass automatically.
 # This is deliberately a cap, never an instruction to spend that amount.
-MAX_MINT_PRICE_NATIVE = "0"
+MAX_MINT_PRICE_NATIVE = os.getenv("MAX_MINT_PRICE_NATIVE", "0").strip() or "0"
 
 try:
     _mint_price_scaled = Decimal(MAX_MINT_PRICE_NATIVE) * (10 ** 18)
@@ -143,69 +155,166 @@ except (InvalidOperation, ValueError):
     )
 
 
+def set_max_mint_price_native(value):
+    """Update the in-process hard mint-value ceiling safely."""
+    global MAX_MINT_PRICE_NATIVE, MAX_MINT_VALUE_WEI
+    text = str(value or "").strip()
+    try:
+        scaled = Decimal(text) * (10 ** 18)
+        if scaled < 0 or scaled > Decimal("100") * (10 ** 18):
+            raise ValueError
+        if scaled != scaled.to_integral_value():
+            raise ValueError
+    except (InvalidOperation, ValueError):
+        raise ValueError("price cap must be a number from 0 to 100 with at most 18 decimals")
+    MAX_MINT_PRICE_NATIVE = text
+    MAX_MINT_VALUE_WEI = int(scaled)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # OPENSEA ENDPOINTS AND HEADERS  (verified live 2026-08-11)
 # ---------------------------------------------------------------------------
-# recon_check.py re-checks that these are still what OpenSea uses. If OpenSea
-# changes something, recon_check.py will tell you which line here to update.
+# OpenSea's documented Drops API is used for both schedule and mint data.
+# OPENSEA_API_KEY lives in .env and is intentionally not stored in this file.
+OPENSEA_API_BASE_URL = "https://api.opensea.io/api/v2"
 
-# The INTERNAL GraphQL endpoint the real OpenSea website uses for minting.
-# (The public api.opensea.io one does NOT expose the mint calldata.)
-GQL_ENDPOINT = "https://gql.opensea.io/graphql"
-
-# The website currently sends SIWE login requests to its same-origin internal
-# API. The old gql.opensea.io/auth/* route returns 404 and must not be used.
-AUTH_NONCE_URL = "https://opensea.io/__api/auth/siwe/nonce"
-AUTH_VERIFY_URL = "https://opensea.io/__api/auth/siwe/verify"
-
-# The website OpenSea's SIWE message is scoped to. The trailing slash matters -
-# the signed message must match byte-for-byte or OpenSea rejects the login.
-OPENSEA_DOMAIN = "opensea.io"
-OPENSEA_URI = "https://opensea.io/"
-
-
-def opensea_signin_uri():
-    """Return the OpenSea page URI used in the SIWE message."""
-    try:
-        slug = target_collection_slug()
-    except ValueError:
-        slug = None
-    if slug:
-        return f"https://opensea.io/collection/{slug}/overview"
-    return OPENSEA_URI
-
-# Extra header OpenSea requires on every GraphQL call. Without it, even a
-# correctly-logged-in request is rejected. Confirmed still present in the
-# live site bundle on 2026-07-18.
-APP_ID_HEADER = "os2-web"
-
-# Browser-like headers so our requests look like the real website's.
+# A normal browser-like user agent for API requests.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Where the saved login session (cookies) is stored so you don't re-sign every
-# run. OpenSea sessions last about 3.5 days. This file is gitignored.
-SESSION_FILE = "session.json"
-
 
 # ---------------------------------------------------------------------------
-# CHAIN RPC LOOKUP  (one Alchemy key, any chain)
+# DISCOVERY, DAILY RUNNER, AND CHAIN SUPPORT
 # ---------------------------------------------------------------------------
-# Alchemy gives one API key that works across every chain it supports - you
-# don't need a separate key or app per chain. This maps a chain ID to the
-# subdomain Alchemy uses for it, so the bot builds the right RPC url on its
-# own from TARGET_CHAIN_ID above + ALCHEMY_API_KEY in your .env.
-#
-# To mint on a chain not listed here: search "Alchemy <chain name> RPC",
-# open the result, and copy the part of the URL between "https://" and
-# ".g.alchemy.com" - that's the subdomain. Add a line below with its chain ID.
-CHAIN_RPC_SUBDOMAINS = {
-    1: "eth-mainnet",           # Ethereum
-    8453: "base-mainnet",       # Base
-    137: "polygon-mainnet",     # Polygon
-    10: "opt-mainnet",          # Optimism
-    42161: "arb-mainnet",       # Arbitrum
-    4663: "robinhood-mainnet",  # Robinhood Chain
+
+# OpenSea chain slugs that have an EVM chain ID and an Alchemy RPC mapping.
+# Set MONITORED_CHAINS to a comma-separated subset, or "all" for every entry
+# below. OpenSea also lists non-EVM chains; those are intentionally skipped by
+# this wallet signer instead of being misclassified as EVM drops.
+CHAIN_CONFIGS = {
+    "ethereum": {"chain_id": 1, "rpc_subdomain": "eth-mainnet", "native": "ETH"},
+    "base": {"chain_id": 8453, "rpc_subdomain": "base-mainnet", "native": "ETH"},
+    "polygon": {"chain_id": 137, "rpc_subdomain": "polygon-mainnet", "native": "POL"},
+    "optimism": {"chain_id": 10, "rpc_subdomain": "opt-mainnet", "native": "ETH"},
+    "arbitrum": {"chain_id": 42161, "rpc_subdomain": "arb-mainnet", "native": "ETH"},
+    "robinhood": {"chain_id": 4663, "rpc_subdomain": "robinhood-mainnet", "native": "ETH"},
+    "zora": {"chain_id": 7777777, "rpc_subdomain": "zora-mainnet", "native": "ETH"},
+    "blast": {"chain_id": 81457, "rpc_subdomain": "blast-mainnet", "native": "ETH"},
+    "avalanche": {"chain_id": 43114, "rpc_subdomain": "avax-mainnet", "native": "AVAX"},
+    "unichain": {"chain_id": 130, "rpc_subdomain": "unichain-mainnet", "native": "ETH"},
+    "shape": {"chain_id": 360, "rpc_subdomain": "shape-mainnet", "native": "ETH"},
 }
+
+# The default set covers the main EVM chains. Add a supported key above if your
+# Alchemy account supports it.
+MONITORED_CHAINS = "ethereum,base,polygon,optimism,arbitrum,robinhood"
+
+# Discovery reads up to this many upcoming drops per chain, then fetches their
+# stage details. The Telegram route lists today's stages and labels free, paid,
+# and restricted entries.
+DISCOVERY_WINDOW_HOURS = 24
+DISCOVERY_LIMIT_PER_CHAIN = 50
+# Follow at most this many OpenSea result pages per chain during one scan.
+# Increase only if you intentionally want a wider, slower scan.
+DISCOVERY_MAX_PAGES_PER_CHAIN = 5
+# OpenSea has no exhaustive "all active today" endpoint. Merge every official
+# drop-calendar feed so active/recent drops are not missed by an upcoming-only
+# scan. Results are deduplicated by collection and mint stage.
+DISCOVERY_DROP_TYPES = ("upcoming", "recently_minted", "featured")
+# A chain-specific Telegram scan also checks OpenSea's most active collections
+# and validates each one through the drop-details endpoint. This catches live
+# SeaDrop mints that OpenSea has not placed in any drop-calendar feed yet.
+DISCOVERY_RANKED_FALLBACK_LIMIT = 100
+DISCOVERY_RANKED_FALLBACK_WORKERS = 8
+DISCOVERY_PUBLIC_ONLY = True
+DISCOVERY_REQUEST_DELAY_SECONDS = 0.15
+# The day boundary is a fixed UTC offset so Windows and Linux VPS machines
+# behave identically. 0 means UTC; set DISCOVERY_UTC_OFFSET_HOURS=1 for WAT.
+DISCOVERY_UTC_OFFSET_HOURS = "0"
+
+# Daily scheduler defaults. Live mode remains disabled until the operator sets
+# ENABLE_LIVE_MINTS=true and confirms it from the authorized Telegram chat.
+DAILY_SCAN_INTERVAL_SECONDS = 24 * 60 * 60
+MAX_DAILY_MINTS = 5
+MAX_DAILY_GAS_NATIVE = "0.05"
+DAILY_STATE_FILE = "state/daily_mints.json"
+
+# One-time schedules created from Telegram are persisted locally so a restart
+# does not silently discard an armed mint. The scheduler resumes armed entries
+# when the bot starts; live entries still require ENABLE_LIVE_MINTS=true.
+MINT_SCHEDULES_STATE_FILE = "state/mint_schedules.json"
+SCHEDULE_POLL_SECONDS = 15
+
+# Telegram uses long polling, so a VPS only needs to keep this process online.
+TELEGRAM_POLL_TIMEOUT_SECONDS = 25
+
+
+def discovery_timezone():
+    """Return the configured fixed-offset timezone used for daily scans."""
+    raw = os.getenv("DISCOVERY_UTC_OFFSET_HOURS", str(DISCOVERY_UTC_OFFSET_HOURS)).strip()
+    try:
+        hours = Decimal(raw)
+        if not hours.is_finite() or hours < Decimal("-24") or hours >= Decimal("24"):
+            raise ValueError
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("DISCOVERY_UTC_OFFSET_HOURS must be between -24 and 24")
+    return timezone(timedelta(hours=float(hours)))
+
+
+def discovery_day_bounds(timestamp=None):
+    """Return ``(start_epoch, end_epoch, label)`` for the current configured day."""
+    tz = discovery_timezone()
+    current = (
+        datetime.fromtimestamp(timestamp, tz)
+        if timestamp is not None
+        else datetime.now(tz)
+    )
+    start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return int(start.timestamp()), int(end.timestamp()), start.date().isoformat()
+
+
+def monitored_chain_slugs():
+    """Return configured OpenSea chain slugs with duplicates removed."""
+    raw = (MONITORED_CHAINS or "").strip().lower()
+    if raw == "all":
+        return list(CHAIN_CONFIGS)
+    result = []
+    for slug in raw.split(","):
+        slug = slug.strip()
+        if slug and slug not in result:
+            result.append(slug)
+    return result
+
+
+def chain_config(chain_slug):
+    """Return EVM chain settings or None for an unsupported OpenSea slug."""
+    return CHAIN_CONFIGS.get((chain_slug or "").strip().lower())
+
+
+def rpc_url_for_chain(alchemy_key, chain_id):
+    """Build the Alchemy RPC URL for a configured EVM chain ID."""
+    for settings in CHAIN_CONFIGS.values():
+        if settings["chain_id"] == chain_id:
+            return f"https://{settings['rpc_subdomain']}.g.alchemy.com/v2/{alchemy_key}"
+    raise ValueError(f"chain ID {chain_id} has no configured Alchemy RPC mapping")
+
+
+def chain_slug_for_id(chain_id):
+    """Return the OpenSea slug for a configured EVM chain ID, if known."""
+    for slug, settings in CHAIN_CONFIGS.items():
+        if settings["chain_id"] == chain_id:
+            return slug
+    return None
+
+
+try:
+    _daily_gas_scaled = Decimal(MAX_DAILY_GAS_NATIVE) * (10 ** 18)
+    if _daily_gas_scaled < 0 or _daily_gas_scaled != _daily_gas_scaled.to_integral_value():
+        raise ValueError
+    MAX_DAILY_GAS_WEI = int(_daily_gas_scaled)
+except (InvalidOperation, ValueError):
+    raise ValueError("MAX_DAILY_GAS_NATIVE must be a non-negative decimal with at most 18 decimals")

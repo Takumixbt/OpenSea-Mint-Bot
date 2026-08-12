@@ -1,125 +1,97 @@
 # OpenSea Mint Bot
 
-A local Python bot for one configured OpenSea collection or drop.
+A Telegram-controlled mint bot for OpenSea EVM drops. It can scan one network,
+research a collection, select quantity, mint immediately, or arm a one-time
+schedule. It supports free, paid, public, and restricted stages; OpenSea makes
+the final wallet-eligibility decision.
 
-It supports:
+This is a mint bot, not a secondary-market buying bot. Use a separate wallet
+and never commit `.env`.
 
-- Free mints
-- Paid mints up to an explicit price cap
-- Dry-run signing without broadcasting
-- Read-only readiness and OpenSea drift checks
-- An optional Tampermonkey page helper
+## Install
 
-Use a separate wallet. Never commit or share `.env`, `PRIVATE_KEY`, or
-`session.json`.
-
-## Install the project
-
-The easiest Windows method is:
-
-1. Open this GitHub repository.
-2. Select **Code → Download ZIP**.
-3. Extract the ZIP file.
-4. Open the extracted `OpenSea-Mint-Bot` folder in PowerShell or Terminal.
-
-Git users can clone it instead:
+Install Python 3.11 or newer, then:
 
 ```powershell
-git clone <paste-the-HTTPS-URL-from-GitHub>
+git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
 cd OpenSea-Mint-Bot
-```
-
-Copy the HTTPS URL from the repository's **Code → Local → HTTPS** menu.
-
-## Quick start
-
-Open PowerShell in the repository folder, then run:
-
-```powershell
 python -m pip install -r requirements.txt
-```
-
-If `.env` does not exist, create and open it:
-
-```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-Fill in:
+Add your Alchemy key, OpenSea key, wallet private key/address, Telegram token,
+and allowed chat ID to `.env`. Keep `MAX_MINT_PRICE_NATIVE=0` for free-only, or
+set your maximum transaction mint value in Telegram under **Settings**.
+
+Run the checks and start the bot:
+
+```powershell
+python -m unittest discover -s tests -v
+python status.py
+python recon_check.py
+python telegram_bot.py
+```
+
+Only one PC or VPS may run `telegram_bot.py` for the same Telegram token.
+
+## Telegram
+
+Send `/start` for the button dashboard. Main commands:
 
 ```text
-ALCHEMY_API_KEY=...
-PRIVATE_KEY=...
-WALLET_ADDRESS=...
+/scan                 choose one network
+/scan base            scan one network directly
+/info                 research an OpenSea URL
+/schedule             paste a URL and arm one stage
+/schedules            inspect or cancel schedules
+/mint 1               review candidate 1 and confirm it
+/settings             price cap and mint-card background
+/status               runtime status
 ```
 
-Open `config.py` and set the drop:
+Every mint requires a confirmation screen. Before signing, the bot checks the
+exact selected price × quantity, configured price cap, gas cap, wallet balance,
+chain ID, daily attempt limit, and OpenSea eligibility. If OpenSea returns a
+different transaction value from the Telegram preview, it refuses to sign.
 
-```python
-TARGET_COLLECTION_URL = "https://opensea.io/collection/example"
-TARGET_CHAIN_ID = 8453
-TARGET_STAGE_INDEX = 0
-MINT_QUANTITY = 1
-MAX_MINT_PRICE_NATIVE = "0"
-```
+The scanner is chain-by-chain in Telegram and covers midnight to midnight at
+`DISCOVERY_UTC_OFFSET_HOURS`. OpenSea's public feeds are incomplete, so a scan
+cannot guarantee it finds every mint. Paste a known collection URL into
+`/schedule` when timing matters.
 
-`MAX_MINT_PRICE_NATIVE = "0"` allows free mints only. Set a value such as
-`"0.02"` to allow paid mints up to that amount. Gas is separate and is still
-required for free mints.
+### Mint-card background
 
-Supported chain IDs are Ethereum `1`, Base `8453`, Polygon `137`, Optimism
-`10`, Arbitrum `42161`, and Robinhood Chain `4663`.
+Open **Settings → Set card background**, then send a JPG/PNG/WEBP or a direct
+image URL. The bot crops it to 1200×675 and stores it locally. **Reset card
+background** restores the built-in design.
 
-## Check the setup
+## VPS
+
+The VPS needs Ubuntu, Python, internet access, and the bot running as one
+service. Chrome, OpenSea, and MetaMask are not required. A ready systemd unit
+is included in `deploy/opensea-mint-bot.service`; see [QUICKGUIDE.md](QUICKGUIDE.md).
+
+Schedules and scans are local to the machine in `state/`. Copy that folder when
+moving an armed bot, and stop the old instance before starting the VPS.
+
+## Optional one-drop CLI
+
+Set the target URL, chain, stage, quantity, and cap in `config.py`. Then run:
 
 ```powershell
 python status.py
 python recon_check.py
+python main.py --confirm-live
 ```
 
-Fix any `BLOCKED`, `CHANGED`, or `FAIL` result before continuing.
+The CLI is live-only and also requires `ENABLE_LIVE_MINTS=true` in `.env`.
 
-## Run safely
+## Browser helper
 
-Dry run; waits for the selected stage but never broadcasts:
+`opensea_mint_assist.user.js` is an optional Tampermonkey page helper. It can
+click one visible Mint/Claim button, but wallet approval remains manual. See
+[TAMPERMONKEY.md](TAMPERMONKEY.md).
 
-```powershell
-python main.py --dry-run
-```
-
-Live run:
-
-```powershell
-python main.py
-```
-
-For a one-run paid cap:
-
-```powershell
-python main.py --max-mint-price 0.02
-```
-
-The live bot needs the PC awake, internet-connected, and running the command.
-Chrome, OpenSea, and MetaMask do not need to be open for the Python bot.
-
-## Tampermonkey helper
-
-The browser helper is separate from the Python bot. It watches one OpenSea page,
-can click one visible Mint/Claim control when armed, and leaves wallet approval
-manual. It does not sign transactions or use your private key.
-
-See [TAMPERMONKEY.md](TAMPERMONKEY.md).
-
-## Main files
-
-- `config.py` — drop, chain, stage, quantity, price, and gas settings
-- `main.py` — direct mint bot
-- `status.py` — read-only readiness report
-- `recon_check.py` — checks for OpenSea website changes
-- `opensea_mint_assist.user.js` — optional browser helper
-- `QUICKGUIDE.md` — beginner setup
-- `RADAR.md` — optional Robinhood Chain discovery/radar component
-
-OpenSea may change its website or restrict automation. This bot does not
-guarantee a mint and should only be used where automation is permitted.
+No bot can guarantee a mint: supply, allowlists, wallet limits, API uptime,
+network gas, and OpenSea timing can change.
