@@ -350,15 +350,18 @@ class TelegramSafetyTests(unittest.TestCase):
 
     def test_scan_groups_multiple_mint_windows_under_one_project(self):
         service = FakeTelegramService()
+        now = int(time.time())
         service.last_candidates = [
-            dict(CANDIDATE, stage_index=0, stage_label="Allowlist", start_time=100),
-            dict(CANDIDATE, stage_index=1, stage_label="Public", start_time=200),
+            dict(CANDIDATE, stage_index=0, stage_label="Allowlist", start_time=now - 60),
+            dict(CANDIDATE, stage_index=1, stage_label="Public", start_time=now + 3600),
         ]
         bot = TelegramBot(FakeAPI(), service, 123)
         text = bot.render_candidates(service.last_candidates, [])
         keyboard = bot.candidates_keyboard()
 
         self.assertIn("1 projects · 2 mint options", text)
+        self.assertIn("1 live", text)
+        self.assertIn("1 opens", text)
         project_buttons = [
             row for row in keyboard["inline_keyboard"]
             if row and row[0].get("callback_data", "").startswith("project:")
@@ -1070,7 +1073,10 @@ class DiscoverySafetyTests(unittest.TestCase):
         self.assertFalse(stages[0].is_public)
 
     def test_gated_stage_labels_are_not_marked_public(self):
-        for label in ("Allowlist", "OH NFT + PFP Holders", "Team Mint", "Private"):
+        for label in (
+            "Allowlist", "OH NFT + PFP Holders", "Team Mint", "Private",
+            "signed_presale",
+        ):
             self.assertFalse(discovery._is_public_label(label), label)
         for label in ("Public", "Public stage", "Newly announced"):
             self.assertTrue(discovery._is_public_label(label), label)
@@ -1233,6 +1239,45 @@ class DiscoverySafetyTests(unittest.TestCase):
             ["featured-only", "recent-only", "shared", "upcoming-only"],
         )
 
+    def test_discovery_exhausts_every_cursor_in_each_drop_feed(self):
+        now = int(time.time())
+        calls = []
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            calls.append((drop_type, cursor))
+            if drop_type == "recently_minted" and cursor is None:
+                return ([{"collectionSlug": "first-page"}], "page-2")
+            if drop_type == "recently_minted" and cursor == "page-2":
+                return ([{"collectionSlug": "second-page"}], None)
+            return ([], None)
+
+        def schedule(client, slug, api_key):
+            return slug, [{
+                "stageIndex": 0,
+                "startTime": now + 60,
+                "endTime": now + 3600,
+                "label": "Public",
+                "price": "0",
+            }]
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_schedule", side_effect=schedule
+        ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
+            config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 0
+        ):
+            candidates, errors = discovery.discover_mints(
+                object(), "key", ["base"], 24, today_only=False
+            )
+
+        self.assertEqual(errors, [])
+        self.assertIn(("recently_minted", "page-2"), calls)
+        self.assertEqual(
+            sorted(item.slug for item in candidates),
+            ["first-page", "second-page"],
+        )
+
     def test_calendar_stage_is_used_when_drop_detail_route_is_unavailable(self):
         day_start, _, _ = config.discovery_day_bounds()
         stage_start = max(day_start + 60, int(time.time()) + 60)
@@ -1323,7 +1368,7 @@ class DiscoverySafetyTests(unittest.TestCase):
         )
         self.assertNotIn("Skipped checks", text)
 
-    def test_today_scan_excludes_an_active_stage_that_started_yesterday(self):
+    def test_today_scan_includes_an_active_stage_that_started_yesterday(self):
         day_start, _, _ = config.discovery_day_bounds()
         cards = [{"collectionSlug": "yesterday", "collectionName": "Yesterday"}]
         stages = [{
@@ -1347,7 +1392,7 @@ class DiscoverySafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(errors, [])
-        self.assertEqual(candidates, [])
+        self.assertEqual([item.slug for item in candidates], ["yesterday"])
 
     def test_chain_scan_finds_today_drop_omitted_from_calendar(self):
         day_start, _, _ = config.discovery_day_bounds()

@@ -54,6 +54,7 @@ def target_collection_slug():
         raise ValueError("the OpenSea collection slug cannot be empty or contain spaces")
     return slug
 
+
 # Some drops have several "stages" (e.g. an allowlist stage, then a public
 # stage). Stage 0 is usually the first one. If you only care about the public
 # stage and there are earlier ones, you may need to raise this number.
@@ -242,17 +243,16 @@ CHAIN_CONFIGS = {
 # Alchemy account supports it.
 MONITORED_CHAINS = "ethereum,base,polygon,optimism,arbitrum,robinhood"
 
-# Discovery reads up to this many upcoming drops per chain, then fetches their
-# stage details. The Telegram route lists today's stages and labels free, paid,
-# and restricted entries.
+# Discovery requests this many OpenSea drops per API page. The Telegram route
+# lists live stages plus stages opening today, including free, paid, and
+# restricted entries.
 DISCOVERY_WINDOW_HOURS = 24
-DISCOVERY_LIMIT_PER_CHAIN = 50
-# Follow at most this many OpenSea result pages per chain during one scan.
-# Increase only if you intentionally want a wider, slower scan.
-DISCOVERY_MAX_PAGES_PER_CHAIN = 5
-# OpenSea has no exhaustive "all active today" endpoint. Merge every official
-# drop-calendar feed so active/recent drops are not missed by an upcoming-only
-# scan. Results are deduplicated by collection and mint stage.
+DISCOVERY_LIMIT_PER_CHAIN = 100
+# Follow every cursor returned by OpenSea. Set a positive value only as an
+# emergency ceiling; 0 means no artificial page limit.
+DISCOVERY_MAX_PAGES_PER_CHAIN = 0
+# OpenSea exposes its mintable collections through three drop feeds. Merge all
+# three and exhaust every page so /scan is not a featured/top-project sample.
 DISCOVERY_DROP_TYPES = ("upcoming", "recently_minted", "featured")
 # A chain-specific Telegram scan also checks OpenSea's most active collections
 # and validates each one through the drop-details endpoint. This catches live

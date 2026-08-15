@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!test-nft/.env.deploy.example
 session.json
 __pycache__/
 *.pyc
@@ -10,6 +11,19 @@ __pycache__/
 *.pem
 *.out
 *.err
+.venv/
+venv/
+.pytest_cache/
+.coverage
+*.sqlite3
+backups/
 
 # Daily scanner state and candidate history are local runtime data.
 state/
+
+# Isolated Foundry project used for the OpenSea bot test collection.
+test-nft/lib/
+test-nft/out/
+test-nft/cache/
+test-nft/broadcast/
+test-nft/upload/

@@ -189,6 +189,10 @@ def _is_public_label(label):
     text = (label or "").strip().lower()
     if not text:
         return True
+    # OpenSea stage types commonly use underscores (for example,
+    # ``signed_presale``). Treat separators as spaces before applying the
+    # word-boundary rules below so gated stages are not mislabeled public.
+    text = re.sub(r"[_-]+", " ", text)
     # Treat explicitly gated/reserved stages as restricted. A raw substring
     # check would reject harmless text such as "newly announced" because it
     # contains "wl", so keep the terms word-bounded and conservative.
@@ -365,10 +369,13 @@ def discover_mints(
             errors.append(f"{chain_slug}: no configured EVM RPC mapping")
             continue
         seen_slugs = set()
+        public_stage_cache = {}
         for drop_type in config.DISCOVERY_DROP_TYPES:
             cursor = None
             seen_cursors = set()
-            for _ in range(max(1, config.DISCOVERY_MAX_PAGES_PER_CHAIN)):
+            page_count = 0
+            while True:
+                page_count += 1
                 try:
                     cards, next_cursor = opensea_client.list_drops(
                         client,
@@ -388,7 +395,11 @@ def discover_mints(
                     for card in cards:
                         slug = _drop_slug(card)
                         summaries = _calendar_stages(card)
-                        if slug and _stage_touches_day(summaries, day_start, horizon):
+                        if (
+                            slug
+                            and slug not in public_stage_cache
+                            and _stage_touches_day(summaries, day_start, horizon)
+                        ):
                             page_targets.append(slug)
                     if page_targets:
                         with ThreadPoolExecutor(
@@ -402,13 +413,16 @@ def discover_mints(
                             }
                             for future in as_completed(page_futures):
                                 try:
-                                    page_stage_map[page_futures[future]] = future.result()
+                                    stages = future.result()
                                 except Exception:
-                                    page_stage_map[page_futures[future]] = []
+                                    stages = []
+                                slug = page_futures[future]
+                                page_stage_map[slug] = stages
+                                public_stage_cache[slug] = stages
 
                 for card in cards:
                     slug = _drop_slug(card)
-                    if not slug or slug in seen_slugs:
+                    if not slug:
                         continue
                     seen_slugs.add(slug)
                     stages = _calendar_stages(card)
@@ -417,7 +431,11 @@ def discover_mints(
                     # stage and one next stage. Read the collection page for
                     # the complete stage list so later same-day public stages
                     # are not omitted when the detail API is unavailable.
-                    page_stages = page_stage_map.get(slug) or []
+                    page_stages = (
+                        page_stage_map.get(slug)
+                        or public_stage_cache.get(slug)
+                        or []
+                    )
                     if page_stages:
                         stages = page_stages
                     # Current calendar responses include active_stage and
@@ -449,11 +467,9 @@ def discover_mints(
                     for candidate in drop_candidates:
                         if candidate.start_time > horizon:
                             continue
-                        # "Today" is strictly midnight-to-midnight in the
-                        # configured timezone. A stage that started yesterday
-                        # belongs to yesterday even if it remains active.
-                        if today_only and day_start is not None and candidate.start_time < day_start:
-                            continue
+                        # A useful "today" scan includes stages opening today
+                        # and stages that are already live. build_drop_candidates
+                        # has already removed stages whose end time has passed.
                         if free_only and (
                             not candidate.is_free
                             or (config.DISCOVERY_PUBLIC_ONLY and not candidate.is_public)
@@ -468,10 +484,8 @@ def discover_mints(
 
                 if not next_cursor or str(next_cursor) in seen_cursors:
                     break
-                if today_only and drop_type in {"recently_minted", "featured"}:
-                    # These feeds are newest-first. One page is enough for a
-                    # midnight-to-midnight scan; older pages cannot add a stage
-                    # that begins later today.
+                page_limit = int(config.DISCOVERY_MAX_PAGES_PER_CHAIN or 0)
+                if page_limit > 0 and page_count >= page_limit:
                     break
                 seen_cursors.add(str(next_cursor))
                 cursor = next_cursor
