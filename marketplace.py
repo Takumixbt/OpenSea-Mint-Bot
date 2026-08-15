@@ -259,6 +259,7 @@ class PurchaseEngine:
             wallet_profile.private_key,
             wallet_profile.address,
             chain_id,
+            rpc_urls=config.rpc_urls_for_chain(self.alchemy_key, chain_id),
         )
         live_chain, nonce = minter.warm_up()
         if live_chain != chain_id:

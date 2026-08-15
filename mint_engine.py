@@ -6,6 +6,7 @@ import time
 import config
 import external_mint
 import opensea_client
+import opensea_direct_executor
 from minter import Minter
 
 
@@ -26,70 +27,116 @@ class MintEngine:
     ):
         """Build, sign, and broadcast one explicitly confirmed candidate mint."""
         prepared_at = time.time()
+        quantity = quantity or config.MINT_QUANTITY
         chain_id = int(candidate["chain_id"])
         rpc_url = config.rpc_url_for_chain(self.alchemy_key, chain_id)
-        minter = Minter(rpc_url, self.private_key, self.wallet_address, chain_id)
-        route = str(candidate.get("route") or "opensea_drop")
-        client = (
-            opensea_client.get_api_client(self.opensea_api_key)
-            if route == "opensea_drop" else None
+        rpc_urls = config.rpc_urls_for_chain(self.alchemy_key, chain_id)
+        minter = Minter(
+            rpc_url,
+            self.private_key,
+            self.wallet_address,
+            chain_id,
+            rpc_urls=rpc_urls,
         )
+        route = str(candidate.get("route") or "opensea_drop")
+        direct_eligible = route == "opensea_drop" and opensea_direct_executor.is_candidate_eligible(candidate)
+        direct_plan = None
 
-        # RPC nonce/fee/balance reads and OpenSea TLS setup are independent,
-        # so do them concurrently during the pre-launch window.
+        # RPC warm-up and the direct SeaDrop read are independent.  When the
+        # direct plan is available, all calldata-dependent work can complete
+        # before the opening second.  A missing/mismatched plan simply falls
+        # back to the existing OpenSea route below.
         def warm_rpc():
             live_chain, nonce = minter.warm_up()
             return live_chain, nonce, minter.native_balance()
 
-        try:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mint-warmup") as pool:
-                rpc_future = pool.submit(warm_rpc)
-                api_future = (
-                    pool.submit(
-                        opensea_client.prewarm_drop_route,
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mint-warmup") as pool:
+            rpc_future = pool.submit(warm_rpc)
+            direct_future = (
+                pool.submit(
+                    opensea_direct_executor.build_public_plan,
+                    rpc_url,
+                    candidate,
+                    quantity,
+                )
+                if direct_eligible else None
+            )
+            live_chain, nonce, balance = rpc_future.result()
+            if direct_future is not None:
+                try:
+                    direct_plan = direct_future.result()
+                except opensea_direct_executor.DirectSafetyError:
+                    # The chain has given us a deterministic reason that this
+                    # quantity would revert. Do not downgrade that to an
+                    # OpenSea fallback which could still broadcast a bad tx.
+                    raise
+                except Exception:
+                    # A direct route is an optimization, not a reason to
+                    # bypass the normal verified OpenSea calldata path.
+                    direct_plan = None
+        if live_chain != chain_id:
+            raise RuntimeError(f"RPC chain mismatch: got {live_chain}, expected {chain_id}")
+        if balance <= 0:
+            raise RuntimeError("wallet has no native coin for gas")
+
+        execution_route = "direct_seadrop" if direct_plan else route
+        if direct_plan:
+            calldata = direct_plan
+            # The direct plan was read from the chain, so its exact value is
+            # the approved amount.  Minter still enforces MAX_MINT_VALUE_WEI.
+            approved_value = int(calldata["value"])
+            launch_at = max(
+                float(scheduled_at or 0),
+                float(candidate.get("start_time") or 0),
+                float(calldata.get("start_time") or 0),
+            )
+            request_started_at = time.time()
+            signed, summary = minter.build_transaction(
+                calldata["to"],
+                calldata["data"],
+                calldata["value"],
+                approved_value_wei=approved_value,
+            )
+        else:
+            client = (
+                opensea_client.get_api_client(self.opensea_api_key)
+                if route == "opensea_drop" else None
+            )
+            try:
+                # The API/TLS warm-up remains in the fallback path.  It is not
+                # needed for a direct SeaDrop transaction.
+                if client is not None:
+                    opensea_client.prewarm_drop_route(
                         client,
                         candidate["slug"],
                         self.opensea_api_key,
                     )
-                    if client is not None else None
+                launch_at = float(scheduled_at or 0)
+                if launch_at > time.time():
+                    self._wait_until(launch_at)
+                request_started_at = time.time()
+                calldata = self._request_calldata(
+                    client,
+                    candidate,
+                    quantity,
+                    rpc_url,
                 )
-                live_chain, nonce, balance = rpc_future.result()
-                if api_future is not None:
-                    api_future.result()
-        except Exception:
-            if client is not None:
-                client.close()
-            raise
-        if live_chain != chain_id:
-            if client is not None:
-                client.close()
-            raise RuntimeError(f"RPC chain mismatch: got {live_chain}, expected {chain_id}")
-        if balance <= 0:
-            if client is not None:
-                client.close()
-            raise RuntimeError("wallet has no native coin for gas")
+            finally:
+                if client is not None:
+                    client.close()
 
-        launch_at = float(scheduled_at or 0)
+            signed, summary = minter.build_transaction(
+                calldata["to"],
+                calldata["data"],
+                calldata["value"],
+                approved_value_wei=self._approved_value(candidate, quantity),
+            )
+
+        # Direct SeaDrop signs before the opening; the fallback signs after
+        # OpenSea provides its ready-to-sign calldata.  Both paths share the
+        # same exact launch, broadcast, receipt, and result bookkeeping.
         if launch_at > time.time():
             self._wait_until(launch_at)
-        request_started_at = time.time()
-        try:
-            calldata = self._request_calldata(
-                client,
-                candidate,
-                quantity or config.MINT_QUANTITY,
-                rpc_url,
-            )
-        finally:
-            if client is not None:
-                client.close()
-
-        signed, summary = minter.build_transaction(
-            calldata["to"],
-            calldata["data"],
-            calldata["value"],
-            approved_value_wei=self._approved_value(candidate, quantity or config.MINT_QUANTITY),
-        )
         worst_case_gas = int(summary.get("worst_case_fee_wei", 0))
         daily_gas_cap_wei = (
             config.MAX_DAILY_GAS_WEI if daily_gas_cap_wei is None else daily_gas_cap_wei
@@ -107,8 +154,11 @@ class MintEngine:
             "worst_case_gas_wei": worst_case_gas,
             "prepared_at": prepared_at,
             "request_started_at": request_started_at,
+            "execution_route": execution_route,
+            "broadcast_rpc_count": 0,
         }
         tx_hash = minter.send(signed)
+        result["broadcast_rpc_count"] = minter.last_broadcast_count or 1
         result["broadcast_at"] = time.time()
         if launch_at > 0:
             result["launch_delay_ms"] = max(

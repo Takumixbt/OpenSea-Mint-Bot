@@ -14,6 +14,7 @@ import opensea_client
 import nft_card
 import external_mint
 import marketplace
+import opensea_direct_executor
 import wallets
 from daily_runner import DailyMintService, quantity_limit, validate_quantity
 from minter import Minter
@@ -919,6 +920,55 @@ class DiscoverySafetyTests(unittest.TestCase):
             ["quantity"],
         )
         self.assertIsNone(external_mint.detect_simple_mint_route(unsafe))
+
+    def test_direct_seadrop_path_requires_public_stage_and_contract(self):
+        eligible = dict(
+            CANDIDATE,
+            contract_address="0x0000000000000000000000000000000000000042",
+            is_public=True,
+        )
+        self.assertTrue(opensea_direct_executor.is_candidate_eligible(eligible))
+        self.assertFalse(
+            opensea_direct_executor.is_candidate_eligible(dict(eligible, is_public=False))
+        )
+        self.assertFalse(
+            opensea_direct_executor.is_candidate_eligible(dict(eligible, route="generic_contract"))
+        )
+        self.assertFalse(
+            opensea_direct_executor.is_candidate_eligible(dict(eligible, contract_address=""))
+        )
+
+    def test_direct_seadrop_calldata_can_be_encoded_without_open_sea(self):
+        from web3 import Web3
+
+        contract = Web3().eth.contract(
+            address=opensea_direct_executor.SEADROP_ADDRESS,
+            abi=opensea_direct_executor.PUBLIC_ABI,
+        )
+        data = contract.functions.mintPublic(
+            "0x0000000000000000000000000000000000000042",
+            opensea_direct_executor.OPENSEA_FEE_RECIPIENT,
+            "0x0000000000000000000000000000000000000000",
+            1,
+        )._encode_transaction_data()
+        self.assertTrue(str(data).startswith("0x"))
+        self.assertGreater(len(data), 10)
+
+    def test_optional_rpc_blast_endpoints_are_chain_specific(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MINT_RPC_URLS_BASE": "https://base-one.example, https://base-two.example",
+                "MINT_RPC_URLS": "https://generic.example",
+            },
+            clear=False,
+        ):
+            urls = config.rpc_urls_for_chain("test-key", 8453)
+        self.assertEqual(urls[0], config.rpc_url_for_chain("test-key", 8453))
+        self.assertEqual(urls[1:], [
+            "https://base-one.example",
+            "https://base-two.example",
+        ])
 
     def test_wallet_registry_derives_extra_addresses_and_rejects_duplicates(self):
         primary_key = "0x" + "11" * 32

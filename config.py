@@ -216,6 +216,22 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Public SeaDrop stages can be prepared and signed directly from on-chain
+# configuration.  This is the fast path used by the Telegram bot when the
+# collection exposes a compatible public SeaDrop stage.  Restricted stages,
+# allowlists, and custom contracts continue through their existing adapters.
+DIRECT_PUBLIC_SEADROP = os.getenv("DIRECT_PUBLIC_SEADROP", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+try:
+    DIRECT_SEADROP_START_TOLERANCE_SECONDS = int(
+        os.getenv("DIRECT_SEADROP_START_TOLERANCE_SECONDS", "120")
+    )
+except (TypeError, ValueError):
+    raise ValueError("DIRECT_SEADROP_START_TOLERANCE_SECONDS must be an integer")
+if DIRECT_SEADROP_START_TOLERANCE_SECONDS < 0:
+    raise ValueError("DIRECT_SEADROP_START_TOLERANCE_SECONDS cannot be negative")
+
 
 # ---------------------------------------------------------------------------
 # DISCOVERY, DAILY RUNNER, AND CHAIN SUPPORT
@@ -331,6 +347,32 @@ def rpc_url_for_chain(alchemy_key, chain_id):
         if settings["chain_id"] == chain_id:
             return f"https://{settings['rpc_subdomain']}.g.alchemy.com/v2/{alchemy_key}"
     raise ValueError(f"chain ID {chain_id} has no configured Alchemy RPC mapping")
+
+
+def rpc_urls_for_chain(alchemy_key, chain_id):
+    """Return the primary RPC plus optional broadcast endpoints.
+
+    ``MINT_RPC_URLS_<CHAIN>`` (or the generic ``MINT_RPC_URLS``) may contain
+    comma-separated HTTP(S) endpoints.  The Alchemy endpoint remains first for
+    reads and transaction preparation; the extra endpoints are used only to
+    fan out an identical signed transaction at launch.
+    """
+    primary = rpc_url_for_chain(alchemy_key, chain_id)
+    slug = chain_slug_for_id(chain_id)
+    configured = ""
+    if slug:
+        configured = os.getenv(f"MINT_RPC_URLS_{slug.upper()}", "").strip()
+    if not configured:
+        configured = os.getenv("MINT_RPC_URLS", "").strip()
+
+    urls = [primary]
+    for value in configured.split(","):
+        value = value.strip()
+        if not value or value in urls:
+            continue
+        if value.startswith(("http://", "https://")):
+            urls.append(value)
+    return urls
 
 
 def chain_slug_for_id(chain_id):

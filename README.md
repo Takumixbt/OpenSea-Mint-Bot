@@ -42,6 +42,13 @@ From Telegram, you can:
 - preview the cheapest OpenSea listing and buy it only after confirmation;
 - configure the NFT receipt-card background and accent color.
 
+For compatible public SeaDrop stages, the bot uses a direct on-chain fast path:
+it reads the public price/window from SeaDrop, prepares calldata, signs during
+the warm-up window, and broadcasts the same signed transaction to optional RPC
+endpoints at launch. Other routes keep their required checks: OpenSea calldata
+for allowlists/signatures and the verified-contract adapter for a small set of
+safe external routes.
+
 The scanner uses OpenSea's official Drops feeds. A collection that is merely
 indexed or traded on OpenSea is not automatically an OpenSea Drop. Custom
 puzzles, CAPTCHAs, backend signatures, unknown Merkle proofs, and ambiguous
@@ -141,6 +148,18 @@ MINT_WALLETS=Backup:0xBACKUP_PRIVATE_KEY;Second:0xSECOND_PRIVATE_KEY
 The bot derives and displays public addresses only. Never put these values in
 Telegram messages, screenshots, issues, or pull requests.
 
+The direct SeaDrop path is enabled by default. You can add extra broadcast
+endpoints per chain if you have them:
+
+```text
+DIRECT_PUBLIC_SEADROP=true
+MINT_RPC_URLS_BASE=https://rpc-one.example,https://rpc-two.example
+```
+
+The Alchemy endpoint remains the primary endpoint for reads and preparation.
+At launch, each extra endpoint receives the same signed transaction; this does
+not create multiple mints because the raw transaction and hash are identical.
+
 Set `DISCOVERY_UTC_OFFSET_HOURS` to the fixed offset you want for the
 midnight-to-midnight scan. For example, West Africa Time is `1`; UTC is `0`.
 
@@ -171,6 +190,13 @@ Restart the bot after changing `.env`. The Telegram flow still requires an
 explicit confirmation. Before signing, the Python bot checks the chain,
 wallet balance, exact value, gas envelope, stage/quantity limits, and a
 transaction simulation where the route supports it.
+
+For a compatible public SeaDrop stage, the direct path signs before the
+opening second so the launch path is only the raw-transaction broadcast. It is
+used only when the on-chain price and opening time match the Telegram preview.
+If the collection is not SeaDrop-compatible, the bot keeps the normal OpenSea
+or verified-contract route. Allowlists and signature stages cannot use the
+direct path because they require project-specific authorization.
 
 A successful broadcast is not a guarantee of inclusion. The network can still
 reject, replace, or reorder transactions, and a collection can sell out.
@@ -256,19 +282,17 @@ Rules:
     confirmation from me in the terminal session.
 ```
 
-## Tampermonkey browser companion
+## Direct execution guide
 
-The optional `opensea_mint_assist.user.js` is a browser helper for one visible
-OpenSea page. It can watch a page, wait for a chosen time, identify a visible
-Mint/Claim control, and optionally click it once. It never reads private keys,
-uses the OpenSea API, controls MetaMask/Rabby, or presses the final wallet
-confirmation.
+The project-owned `opensea_direct_executor.py` is the low-latency on-chain
+executor for compatible public SeaDrop stages. It is integrated into the
+Telegram scheduler and signs a checked transaction during warm-up, so no
+browser, Chrome session, or wallet extension is required. It has its own
+project-owned implementation and naming.
 
-It therefore cannot replace the Python bot's Telegram control, VPS schedules,
-multi-wallet execution, cross-chain scanner, balance checks, or transaction
-receipt tracking. The browser must remain open. Read
-[TAMPERMONKEY.md](TAMPERMONKEY.md) before enabling its optional auto-click
-features.
+Read [DIRECT_EXECUTION.md](DIRECT_EXECUTION.md) for the exact setup, Telegram
+flow, VPS service, timing model, supported routes, and the upgrades included
+around the direct executor.
 
 ## Troubleshooting
 

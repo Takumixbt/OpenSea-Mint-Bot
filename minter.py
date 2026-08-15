@@ -1,6 +1,7 @@
 """
-The blockchain side. Takes the mint instructions OpenSea handed us and turns
-them into a real, signed transaction, then sends it and waits for it to land.
+The blockchain side. Takes verified mint instructions (from OpenSea or the
+direct public SeaDrop planner), turns them into a real signed transaction, then
+sends it and waits for it to land.
 
 Uses EIP-1559 fees (the modern "base fee + tip" model that Ethereum, Base,
 Optimism, Arbitrum and Polygon all support). Nothing here is specific to one
@@ -8,6 +9,8 @@ chain, so the same code works whichever chain your drop is on.
 
 The private key is used only to sign, in memory. It is never printed or saved.
 """
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -19,7 +22,14 @@ POA_CHAIN_IDS = {137}
 
 
 class Minter:
-    def __init__(self, rpc_url, private_key, address, chain_id):
+    def __init__(self, rpc_url, private_key, address, chain_id, rpc_urls=None):
+        self.rpc_url = str(rpc_url)
+        endpoints = [self.rpc_url]
+        for endpoint in rpc_urls or []:
+            endpoint = str(endpoint or "").strip()
+            if endpoint and endpoint not in endpoints:
+                endpoints.append(endpoint)
+        self.rpc_urls = endpoints
         self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
         if int(chain_id) in POA_CHAIN_IDS:
             # Polygon includes a longer proof-of-authority extraData field.
@@ -31,6 +41,7 @@ class Minter:
         self._cached_nonce = None
         self._cached_gas_fees = None
         self.last_receipt = None
+        self.last_broadcast_count = 0
 
     def warm_up(self):
         """
@@ -48,6 +59,34 @@ class Minter:
                 f"the RPC actually connected to chain {live_chain_id}. Check "
                 f"CHAIN_CONFIGS in config.py maps TARGET_CHAIN_ID to the right RPC."
             )
+        if len(self.rpc_urls) > 1:
+            # Never blast a transaction at an endpoint that reports a
+            # different chain. A wrong-chain raw transaction cannot spend
+            # funds, but filtering it keeps the launch path predictable.
+            def endpoint_chain_id(url):
+                provider = Web3(
+                    Web3.HTTPProvider(url, request_kwargs={"timeout": 8})
+                )
+                return int(provider.eth.chain_id)
+
+            verified = {self.rpc_url}
+            with ThreadPoolExecutor(
+                max_workers=min(8, len(self.rpc_urls) - 1),
+                thread_name_prefix="rpc-check",
+            ) as pool:
+                futures = {
+                    pool.submit(endpoint_chain_id, url): url
+                    for url in self.rpc_urls[1:]
+                }
+                for future in as_completed(futures):
+                    url = futures[future]
+                    try:
+                        if future.result() == int(self.chain_id):
+                            verified.add(url)
+                    except Exception:
+                        continue
+            # Preserve the configured order after concurrent verification.
+            self.rpc_urls = [url for url in self.rpc_urls if url in verified]
         # "pending" so that if this wallet somehow has a transaction already
         # waiting in the pool, we take the next number after it instead of
         # colliding with it.
@@ -208,14 +247,47 @@ class Minter:
         return signed, summary
 
     def send(self, signed_tx):
-        """Broadcast the signed transaction. Returns the transaction hash."""
+        """Broadcast the signed transaction and return its transaction hash.
+
+        When optional endpoints are configured, the exact same signed bytes
+        are sent to all of them concurrently.  A duplicate raw transaction has
+        the same hash, so this improves propagation without creating multiple
+        mints or spending twice.
+        """
         # web3 v7 renamed rawTransaction -> raw_transaction; support both so a
         # different installed web3 can't crash us at the broadcast moment.
         raw = getattr(signed_tx, "raw_transaction", None)
         if raw is None:
             raw = signed_tx.rawTransaction
-        tx_hash = self.w3.eth.send_raw_transaction(raw)
-        return Web3.to_hex(tx_hash)
+
+        def send_one(url):
+            provider = self.w3 if url == self.rpc_url else Web3(
+                Web3.HTTPProvider(url, request_kwargs={"timeout": 8})
+            )
+            return Web3.to_hex(provider.eth.send_raw_transaction(raw))
+
+        if len(self.rpc_urls) == 1:
+            tx_hash = send_one(self.rpc_urls[0])
+            self.last_broadcast_count = 1
+            return tx_hash
+
+        successes = []
+        errors = []
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(self.rpc_urls)), thread_name_prefix="rpc-blast"
+        ) as pool:
+            futures = [pool.submit(send_one, url) for url in self.rpc_urls]
+            for future in as_completed(futures):
+                try:
+                    successes.append(future.result())
+                except Exception as exc:
+                    errors.append(exc)
+        if not successes:
+            self.last_broadcast_count = 0
+            detail = type(errors[0]).__name__ if errors else "unknown error"
+            raise RuntimeError(f"all configured RPC endpoints rejected the transaction ({detail})")
+        self.last_broadcast_count = len(successes)
+        return successes[0]
 
     def wait_for_confirmation(self, tx_hash, timeout=180):
         """

@@ -2427,6 +2427,8 @@ class TelegramBot:
         collection_url = candidate.get("opensea_url") or candidate.get("url")
         if candidate.get("route") == "generic_contract":
             route = "🟣 Verified external contract · simulation required"
+        elif candidate.get("is_public") is True and candidate.get("contract_address"):
+            route = "⚡ Direct public SeaDrop first · OpenSea fallback"
         elif is_free_public_candidate(candidate):
             route = "🟢 Free/public · ready to request"
         elif candidate.get("is_public") is False:
@@ -2495,6 +2497,11 @@ class TelegramBot:
             return (
                 "The verified external contract route is simulated again for each wallet "
                 "immediately before signing. Custom proofs or changed contract rules make it stop safely."
+            )
+        if candidate.get("is_public") is True and candidate.get("contract_address"):
+            return (
+                "Public SeaDrop stages use the direct on-chain fast path when the contract "
+                "values match the preview; other OpenSea stages use OpenSea's signed calldata route."
             )
         return (
             "OpenSea supplies the final mint transaction and performs the stage eligibility check."
@@ -2812,6 +2819,17 @@ class TelegramBot:
             f"\n<b>Broadcast delay:</b> {esc(result['launch_delay_ms'])} ms"
             if result.get("launch_delay_ms") is not None else ""
         )
+        execution_route = str(result.get("execution_route") or "").strip()
+        if execution_route == "direct_seadrop":
+            route_line = "\n<b>Execution:</b> ⚡ Direct SeaDrop fast path"
+        elif execution_route == "mixed":
+            route_line = "\n<b>Execution:</b> Mixed direct/OpenSea routes"
+        elif execution_route:
+            route_line = "\n<b>Execution:</b> OpenSea verified calldata"
+        else:
+            route_line = ""
+        rpc_count = int(result.get("broadcast_rpc_count") or 0)
+        rpc_line = f"\n<b>RPC broadcast:</b> {rpc_count} endpoint(s)" if rpc_count > 1 else ""
         tx_hash = result.get("tx_hash")
         tx_link = embedded_link(
             "View transaction", explorer_tx_url(candidate.get("chain"), tx_hash)
@@ -2843,13 +2861,17 @@ class TelegramBot:
                     explorer_tx_url(candidate.get("chain"), item.get("tx_hash")),
                 ) if item.get("tx_hash") else esc(short_text(item.get("error", "No transaction"), 80))
                 lines.append(f"<b>{esc(wallet.get('label', 'Wallet'))}</b> · {status} · {link}")
-            lines.extend(["", "Each wallet used its own nonce, balance, gas check, and transaction."])
+            lines.extend([
+                "",
+                "Each wallet used its own nonce, balance, gas check, and transaction.",
+                (f"Execution: {execution_route.replace('_', ' ')}" if execution_route else ""),
+            ])
             return "\n".join(lines)
         if result.get("tx_hash") and result.get("confirmed") is True:
             return (
                 "<b>✅ Mint confirmed</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> {transaction}{speed}\n"
+                f"<b>Transaction:</b> {transaction}{speed}{route_line}{rpc_line}\n"
                 "<b>Ownership:</b> confirmed on-chain; OpenSea may still be indexing it."
                 f"{details}"
             )
@@ -2857,14 +2879,14 @@ class TelegramBot:
             return (
                 "<b>❌ Mint transaction reverted</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> {transaction}{speed}"
+                f"<b>Transaction:</b> {transaction}{speed}{route_line}{rpc_line}"
                 f"{details}"
             )
         if result.get("tx_hash"):
             return (
                 "<b>⏳ Transaction sent; confirmation pending</b>\n\n"
                 f"<b>Collection:</b> {collection_link}\n"
-                f"<b>Transaction:</b> {transaction}{speed}\n\n"
+                f"<b>Transaction:</b> {transaction}{speed}{route_line}{rpc_line}\n\n"
                 "Do not retry this mint. Check the transaction in the chain explorer."
                 f"{details}"
             )

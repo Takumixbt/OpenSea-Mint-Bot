@@ -173,7 +173,13 @@ def main():
             f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(open_time))}.")
 
     # --- Set up the blockchain side ---
-    minter = Minter(rpc_url, private_key, wallet_address, chain_id)
+    minter = Minter(
+        rpc_url,
+        private_key,
+        wallet_address,
+        chain_id,
+        rpc_urls=config.rpc_urls_for_chain(alchemy_key, chain_id),
+    )
     try:
         balance = minter.native_balance()
     except Exception as e:

@@ -29,6 +29,10 @@ MAX_BUY_PRICE_NATIVE=0
 Use `/start` in Telegram. The bot scans one network at a time. It includes
 paid and restricted OpenSea stages; the price cap only controls execution.
 
+Public SeaDrop stages use the faster direct on-chain path automatically when
+their on-chain price and opening time match the scan. Allowlists and custom
+routes keep their required OpenSea/contract checks.
+
 ## Run on Ubuntu as a VPS service
 
 ```bash
@@ -58,9 +62,9 @@ sudo journalctl -u opensea-mint-bot.service -f
 Only one process may use a Telegram token. Chrome and MetaMask are not needed
 for the Python VPS route.
 
-## Tampermonkey
+## Fast direct route
 
-The browser helper is separate. Install Tampermonkey, create a new script,
-paste `opensea_mint_assist.user.js`, save it, and follow
-[TAMPERMONKEY.md](TAMPERMONKEY.md). It needs the browser page to stay open and
-leaves the final wallet confirmation to you.
+The bot automatically uses `opensea_direct_executor.py` for compatible public
+SeaDrop stages. It runs from Python and Telegram, so Chrome, OpenSea tabs, and
+wallet extensions are not needed. See [DIRECT_EXECUTION.md](DIRECT_EXECUTION.md)
+for the setup and timing details.

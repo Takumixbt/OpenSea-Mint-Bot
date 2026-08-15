@@ -198,6 +198,7 @@ class DailyMintService:
                 profile.private_key,
                 profile.address,
                 int(chain["chain_id"]),
+                rpc_urls=config.rpc_urls_for_chain(self.alchemy_key, int(chain["chain_id"])),
             )
             check = minter.funding_preview(mint_value_wei)
             check["wallet"] = profile.public()
@@ -255,6 +256,7 @@ class DailyMintService:
                     profile.private_key,
                     profile.address,
                     int(chain["chain_id"]),
+                    rpc_urls=config.rpc_urls_for_chain(self.alchemy_key, int(chain["chain_id"])),
                 )
                 live_chain, _ = minter.warm_up()
                 if live_chain != int(chain["chain_id"]):
@@ -1294,6 +1296,8 @@ class DailyMintService:
             "mint_value_wei": result.get("summary", {}).get("value_wei", 0),
             "gas_wei": result.get("worst_case_gas_wei", 0),
             "actual_gas_wei": result.get("actual_gas_wei"),
+            "execution_route": result.get("execution_route"),
+            "broadcast_rpc_count": result.get("broadcast_rpc_count"),
             "wallet_results": [
                 {
                     "wallet": item.get("wallet"),
@@ -1480,6 +1484,15 @@ class DailyMintService:
             "actual_gas_wei": sum(
                 int(item.get("actual_gas_wei") or 0) for item in successes
             ),
+            "execution_route": (
+                "direct_seadrop"
+                if successes and all(item.get("execution_route") == "direct_seadrop" for item in successes)
+                else "mixed" if any(item.get("execution_route") == "direct_seadrop" for item in successes)
+                else "opensea_drop"
+            ),
+            "broadcast_rpc_count": max(
+                int(item.get("broadcast_rpc_count") or 0) for item in successes
+            ),
             "summary": {
                 "value_wei": sum(
                     int((item.get("summary") or {}).get("value_wei") or 0)
@@ -1628,6 +1641,8 @@ class DailyMintService:
                 ),
                 "gas_wei": result.get("worst_case_gas_wei", 0),
                 "actual_gas_wei": result.get("actual_gas_wei"),
+                "execution_route": result.get("execution_route"),
+                "broadcast_rpc_count": result.get("broadcast_rpc_count"),
                 "wallet_results": [
                     {
                         "wallet": item.get("wallet"),
