@@ -524,10 +524,9 @@ class DailyMintService:
                     chains,
                     config.DISCOVERY_WINDOW_HOURS,
                     today_only=True,
-                    # Explicit Telegram scans are chain-specific and use the
-                    # deeper fallback. The broad automatic runner remains on
-                    # the lightweight calendar route.
-                    include_ranked_fallback=bool(chain_slug and chain_slug != "all"),
+                    # /scan only indexes collections OpenSea exposes as drops.
+                    # It does not probe arbitrary on-chain or top collections.
+                    include_ranked_fallback=False,
                 )
             finally:
                 client.close()
@@ -551,7 +550,9 @@ class DailyMintService:
                     for drop_type in config.DISCOVERY_DROP_TYPES:
                         cursor = None
                         seen_cursors = set()
-                        for _ in range(max(1, config.DISCOVERY_MAX_PAGES_PER_CHAIN)):
+                        page_count = 0
+                        while True:
+                            page_count += 1
                             cards, next_cursor = opensea_client.list_drops(
                                 client, self.api_key, "", drop_type,
                                 config.DISCOVERY_LIMIT_PER_CHAIN, cursor,
@@ -581,6 +582,9 @@ class DailyMintService:
                                     }
                                     break
                             if info or not next_cursor or str(next_cursor) in seen_cursors:
+                                break
+                            page_limit = int(config.DISCOVERY_MAX_PAGES_PER_CHAIN or 0)
+                            if page_limit > 0 and page_count >= page_limit:
                                 break
                             seen_cursors.add(str(next_cursor))
                             cursor = next_cursor

@@ -1,52 +1,87 @@
-# OpenSea Mint Bot — Tampermonkey helper
+# Tampermonkey browser companion
 
-This is an optional browser helper. It is not the Python mint bot.
+`opensea_mint_assist.user.js` is an optional browser helper for one OpenSea
+collection/drop page. It is not a second wallet and it is not a replacement
+for the Python Telegram bot.
 
-## Install
+## What it can do
 
-1. Install Tampermonkey in Chrome or another supported browser.
-2. Open the Tampermonkey dashboard.
-3. Choose **Create a new script**.
-4. Delete the starter code.
-5. Copy all of `opensea_mint_assist.user.js` into the editor.
-6. Save with `Ctrl+S`.
-7. Make sure the script is enabled.
+- show a small status panel on OpenSea pages;
+- watch for a visible Mint, Claim, or Collect button;
+- check nearby page text for free/zero-value evidence;
+- optionally allow a paid click only when you explicitly enable it and set a
+  visible price cap;
+- wait until a browser-local date and time;
+- optionally set a visible numeric quantity input;
+- click at most one page control, then disarm immediately.
 
-## Use
+## What it cannot do
 
-1. Open one OpenSea collection/drop page.
-2. Refresh the page.
-3. Look for the **OpenSea Mint Assist** panel in the bottom-right corner.
-4. Leave **Require visible free/0-value evidence** enabled unless you fully
-   understand the page price.
-5. Leave **Auto-click one page button** disabled for the safest route.
-6. Click **Arm once** when you are ready.
-7. If a visible Mint/Claim button appears, click it yourself.
-8. Review the wallet popup carefully and confirm it manually.
+- scan every OpenSea chain or collection;
+- call the Python bot or Telegram;
+- read a private key, seed phrase, API key, or wallet balance;
+- sign or confirm a MetaMask/Rabby transaction;
+- guarantee that a button is the project's real mint control;
+- bypass allowlists, signatures, puzzles, CAPTCHAs, or project limits.
 
-## Fast mode
+The wallet popup and final **Confirm** action are always yours. The browser
+must remain open, logged in, connected to the intended wallet, and on the
+correct collection page.
 
-For an opt-in fast route:
+## Install Tampermonkey
 
-1. Enable **Auto-arm on page load**.
-2. Enable **Auto-click one page button**.
-3. Keep **Require visible free/0-value evidence** enabled for free mints.
-4. Reload the OpenSea page before the drop.
+1. Go to the official site: <https://www.tampermonkey.net/>.
+2. Choose your browser and install the extension from its official store.
+3. Open the Tampermonkey extension menu and choose **Dashboard**.
+4. Select **Create a new script**.
+5. Delete the starter template.
+6. Copy the complete contents of `opensea_mint_assist.user.js` into the editor.
+7. Save with `Ctrl+S`.
+8. Confirm the script is enabled and its match rule is `https://opensea.io/*`.
 
-The helper watches the page continuously and clicks at most one matching button
-as soon as it becomes visible. It immediately disarms after the click. For a
-paid mint, disable the free-only checkbox only after verifying the price yourself.
+Review the script before installing it. Do not install a modified copy from an
+unknown source.
 
-The wallet popup is still manual. Tampermonkey cannot safely sign or press
-Confirm inside MetaMask or Rabby, so the final approval remains yours.
+## Safe first use
 
-## How to verify it is working
+1. Open the intended OpenSea collection or drop page.
+2. Connect the intended wallet manually.
+3. Check the chain, collection, quantity, and price in OpenSea itself.
+4. Leave **Free/zero-value only** enabled.
+5. Leave **Auto-click** disabled.
+6. Click **Arm once**.
+7. When the panel reports a matching control, click the page button yourself.
+8. Read the wallet popup and reject it if the recipient, value, gas, or chain
+   is not exactly what you expect.
 
-The panel should appear on `https://opensea.io/*` pages and initially say
-`Disarmed — watching only`. On a live page it will report when it sees a visible
-Mint/Claim control. If the panel appears but cannot find the control, OpenSea's
-current UI text or button structure may differ; use the page manually or use the
-Python bot instead.
+## Faster opt-in use
 
-The browser must remain open for this route. The helper does not read your
-private key, API key, wallet address, or Python bot credentials.
+Only after the safe flow works:
+
+1. Set the browser-local launch time, or leave it blank for immediate watching.
+2. Enable **Auto-arm on page load** if you understand that refreshing the page
+   arms the helper again.
+3. Enable **Auto-click one page button**.
+4. Keep **Free/zero-value only** enabled for free drops.
+5. Reload the page before the target time.
+
+The helper clicks once at most and then disarms. It does not press the wallet
+confirmation button.
+
+## Paid page clicks
+
+Paid browser clicks are deliberately opt-in. Disable **Free/zero-value only**,
+enable **Allow paid click**, and enter a maximum native-coin amount. The helper
+only proceeds when it can find a nearby visible price and the amount is at or
+below your cap. Page text can be ambiguous, so the Python bot is the safer
+route for paid execution. Always verify the wallet popup manually.
+
+## Troubleshooting
+
+- If the panel does not appear, make sure the URL starts with
+  `https://opensea.io/`, the script is enabled, and the page is refreshed.
+- If it says no button was found, OpenSea may have changed its UI or the drop
+  may not be live. Use the page manually.
+- If the browser page changes collection through client-side navigation,
+  refresh before arming again.
+- If the wallet popup shows a different chain or value, reject it.

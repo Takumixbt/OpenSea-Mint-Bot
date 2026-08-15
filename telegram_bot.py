@@ -941,7 +941,7 @@ class TelegramBot:
             self.render_candidates(
                 candidates,
                 errors,
-                title=f"🎨 <b>Today on {esc(pretty_chain(chain))}</b>",
+                title=f"🎨 <b>OpenSea mints · {esc(pretty_chain(chain))}</b>",
             ),
             self.candidates_keyboard(candidates, scan_chain=chain),
             target_id,
@@ -2339,11 +2339,11 @@ class TelegramBot:
 
     def scan_picker_text(self):
         return (
-            "<b>🔎 Find today’s mints</b>\n\n"
+            "<b>🔎 Find OpenSea mints</b>\n\n"
             "Which network do you want to search?\n\n"
-            "The bot scans one network at a time and shows mint options opening today, "
-            "including their time, price, and access type.\n\n"
-            "<i>Coverage comes from OpenSea’s upcoming, recently minted, and featured calendars.</i>"
+            "The bot shows every live mint and every mint opening today that "
+            "OpenSea exposes for that network.\n\n"
+            "<i>One scan · OpenSea-hosted mints only</i>"
         )
 
     def render_candidates(self, candidates, errors, title="🎨 <b>Today’s mint options</b>", page=0):
@@ -2357,14 +2357,16 @@ class TelegramBot:
         if not candidates:
             text = (
                 f"{title}\n\n"
-                "<b>No live or upcoming mints found today.</b>\n"
-                "Check again later, or paste a collection link into <b>Look up an NFT</b>."
+                "<b>No OpenSea mints are live or opening today.</b>\n"
+                "Check again later. Collections that are only listed for trading are not included."
             )
         else:
-            free_count = sum(1 for candidate in candidates if is_free_public_candidate(candidate))
+            free_count = sum(1 for candidate in candidates if candidate.get("is_free"))
+            public_count = sum(1 for candidate in candidates if candidate.get("is_public"))
             lines = [
                 title,
-                f"<i>{esc(total)} projects · {esc(total_options)} mint options · {esc(free_count)} free + public</i>",
+                f"<i>{esc(total)} projects · {esc(total_options)} mint options · "
+                f"{esc(free_count)} free · {esc(public_count)} public</i>",
                 f"<i>Page {page + 1} of {total_pages} · tap a project to continue</i>",
                 "",
             ]
@@ -2404,11 +2406,18 @@ class TelegramBot:
                 active.append(candidate)
             elif start > now:
                 upcoming.append(candidate)
+        if active and upcoming:
+            opens = min(item.get("start_time") or 0 for item in upcoming)
+            upcoming_word = "open" if len(upcoming) != 1 else "opens"
+            return (
+                f"🟢 {len(active)} live · "
+                f"🕒 {len(upcoming)} {upcoming_word} {format_time(opens)}"
+            )
         if active:
-            return "🟢 Live now"
+            return f"🟢 {len(active)} live now"
         if upcoming:
             opens = min(item.get("start_time") or 0 for item in upcoming)
-            return f"🕒 Opens {format_time(opens)}"
+            return f"🕒 {len(upcoming)} opens {format_time(opens)}"
         return "Stage timing unavailable"
 
     def render_candidate(self, candidate, index):
