@@ -170,6 +170,73 @@ def get_collection_nfts(client, slug, api_key, limit=1, cursor=None):
     return nfts, payload.get("next") or payload.get("next_cursor")
 
 
+def get_best_collection_listings(client, slug, api_key, limit=20):
+    """Return active collection listings sorted by current price ascending."""
+    if _api_key_missing(api_key):
+        raise RuntimeError("OPENSEA_API_KEY is missing or still a placeholder.")
+    try:
+        limit = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit = 20
+    endpoint = (
+        f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/listings/collection/"
+        f"{quote(str(slug), safe='-_.~')}/best"
+    )
+    payload = _get_json(client, endpoint, api_key, params={"limit": limit})
+    if not isinstance(payload, dict) or not isinstance(payload.get("listings"), list):
+        raise RuntimeError("OpenSea returned an invalid best-listings response.")
+    return payload["listings"], payload.get("next")
+
+
+def get_listing_fulfillment_data(client, listing, fulfiller_address, api_key):
+    """Request ready-to-encode Seaport fulfillment data for one exact listing."""
+    if _api_key_missing(api_key):
+        raise RuntimeError("OPENSEA_API_KEY is missing or still a placeholder.")
+    listing = dict(listing or {})
+    asset = listing.get("asset") if isinstance(listing.get("asset"), dict) else {}
+    required = {
+        "hash": listing.get("order_hash"),
+        "chain": listing.get("chain"),
+        "protocol_address": listing.get("protocol_address"),
+    }
+    if not all(required.values()) or not asset.get("contract") or asset.get("identifier") is None:
+        raise ValueError("the selected OpenSea listing is incomplete")
+    address = str(fulfiller_address or "").strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
+        raise ValueError("the fulfiller wallet address is invalid")
+    endpoint = f"{config.OPENSEA_API_BASE_URL.rstrip('/')}/listings/fulfillment_data"
+    try:
+        response = client.post(
+            endpoint,
+            headers=_api_headers(api_key, content_type=True),
+            json={
+                "listing": required,
+                "fulfiller": {"address": address},
+                "consideration": {
+                    "asset_contract_address": asset["contract"],
+                    "token_id": str(asset["identifier"]),
+                },
+                "units_to_fill": 1,
+                "include_optional_creator_fees": False,
+            },
+            timeout=15.0,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"OpenSea listing fulfillment failed ({type(exc).__name__})") from exc
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"OpenSea could not fulfill this listing (HTTP {response.status_code}): "
+            f"{_response_message(response)}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenSea returned non-JSON listing fulfillment data") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenSea returned invalid listing fulfillment data")
+    return payload
+
+
 def get_account_nfts(client, chain, address, api_key, limit=200, cursor=None):
     """Return NFTs owned by an account on one OpenSea-supported chain."""
     if _api_key_missing(api_key):

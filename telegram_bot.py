@@ -1,4 +1,4 @@
-"""Professional Telegram control panel for the OpenSea Mint Bot.
+"""Professional Telegram control panel for the NFT Mint Bot.
 
 The bot uses Telegram's HTTPS Bot API directly. The interface is intentionally
 button-first: discovery, research, live scheduling, and mint confirmation are
@@ -67,7 +67,7 @@ def short_text(value, length=28):
 def candidate_token(candidate):
     """Return a short identity token so old inline buttons cannot mint a new candidate."""
     identity = ":".join(str(candidate.get(name, "")) for name in (
-        "chain", "slug", "stage_index", "start_time"))
+        "chain", "slug", "stage_index", "start_time", "route", "contract_address"))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
 
 
@@ -305,6 +305,7 @@ class TelegramBot:
         self.schedule_drafts = {}
         self.research_drafts = {}
         self.quantity_choices = {}
+        self.wallet_choices = {}
         self.last_scan_chain = None
         self.offset = None
 
@@ -319,7 +320,7 @@ class TelegramBot:
         try:
             self.api.send_message(
                 self.allowed_chat_id,
-                "🔔 <b>OpenSea Mint Bot update</b>\n\n" + esc(message),
+                "🔔 <b>NFT Mint Bot update</b>\n\n" + esc(message),
                 parse_mode=HTML_MODE,
             )
         except Exception as exc:
@@ -410,6 +411,8 @@ class TelegramBot:
                         self.handle_quantity_input(chat_id, text, pending)
                     elif pending.get("kind") == "price_cap":
                         self.handle_price_cap_input(chat_id, text)
+                    elif pending.get("kind") == "buy_cap":
+                        self.handle_buy_cap_input(chat_id, text)
                     elif pending.get("kind") == "card_accent":
                         self.handle_accent_input(chat_id, text)
                     elif pending.get("kind") == "card_brand":
@@ -556,7 +559,19 @@ class TelegramBot:
         elif data == "wallet":
             self.start_wallet_status(chat_id, message_id=message_id)
         elif data.startswith("wallet:chain:"):
-            self.start_wallet_status(chat_id, data.rsplit(":", 1)[-1], message_id)
+            parts = data.split(":")
+            self.start_wallet_status(
+                chat_id,
+                parts[2],
+                message_id,
+                parts[3] if len(parts) > 3 else "primary",
+            )
+        elif data.startswith("wallet:profile:"):
+            self.start_wallet_status(
+                chat_id,
+                message_id=message_id,
+                wallet_id=data.rsplit(":", 1)[-1],
+            )
         elif data == "wallet:mints":
             self.show_mint_history(chat_id, message_id)
         elif data == "chains":
@@ -597,6 +612,8 @@ class TelegramBot:
             self.show_settings(chat_id, message_id, notice="✅ <b>Built-in card background restored.</b>")
         elif data == "settings:cap":
             self.begin_price_cap_input(chat_id, message_id)
+        elif data == "settings:buycap":
+            self.begin_buy_cap_input(chat_id, message_id)
         elif data == "settings:accent":
             self.begin_accent_input(chat_id, message_id)
         elif data == "settings:brand":
@@ -624,6 +641,8 @@ class TelegramBot:
             self.dispatch_mint_callback(chat_id, message_id, data)
         elif data.startswith("quantity:"):
             self.dispatch_quantity_callback(chat_id, message_id, data)
+        elif data.startswith("wallets:"):
+            self.dispatch_wallets_callback(chat_id, message_id, data)
         else:
             self._present(chat_id, "That button has expired. Open the dashboard again.", self.home_keyboard(), message_id)
 
@@ -724,8 +743,83 @@ class TelegramBot:
             if not candidate:
                 raise ValueError("this research result has no mintable stage")
             self.start_draft_mint(chat_id, candidate, token, message_id)
+        elif action == "buy":
+            self.show_purchase_confirmation(chat_id, token, draft, message_id)
+        elif action == "buyconfirm":
+            self.start_purchase(chat_id, token, draft, message_id)
         else:
             raise ValueError("invalid or expired research button")
+
+    def show_purchase_confirmation(self, chat_id, token, draft, message_id=None):
+        research = draft.get("research") or draft
+        slug = str(research.get("slug") or "")
+        preview = self.service.purchase_preview(slug)
+        preview["name"] = research.get("name") or slug
+        with self.input_lock:
+            saved = (self.research_drafts.get(int(chat_id)) or {}).get(str(token))
+            if saved is not None:
+                saved["best_listing"] = preview
+                if isinstance(saved.get("research"), dict):
+                    saved["research"]["best_listing"] = preview
+        wallet = self._public_wallets()[0]
+        over_cap = int(preview.get("price_wei") or 0) > config.MAX_BUY_VALUE_WEI
+        cap_note = (
+            "❌ This listing is above your buy cap. Increase it in Settings before confirming."
+            if over_cap else
+            "✅ Exact listing and price will be checked again before signing."
+        )
+        rows = []
+        if not over_cap:
+            rows.append([self.button("✅ Buy this NFT", f"research:buyconfirm:{token}")])
+        rows.extend([
+            [self.button("⚙️ Buy price cap", "settings:buycap")],
+            [self.button("↩️ Back", f"research:view:{token}")],
+        ])
+        text = (
+            "⚠️ <b>Confirm OpenSea purchase</b>\n\n"
+            f"<b>Collection:</b> {embedded_link(preview.get('name'), f'https://opensea.io/collection/{slug}')}\n"
+            f"<b>NFT:</b> {embedded_link('#' + str(preview.get('token_id')), preview.get('opensea_url'))}\n"
+            f"<b>Chain:</b> {esc(pretty_chain(preview.get('chain')))}\n"
+            f"<b>Current total price:</b> {esc(preview.get('price_display'))}\n"
+            f"<b>Buy cap:</b> {esc(config.MAX_BUY_PRICE_NATIVE)} native coin\n"
+            f"<b>Wallet:</b> {esc(wallet.get('label'))} · <code>{esc(wallet.get('address'))}</code>\n\n"
+            f"{esc(cap_note)}\n\n"
+            "This is a secondary-market purchase, not a mint. The confirmation buys exactly "
+            "the displayed token from its exact signed listing; it never substitutes a more expensive item."
+        )
+        self._present(chat_id, text, self.markup(rows), message_id)
+
+    def start_purchase(self, chat_id, token, draft, message_id=None):
+        preview = (draft.get("research") or draft).get("best_listing") or draft.get("best_listing")
+        if not preview:
+            raise ValueError("the listing preview expired; open Buy current price again")
+        self._background(
+            chat_id,
+            "Buying exact OpenSea listing",
+            lambda target_id: self.purchase_job(chat_id, preview, target_id),
+            message_id,
+        )
+
+    def purchase_job(self, chat_id, preview, target_id):
+        result = self.service.buy_listing(preview, "primary")
+        tx_hash = result.get("tx_hash")
+        chain = (result.get("candidate") or {}).get("chain")
+        link = embedded_link("View transaction", explorer_tx_url(chain, tx_hash))
+        status = (
+            "✅ Confirmed" if result.get("confirmed") is True
+            else "❌ Reverted" if result.get("confirmed") is False
+            else "📡 Broadcast"
+        )
+        self._present(
+            chat_id,
+            "<b>🛍 OpenSea purchase</b>\n\n"
+            f"<b>Status:</b> {status}\n"
+            f"<b>NFT:</b> #{esc((result.get('candidate') or {}).get('token_id'))}\n"
+            f"<b>Price:</b> {esc((result.get('candidate') or {}).get('price_display'))}\n"
+            f"<b>Transaction:</b> {link}",
+            self.home_keyboard(),
+            target_id,
+        )
 
     def dispatch_mint_callback(self, chat_id, message_id, data):
         parts = data.split(":")
@@ -781,6 +875,30 @@ class TelegramBot:
             self.begin_custom_quantity_input(chat_id, candidate, "schedule", None, message_id)
         else:
             raise ValueError("invalid or expired quantity button")
+
+    def dispatch_wallets_callback(self, chat_id, message_id, data):
+        parts = data.split(":")
+        if len(parts) == 4 and parts[1] == "candidate" and parts[2].isdigit():
+            index = int(parts[2])
+            candidate = self._candidate_from_ref(f"candidate:{index}:{parts[3]}")[1]
+            self.show_wallet_picker(chat_id, candidate, "candidate", index, message_id)
+            return
+        if len(parts) == 3 and parts[1] == "schedule":
+            candidate = self._schedule_candidate_from_ref(chat_id, parts[2])
+            self.show_wallet_picker(chat_id, candidate, "schedule", None, message_id)
+            return
+        if len(parts) == 6 and parts[1] == "toggle" and parts[2] == "candidate":
+            if not parts[3].isdigit():
+                raise ValueError("invalid wallet button")
+            index = int(parts[3])
+            candidate = self._candidate_from_ref(f"candidate:{index}:{parts[4]}")[1]
+            self.toggle_wallet(chat_id, candidate, parts[5], "candidate", index, message_id)
+            return
+        if len(parts) == 5 and parts[1] == "toggle" and parts[2] == "schedule":
+            candidate = self._schedule_candidate_from_ref(chat_id, parts[3])
+            self.toggle_wallet(chat_id, candidate, parts[4], "schedule", None, message_id)
+            return
+        raise ValueError("invalid or expired wallet button")
 
     # ------------------------------------------------------------------
     # Actions and background jobs
@@ -843,8 +961,8 @@ class TelegramBot:
             chat_id,
             "<b>📌 Schedule one mint</b>\n\n"
             "Send an OpenSea <b>collection or drop URL</b> as your next message.\n\n"
-            "The bot will read the chain, show every active/upcoming stage, and let you "
-            "review and confirm a live mint or schedule.\n\n"
+            "The bot first checks OpenSea Drops. If minting happens on the project's own "
+            "contract, it will use a verified and simulatable external route when available.\n\n"
             "<i>Individual NFT asset URLs are not mint routes. Use the collection/drop page.</i>",
             self.schedule_input_keyboard(),
             message_id,
@@ -1098,6 +1216,7 @@ class TelegramBot:
             confirm = f"research:confirm:{token}"
             cancel = f"research:view:{token}"
         funding = self._funding_block(candidate)
+        route_note = self._route_guard_text(candidate)
         text = (
             "⚠️ <b>Confirm live mint now</b>\n\n"
             f"<b>Collection:</b> {collection}\n"
@@ -1105,11 +1224,12 @@ class TelegramBot:
             f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))}\n"
             f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}\n"
             f"<b>Total mint value:</b> {esc(self._total_mint_value(candidate))}\n"
-            f"<b>Quantity:</b> {esc(candidate.get('quantity', 1))}\n\n"
+            f"<b>Quantity:</b> {esc(candidate.get('quantity', 1))} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n\n"
             f"{funding}\n\n"
             f"{self._schedule_price_warning(candidate)}\n"
             "The next button may request calldata, sign, and broadcast a real transaction. "
-            "OpenSea still performs final price and eligibility checks."
+            f"{route_note}"
         )
         self._present(
             chat_id,
@@ -1162,6 +1282,7 @@ class TelegramBot:
         )
         links = self.rich_links(candidate)
         funding = self._funding_block(candidate)
+        route_note = self._route_guard_text(candidate)
         text = (
             "⚠️ <b>Confirm live mint schedule</b>\n\n"
             f"<b>Collection:</b> {collection_link}\n"
@@ -1171,14 +1292,14 @@ class TelegramBot:
             f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}\n"
             f"<b>Total mint value:</b> {esc(self._total_mint_value(candidate))}\n"
             f"<b>Access:</b> {esc(candidate.get('access_label', 'Unknown'))}\n"
-            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}\n\n"
+            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n\n"
             f"{funding}\n\n"
             f"{warning}\n\n"
-            "<b>OpenSea stage rule:</b> first eligible active stage at fire time. "
-            "This selected stage controls the schedule time; OpenSea makes the final eligibility choice.\n\n"
-            "The bot must stay online. At the opening it will request fresh OpenSea "
-            "calldata, use OpenSea's first eligible active stage, check the wallet and caps, "
-            "then broadcast only if every guard passes.\n\n"
+            f"{route_note}\n\n"
+            "The bot must stay online. At opening it refreshes the exact transaction, "
+            "simulates it, checks every selected wallet and cap, then broadcasts only "
+            "if every guard passes.\n\n"
             f"{description_block(candidate)}\n\n"
             f"{links}"
         )
@@ -1204,7 +1325,7 @@ class TelegramBot:
             chat_id,
             self.render_schedule(
                 schedule,
-                notice="🔴 <b>Live schedule armed.</b> It will still obey every cap and OpenSea eligibility check.",
+                notice="🔴 <b>Live schedule armed.</b> It will still obey every cap, simulation, and route eligibility check.",
             ),
             self.schedule_detail_keyboard(schedule),
             message_id,
@@ -1272,6 +1393,15 @@ class TelegramBot:
 
     def send_mint_receipt(self, chat_id, result):
         """Send a branded post-mint card; transaction links remain clickable in Telegram."""
+        wallet_results = result.get("wallet_results") or []
+        if len(wallet_results) > 1:
+            for wallet_result in wallet_results:
+                if not wallet_result.get("tx_hash"):
+                    continue
+                item = dict(wallet_result)
+                item["candidate"] = result.get("candidate") or {}
+                self.send_mint_receipt(chat_id, item)
+            return
         tx_hash = result.get("tx_hash")
         if not tx_hash:
             return
@@ -1409,12 +1539,13 @@ class TelegramBot:
     def show_settings(self, chat_id, message_id=None, notice=None):
         custom = bool(os.getenv("NFT_CARD_BACKGROUND", "").strip() or PERSISTENT_BACKGROUND.is_file())
         accent = os.getenv("NFT_CARD_ACCENT_COLOR", "#63E6BE").strip() or "#63E6BE"
-        brand = os.getenv("NFT_CARD_BRAND_NAME", "OpenSea Mint Bot").strip() or "OpenSea Mint Bot"
+        brand = os.getenv("NFT_CARD_BRAND_NAME", "NFT Mint Bot").strip() or "NFT Mint Bot"
         text = (
             (notice + "\n\n" if notice else "")
             + "<b>⚙️ Settings</b>\n\n"
             f"<b>Live transactions:</b> {'Enabled' if self.service.live_enabled else 'Locked'}\n"
             f"<b>Maximum mint price:</b> {esc(config.MAX_MINT_PRICE_NATIVE)} native coin\n"
+            f"<b>Maximum buy price:</b> {esc(config.MAX_BUY_PRICE_NATIVE)} native coin\n"
             f"<b>Card background:</b> {'Custom' if custom else 'Built in'}\n"
             f"<b>Card accent:</b> <code>{esc(accent)}</code>\n"
             f"<b>Card brand:</b> {esc(brand)}\n\n"
@@ -1490,6 +1621,27 @@ class TelegramBot:
         cap = config.set_max_mint_price_native(value)
         self._set_env_value("MAX_MINT_PRICE_NATIVE", cap)
         self.show_settings(chat_id, notice="✅ <b>Maximum mint price updated.</b>")
+
+    def begin_buy_cap_input(self, chat_id, message_id=None):
+        with self.input_lock:
+            self.pending_inputs[int(chat_id)] = {
+                "kind": "buy_cap",
+                "expires_at": time.time() + 10 * 60,
+            }
+        self._present(
+            chat_id,
+            "<b>🛍 Maximum OpenSea buy price</b>\n\n"
+            "Send the maximum native coin allowed for one exact secondary-market purchase. "
+            "This is separate from mint price and excludes gas.\n\n"
+            "Example: <code>0.02</code>. Use <code>0</code> to lock buying.",
+            self.markup([[self.button("↩️ Cancel", "settings")]]),
+            message_id,
+        )
+
+    def handle_buy_cap_input(self, chat_id, value):
+        cap = config.set_max_buy_price_native(value)
+        self._set_env_value("MAX_BUY_PRICE_NATIVE", cap)
+        self.show_settings(chat_id, notice="✅ <b>Maximum buy price updated.</b>")
 
     def begin_accent_input(self, chat_id, message_id=None):
         with self.input_lock:
@@ -1586,18 +1738,24 @@ class TelegramBot:
     def show_status(self, chat_id, message_id=None):
         self._present(chat_id, self.status_card(), self.status_keyboard(), message_id)
 
-    def start_wallet_status(self, chat_id, chain_slug=None, message_id=None):
+    def start_wallet_status(
+        self, chat_id, chain_slug=None, message_id=None, wallet_id="primary"
+    ):
         if chain_slug and chain_slug not in self.service.supported_chains():
             raise ValueError("choose one of the enabled networks from the wallet screen")
         label = f"Check {pretty_chain(chain_slug)} wallet" if chain_slug else "Check wallet"
         self._background(
             chat_id, label,
-            lambda target_id: self.wallet_status_job(chat_id, chain_slug, target_id),
+            lambda target_id: self.wallet_status_job(
+                chat_id, chain_slug, wallet_id, target_id
+            ),
             message_id,
         )
 
-    def wallet_status_job(self, chat_id, chain_slug, target_id):
-        snapshot = self.service.wallet_snapshot(chain_slug=chain_slug)
+    def wallet_status_job(self, chat_id, chain_slug, wallet_id, target_id):
+        snapshot = self.service.wallet_snapshot(
+            chain_slug=chain_slug, wallet_id=wallet_id
+        )
         self._present(
             chat_id, self.render_wallet(snapshot), self.wallet_keyboard(snapshot), target_id
         )
@@ -1613,6 +1771,7 @@ class TelegramBot:
         address = str(snapshot.get("address") or "")
         account_url = f"https://opensea.io/{address}" if address else ""
         short_address = f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
+        wallet_label = str((snapshot.get("wallet") or {}).get("label") or "Primary")
         chain_items = snapshot.get("chains") or []
         selected_chain = snapshot.get("selected_chain")
         total_nfts = 0
@@ -1635,6 +1794,7 @@ class TelegramBot:
             count_text = "Unavailable" if count is None else f"{count}{'+' if item.get('nft_count_capped') else ''}"
             lines = [
                 f"<b>💼 {esc(pretty_chain(selected_chain))}</b>",
+                f"<i>{esc(wallet_label)} wallet</i>",
                 embedded_link(short_address, account_url),
                 "",
                 f"<b>Balance</b>\n{esc(format_wallet_balance(item.get('balance_wei'), item.get('native')))}",
@@ -1650,6 +1810,7 @@ class TelegramBot:
 
         lines = [
             "<b>💼 My wallet</b>",
+            f"<i>{esc(wallet_label)}</i>",
             f"{embedded_link(short_address, account_url)} · <b>{esc(total_nfts)}{'+' if not all_exact else ''} NFTs</b>",
             "",
         ]
@@ -1696,17 +1857,40 @@ class TelegramBot:
     def wallet_keyboard(self, snapshot=None):
         chains = [item.get("chain") for item in (snapshot or {}).get("chains", [])]
         selected_chain = (snapshot or {}).get("selected_chain")
+        wallet_id = str(((snapshot or {}).get("wallet") or {}).get("id") or "primary")
+        available = (snapshot or {}).get("available_wallets") or []
         if selected_chain:
+            refresh_callback = (
+                f"wallet:chain:{selected_chain}"
+                if wallet_id == "primary" else f"wallet:chain:{selected_chain}:{wallet_id}"
+            )
+            all_callback = "wallet" if wallet_id == "primary" else f"wallet:profile:{wallet_id}"
             return self.markup([
-                [self.button("🔄 Refresh", f"wallet:chain:{selected_chain}"), self.button("🧾 Mint history", "wallet:mints")],
-                [self.button("‹ All networks", "wallet"), self.button("🏠 Home", "home")],
+                [self.button("🔄 Refresh", refresh_callback), self.button("🧾 Mint history", "wallet:mints")],
+                [self.button("‹ All networks", all_callback), self.button("🏠 Home", "home")],
             ])
-        rows = [[self.button("🔄 Refresh", "wallet"), self.button("🧾 Mint history", "wallet:mints")]]
+        refresh_callback = "wallet" if wallet_id == "primary" else f"wallet:profile:{wallet_id}"
+        rows = [[self.button("🔄 Refresh", refresh_callback), self.button("🧾 Mint history", "wallet:mints")]]
         for start in range(0, len(chains), 2):
             rows.append([
-                self.button(pretty_chain(chain), f"wallet:chain:{chain}")
+                self.button(
+                    pretty_chain(chain),
+                    f"wallet:chain:{chain}" if wallet_id == "primary"
+                    else f"wallet:chain:{chain}:{wallet_id}",
+                )
                 for chain in chains[start:start + 2]
             ])
+        if len(available) > 1:
+            rows.append([self.button("👛 Switch wallet", "noop")])
+            for start in range(0, len(available), 2):
+                rows.append([
+                    self.button(
+                        ("✅ " if item.get("id") == wallet_id else "")
+                        + short_text(item.get("label"), 18),
+                        f"wallet:profile:{item.get('id')}",
+                    )
+                    for item in available[start:start + 2]
+                ])
         rows.append([self.button("🏠 Home", "home")])
         return self.markup(rows)
 
@@ -1801,6 +1985,79 @@ class TelegramBot:
             self.quantity_keyboard(candidate, context, index),
             message_id,
         )
+
+    def _public_wallets(self):
+        getter = getattr(self.service, "public_wallets", None)
+        if callable(getter):
+            wallets = getter()
+            if wallets:
+                return wallets
+        address = str(getattr(self.service, "wallet_address", "") or "")
+        return [{"id": "primary", "label": "Primary", "address": address}]
+
+    def _selected_wallet_ids(self, chat_id, candidate):
+        token = candidate_token(candidate)
+        saved = self.wallet_choices.get((int(chat_id), token))
+        if saved:
+            return list(saved)
+        available = self._public_wallets()
+        valid = {item["id"] for item in available}
+        selected = [
+            wallet_id for wallet_id in (candidate.get("wallet_ids") or [])
+            if wallet_id in valid
+        ]
+        return selected or [available[0]["id"]]
+
+    def show_wallet_picker(
+        self, chat_id, candidate, context, index=None, message_id=None
+    ):
+        candidate = self._rich_candidate(self._with_quantity(chat_id, candidate))
+        wallets = self._public_wallets()
+        selected = set(self._selected_wallet_ids(chat_id, candidate))
+        quantity = int(candidate.get("quantity") or 1)
+        lines = [
+            "<b>👛 Choose mint wallets</b>",
+            "",
+            f"<b>Selected:</b> {len(selected)} of {len(wallets)}",
+            f"<b>Per wallet:</b> {quantity} NFT(s)",
+            f"<b>Total requested:</b> {quantity * len(selected)} NFT(s)",
+            "",
+        ]
+        for wallet in wallets:
+            icon = "✅" if wallet["id"] in selected else "⬜"
+            address = str(wallet.get("address") or "")
+            short = f"{address[:6]}…{address[-4:]}" if len(address) >= 12 else "configured"
+            lines.append(f"{icon} <b>{esc(wallet.get('label'))}</b> · <code>{esc(short)}</code>")
+        lines.extend([
+            "",
+            "Each selected wallet signs its own transaction in parallel. Price and gas apply to every wallet.",
+        ])
+        self._present(
+            chat_id,
+            "\n".join(lines),
+            self.wallet_picker_keyboard(candidate, context, index, selected),
+            message_id,
+        )
+
+    def toggle_wallet(
+        self, chat_id, candidate, wallet_id, context, index=None, message_id=None
+    ):
+        wallets = self._public_wallets()
+        valid = {item["id"] for item in wallets}
+        selected = set(self._selected_wallet_ids(chat_id, candidate))
+        if wallet_id == "all":
+            selected = valid
+        elif wallet_id not in valid:
+            raise ValueError("that wallet is no longer configured")
+        elif wallet_id in selected:
+            if len(selected) == 1:
+                raise ValueError("at least one wallet must remain selected")
+            selected.remove(wallet_id)
+        else:
+            selected.add(wallet_id)
+        ordered = [item["id"] for item in wallets if item["id"] in selected]
+        self.wallet_choices[(int(chat_id), candidate_token(candidate))] = ordered
+        self.show_wallet_picker(chat_id, candidate, context, index, message_id)
 
     def begin_custom_quantity_input(self, chat_id, candidate, context, index=None, message_id=None):
         token = candidate_token(candidate)
@@ -1913,6 +2170,31 @@ class TelegramBot:
         rows.append([self.button("↩️ Back", self._quantity_back_callback(candidate, context, index))])
         return self.markup(rows)
 
+    def wallet_picker_keyboard(self, candidate, context, index, selected):
+        token = candidate_token(candidate)
+        wallets = self._public_wallets()
+        rows = []
+        for wallet in wallets:
+            icon = "✅" if wallet["id"] in selected else "⬜"
+            if context == "candidate":
+                callback = f"wallets:toggle:candidate:{index}:{token}:{wallet['id']}"
+            else:
+                callback = f"wallets:toggle:schedule:{token}:{wallet['id']}"
+            rows.append([
+                self.button(f"{icon} {short_text(wallet['label'], 24)}", callback)
+            ])
+        if len(wallets) > 1:
+            callback = (
+                f"wallets:toggle:candidate:{index}:{token}:all"
+                if context == "candidate"
+                else f"wallets:toggle:schedule:{token}:all"
+            )
+            rows.append([self.button("✅ Select all wallets", callback)])
+        rows.append([
+            self.button("↩️ Done", self._quantity_back_callback(candidate, context, index))
+        ])
+        return self.markup(rows)
+
     @staticmethod
     def _quantity_back_callback(candidate, context, index=None):
         token = candidate_token(candidate)
@@ -1964,6 +2246,7 @@ class TelegramBot:
         description = esc(shorten_description(candidate.get("description")))
         links = self.rich_links(candidate)
         funding = self._funding_block(candidate)
+        route_note = self._route_guard_text(candidate)
         text = (
             "⚠️ <b>Confirm one live mint request</b>\n\n"
             f"<b>Collection:</b> {collection_link}\n"
@@ -1971,11 +2254,11 @@ class TelegramBot:
             f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}\n"
             f"<b>Total mint value:</b> {esc(self._total_mint_value(candidate))}\n"
             f"<b>Access:</b> {esc(candidate.get('access_label', candidate.get('stage_label', 'Unknown')))}\n"
-            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}\n"
+            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n"
             f"<b>Price cap:</b> {esc(config.MAX_MINT_PRICE_NATIVE)} native coin\n\n"
             f"{funding}\n\n"
-            "OpenSea will verify whether this wallet is eligible. The next step "
-            "can broadcast a real transaction and spend gas.\n\n"
+            f"{route_note} The next step can broadcast real transactions and spend gas.\n\n"
             f"{description_block(candidate)}\n\n"
             f"{links}"
         )
@@ -1989,12 +2272,13 @@ class TelegramBot:
         }.get(snapshot["mode"], str(snapshot["mode"]).title())
         live = "Enabled" if snapshot["live_enabled"] else "Locked"
         return (
-            "<b>🛰 OpenSea Mint Bot</b>\n"
-            "<i>Find, inspect, and schedule OpenSea mints.</i>\n\n"
+            "<b>🛰 NFT Mint Bot</b>\n"
+            "<i>Find, inspect, schedule, and buy EVM NFTs.</i>\n\n"
             f"<b>Today:</b> {esc(snapshot.get('project_count', 0))} projects · "
             f"{esc(snapshot['candidate_count'])} mint options\n"
             f"<b>Free + public:</b> {esc(snapshot['free_candidate_count'])}\n"
             f"<b>Scheduled:</b> {esc(snapshot.get('schedule_count', 0))}\n"
+            f"<b>Signing wallets:</b> {esc(snapshot.get('wallet_count', 1))}\n"
             f"<b>Automatic scanning:</b> {esc(automatic)}\n"
             f"<b>Live transactions:</b> {live}\n"
             f"<b>Last scan:</b> {esc(format_saved_time(snapshot.get('last_scan_at')))}\n\n"
@@ -2019,6 +2303,7 @@ class TelegramBot:
             f"<b>Automatic scanning:</b> {esc(mode)}\n"
             f"<b>Live transactions:</b> {live}\n"
             f"<b>Enabled networks:</b> {esc(chains)}\n"
+            f"<b>Signing wallets:</b> {esc(snapshot.get('wallet_count', 1))}\n"
             f"<b>Projects found today:</b> {esc(snapshot.get('project_count', 0))}\n"
             f"<b>Mint options found:</b> {esc(snapshot['candidate_count'])}\n"
             f"<b>Free + public:</b> {esc(snapshot['free_candidate_count'])}\n"
@@ -2131,7 +2416,9 @@ class TelegramBot:
         end = candidate.get("end_time")
         end_text = format_time(end) if end else "not provided"
         collection_url = candidate.get("opensea_url") or candidate.get("url")
-        if is_free_public_candidate(candidate):
+        if candidate.get("route") == "generic_contract":
+            route = "🟣 Verified external contract · simulation required"
+        elif is_free_public_candidate(candidate):
             route = "🟢 Free/public · ready to request"
         elif candidate.get("is_public") is False:
             route = "🟡 Restricted · OpenSea will verify wallet eligibility"
@@ -2154,7 +2441,8 @@ class TelegramBot:
             f"<b>Access:</b> {esc(candidate.get('access_label', candidate.get('stage_label', 'Unknown')))}\n"
             f"<b>Opens:</b> {esc(format_time(candidate.get('start_time')))}\n"
             f"<b>Ends:</b> {esc(end_text)}\n"
-            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}\n"
+            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n"
             f"<b>Route:</b> {route}\n\n"
             f"{description_block(candidate)}\n\n"
             f"{supply + chr(10) if supply else ''}"
@@ -2193,6 +2481,17 @@ class TelegramBot:
         return "🟢 <b>Safety:</b> wallet balance, price, gas, and chain checks run before broadcast.\n"
 
     @staticmethod
+    def _route_guard_text(candidate):
+        if candidate.get("route") == "generic_contract":
+            return (
+                "The verified external contract route is simulated again for each wallet "
+                "immediately before signing. Custom proofs or changed contract rules make it stop safely."
+            )
+        return (
+            "OpenSea supplies the final mint transaction and performs the stage eligibility check."
+        )
+
+    @staticmethod
     def _total_mint_value(candidate):
         price_wei = candidate.get("price_wei")
         if price_wei is None:
@@ -2201,7 +2500,8 @@ class TelegramBot:
             quantity = validate_quantity(
                 candidate, candidate.get("quantity") or config.MINT_QUANTITY
             )
-            total = int(price_wei) * quantity
+            wallet_count = len(candidate.get("wallet_ids") or ["primary"])
+            total = int(price_wei) * quantity * wallet_count
         except (TypeError, ValueError):
             return "Invalid — live mint blocked"
         if total == 0:
@@ -2209,7 +2509,8 @@ class TelegramBot:
         chain = config.chain_config(candidate.get("chain")) or {}
         native = chain.get("native") or "native coin"
         value = format(Decimal(total) / Decimal(10 ** 18), "f").rstrip("0").rstrip(".")
-        return f"{value} {native}"
+        suffix = f" across {wallet_count} wallets" if wallet_count > 1 else ""
+        return f"{value} {native}{suffix}"
 
     def _funding_block(self, candidate):
         """Render a fresh read-only wallet check for a confirmation screen."""
@@ -2228,6 +2529,7 @@ class TelegramBot:
             )
         return (
             "<b>💳 Funds needed</b>\n"
+            f"Wallets: {esc(snapshot.get('wallet_count', 1))}\n"
             f"Mint: {esc(format_native_wei(snapshot.get('mint_value_wei'), native))}\n"
             f"Gas estimate: {esc(format_native_wei(snapshot.get('estimated_gas_wei'), native))}\n"
             f"<b>Total: {esc(format_native_wei(snapshot.get('estimated_total_wei'), native))}</b>\n"
@@ -2341,6 +2643,8 @@ class TelegramBot:
             # A saved default can be higher than a stage's newly reported
             # wallet limit. Start at one so the next action remains usable.
             candidate["quantity"] = 1
+        if chat_id is not None:
+            candidate["wallet_ids"] = self._selected_wallet_ids(chat_id, candidate)
         return candidate
 
     def render_schedule_stages(self, candidates, page=0):
@@ -2386,10 +2690,10 @@ class TelegramBot:
             f"<b>Access:</b> {esc(access)}\n"
             f"<b>Opens:</b> {esc(format_time(candidate.get('start_time')))}\n"
             f"<b>Ends:</b> {esc(format_time(end) if end else 'not provided')}\n"
-            f"<b>Quantity:</b> {esc(quantity)}\n\n"
+            f"<b>Quantity:</b> {esc(quantity)} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n\n"
             f"{warning}\n"
-            "<b>OpenSea stage rule:</b> first eligible active stage at fire time. "
-            "This selected stage controls the schedule time; OpenSea makes the final eligibility choice.\n\n"
+            f"{self._route_guard_text(candidate)}\n\n"
             "Review the details, then use the live confirmation screen.\n\n"
             f"{description_block(candidate)}\n\n"
             f"{supply + chr(10) if supply else ''}"
@@ -2424,11 +2728,12 @@ class TelegramBot:
             f"<b>Total mint value:</b> {esc(self._total_mint_value(candidate))}\n"
             f"<b>Access:</b> {esc(candidate.get('access_label', 'Unknown'))}\n"
             f"<b>Fire time:</b> {esc(format_time(schedule.get('run_at')))}\n"
-            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}\n\n"
+            f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))} per wallet\n"
+            f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n\n"
             f"{warning}\n"
-            "<b>OpenSea stage rule:</b> first eligible active stage at fire time.\n"
-            "The bot process must remain online for an armed schedule. OpenSea will provide "
-            "fresh mint data at fire time; no transaction is prepared or broadcast when this screen is shown."
+            f"{self._route_guard_text(candidate)}\n"
+            "The bot process must remain online for an armed schedule. Fresh transaction data "
+            "and simulation are required at fire time; nothing is broadcast when this screen is shown."
         )
         links = self.rich_links(candidate)
         supply = self.supply_text(candidate)
@@ -2505,6 +2810,32 @@ class TelegramBot:
         transaction = (
             f"<code>{esc(tx_hash)}</code> · {tx_link}" if tx_hash else "No transaction hash"
         )
+        wallet_results = result.get("wallet_results") or []
+        if len(wallet_results) > 1:
+            lines = [
+                "<b>👛 Multi-wallet mint result</b>",
+                "",
+                f"<b>Collection:</b> {collection_link}",
+                f"<b>Wallets:</b> {len(wallet_results)}",
+                "",
+            ]
+            for item in wallet_results:
+                wallet = item.get("wallet") or {}
+                if item.get("confirmed") is True:
+                    status = "✅ Confirmed"
+                elif item.get("confirmed") is False:
+                    status = "❌ Reverted"
+                elif item.get("tx_hash"):
+                    status = "⏳ Sent"
+                else:
+                    status = "⚠️ Failed"
+                link = embedded_link(
+                    "Transaction",
+                    explorer_tx_url(candidate.get("chain"), item.get("tx_hash")),
+                ) if item.get("tx_hash") else esc(short_text(item.get("error", "No transaction"), 80))
+                lines.append(f"<b>{esc(wallet.get('label', 'Wallet'))}</b> · {status} · {link}")
+            lines.extend(["", "Each wallet used its own nonce, balance, gas check, and transaction."])
+            return "\n".join(lines)
         if result.get("tx_hash") and result.get("confirmed") is True:
             return (
                 "<b>✅ Mint confirmed</b>\n\n"
@@ -2555,6 +2886,17 @@ class TelegramBot:
                 f"<b>Opens:</b> {esc(format_time(candidate.get('start_time')))}",
                 f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}",
             ])
+        elif research.get("mint_route_note"):
+            lines.extend([
+                "<b>Mint route:</b> Custom or unavailable",
+                f"<i>{esc(shorten_description(research.get('mint_route_note'), 320))}</i>",
+            ])
+        best_listing = research.get("best_listing") or {}
+        if best_listing:
+            lines.append(
+                f"<b>Cheapest active listing:</b> "
+                f"{embedded_link(best_listing.get('price_display', 'View listing'), best_listing.get('opensea_url'))}"
+            )
         description = shorten_description(research.get("description") or candidate.get("description"), 900)
         if description:
             lines.extend(["", f"<b>Description:</b>\n{esc(description)}"])
@@ -3033,9 +3375,11 @@ class TelegramBot:
         if page is None:
             page = max(0, (index - 1) // CANDIDATE_PAGE_SIZE)
         quantity = int(candidate.get("quantity") or config.MINT_QUANTITY)
+        wallet_count = len(candidate.get("wallet_ids") or ["primary"])
         rows = [
             [self.button("🔬 Full info", f"info:candidate:{index}:{token}"), self.button("🖼 Mint card", f"card:candidate:{index}:{token}")],
             [self.button(f"📦 Quantity: {quantity}", f"quantity:candidate:{index}:{token}")],
+            [self.button(f"👛 Wallets: {wallet_count}", f"wallets:candidate:{index}:{token}")],
             [self.button("🚀 Mint now", f"mint:{index}:{token}:live")],
             [self.button("📌 Schedule this mint", f"schedule:candidate:{index}:{token}")],
         ]
@@ -3058,6 +3402,7 @@ class TelegramBot:
             [self.button("🎨 Set accent color", "settings:accent"), self.button("✏️ Set card brand", "settings:brand")],
             [self.button("👁 Preview card", "settings:preview")],
             [self.button("💰 Set maximum mint price", "settings:cap")],
+            [self.button("🛍 Set maximum buy price", "settings:buycap")],
         ]
         if custom_background:
             rows.append([self.button("↩️ Reset card background", "settings:bg:reset")])
@@ -3107,9 +3452,11 @@ class TelegramBot:
     def schedule_candidate_keyboard(self, candidate):
         token = candidate_token(candidate)
         quantity = int(candidate.get("quantity") or config.MINT_QUANTITY)
+        wallet_count = len(candidate.get("wallet_ids") or ["primary"])
         return self.markup([
             [self.button("🔬 Full info", f"info:schedule:{token}"), self.button("🖼 Mint card", f"card:schedule:{token}")],
             [self.button(f"📦 Quantity: {quantity}", f"quantity:schedule:{token}")],
+            [self.button(f"👛 Wallets: {wallet_count}", f"wallets:schedule:{token}")],
             [self.button("🚀 Mint now", f"schedule:mint:live:{token}")],
             [self.button("⏰ Arm live schedule", f"schedule:live:{token}")],
             [self.button("↩️ Choose another stage", "schedule:stages")],
@@ -3183,9 +3530,18 @@ class TelegramBot:
                 self.button("🖼 Mint card", f"research:card:{token}"),
                 self.button("📦 Quantity", f"quantity:schedule:{candidate_token(candidate)}"),
             ])
+            rows.append([
+                self.button("👛 Wallets", f"wallets:schedule:{candidate_token(candidate)}")
+            ])
             rows.append([self.button("🚀 Mint now", f"research:live:{token}")])
         if research.get("mint_candidates"):
             rows.append([self.button("📌 Choose mint stage", f"research:stages:{token}")])
+        if research.get("best_listing"):
+            price = short_text(
+                (research.get("best_listing") or {}).get("price_display", "current price"),
+                20,
+            )
+            rows.append([self.button(f"🛍 Buy now · {price}", f"research:buy:{token}")])
         rows.append([self.button("🔬 New research", "research:new"), self.button("🏠 Home", "home")])
         return self.markup(rows)
 
@@ -3213,7 +3569,7 @@ class TelegramBot:
             {"command": "schedules", "description": "view or cancel schedules"},
             {"command": "daily", "description": "open daily runner controls"},
             {"command": "mint", "description": "review one candidate"},
-            {"command": "settings", "description": "price cap and mint-card look"},
+            {"command": "settings", "description": "mint, buy, wallet, and card controls"},
             {"command": "stop", "description": "stop the daily runner"},
             {"command": "help", "description": "show command help"},
         ]
@@ -3221,7 +3577,7 @@ class TelegramBot:
     @staticmethod
     def help_text():
         return (
-            "<b>❓ OpenSea Mint Bot</b>\n\n"
+            "<b>❓ NFT Mint Bot</b>\n\n"
             "<b>Dashboard</b>\n"
             "Use /start or /home for the button-based control center.\n\n"
             "<b>Commands</b>\n"
@@ -3239,10 +3595,12 @@ class TelegramBot:
             "<code>/schedules</code> · view, inspect, or cancel one-time schedules\n"
             "<code>/daily live CONFIRM</code> · start guarded live mode\n"
             "<code>/mint 1</code> · review and confirm one live mint\n"
-            "<code>/settings</code> · price cap and full mint-card controls\n"
+            "<code>/settings</code> · separate mint/buy caps and mint-card controls\n"
             "<code>/stop</code> · request the daily runner to stop\n\n"
             "Live mode requires <code>ENABLE_LIVE_MINTS=true</code> and a second confirmation. "
-            "Paid entries must fit the configured price cap; OpenSea verifies allowlist eligibility. "
+            "Use Quantity and Wallets on a mint preview to launch selected wallets in parallel. "
+            "OpenSea Drops use OpenSea eligibility; safe external routes require verified ABI and simulation. "
+            "Buy now always targets one exact active listing and has a separate price cap. "
             "Owner/editor wallets shown in research are OpenSea attributions, not verified developer identities. "
             "A one-time schedule runs only while this Python process is online, so use a VPS for unattended operation."
         )
@@ -3267,7 +3625,14 @@ def run_from_env():
             print("TELEGRAM_ALLOWED_CHAT_ID must be an integer from Telegram.")
             return 1
     api = TelegramAPI(token)
-    service = DailyMintService(*required, notify=lambda message: print(message, flush=True))
+    try:
+        service = DailyMintService(
+            *required, notify=lambda message: print(message, flush=True)
+        )
+    except ValueError as exc:
+        api.close()
+        print(f"Wallet configuration error: {redact_secrets(exc)}")
+        return 1
     bot = TelegramBot(api, service, allowed_chat_id)
     service.notify = bot.notify_operator
     service.notify_result = bot.notify_mint_result

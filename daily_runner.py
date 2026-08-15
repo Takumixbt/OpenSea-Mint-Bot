@@ -15,9 +15,12 @@ import httpx
 
 import config
 import discovery
+import external_mint
+import marketplace
 import opensea_client
 from mint_engine import MintEngine
 from minter import Minter
+from wallets import load_wallet_profiles, select_wallet_profiles
 
 
 ROOT = Path(__file__).resolve().parent
@@ -26,7 +29,10 @@ ROOT = Path(__file__).resolve().parent
 def redact_secrets(text):
     """Keep API/RPC/private values out of console and Telegram messages."""
     text = str(text)
-    for name in ("ALCHEMY_API_KEY", "PRIVATE_KEY", "OPENSEA_API_KEY", "TELEGRAM_BOT_TOKEN"):
+    for name in (
+        "ALCHEMY_API_KEY", "PRIVATE_KEY", "MINT_WALLETS",
+        "OPENSEA_API_KEY", "TELEGRAM_BOT_TOKEN",
+    ):
         value = os.getenv(name, "")
         if value and len(value) > 8:
             text = text.replace(value, f"<{name} hidden>")
@@ -104,6 +110,9 @@ class DailyMintService:
     def __init__(self, alchemy_key, private_key, wallet_address, opensea_api_key, notify=None):
         load_dotenv(ROOT / ".env")
         self.engine = MintEngine(alchemy_key, private_key, wallet_address, opensea_api_key)
+        self.wallet_profiles = load_wallet_profiles(private_key, wallet_address)
+        self._wallet_engines = {"primary": self.engine}
+        self.purchase_engine = marketplace.PurchaseEngine(alchemy_key, opensea_api_key)
         self.alchemy_key = alchemy_key
         self.private_key = private_key
         self.wallet_address = wallet_address
@@ -159,6 +168,16 @@ class DailyMintService:
         """Return configured chains that have an EVM signer/RPC mapping."""
         return [slug for slug in self.configured_chains() if config.chain_config(slug)]
 
+    def public_wallets(self):
+        """Return labels and addresses only; private keys never enter UI state."""
+        return [profile.public() for profile in self.wallet_profiles]
+
+    def selected_wallets(self, candidate):
+        return select_wallet_profiles(
+            self.wallet_profiles,
+            (candidate or {}).get("wallet_ids") or [],
+        )
+
     def funding_snapshot(self, candidate):
         """Return the wallet balance and read-only gas envelope for one mint."""
         candidate = dict(candidate or {})
@@ -172,22 +191,37 @@ class DailyMintService:
         if candidate.get("price_wei") is None:
             raise ValueError("mint price is unknown; refresh the OpenSea stage first")
         mint_value_wei = int(candidate["price_wei"]) * quantity
-        minter = Minter(
-            config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
-            self.private_key,
-            self.wallet_address,
-            int(chain["chain_id"]),
-        )
-        snapshot = minter.funding_preview(mint_value_wei)
+        wallet_checks = []
+        for profile in self.selected_wallets(candidate):
+            minter = Minter(
+                config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
+                profile.private_key,
+                profile.address,
+                int(chain["chain_id"]),
+            )
+            check = minter.funding_preview(mint_value_wei)
+            check["wallet"] = profile.public()
+            wallet_checks.append(check)
+        snapshot = {
+            key: sum(int(item.get(key) or 0) for item in wallet_checks)
+            for key in (
+                "balance_wei", "mint_value_wei", "estimated_gas_wei",
+                "maximum_gas_wei", "estimated_total_wei", "maximum_total_wei",
+                "estimated_shortfall_wei", "maximum_shortfall_wei",
+            )
+        }
         snapshot.update({
             "chain": chain_slug,
             "native": chain.get("native") or "native coin",
             "quantity": quantity,
+            "wallet_count": len(wallet_checks),
+            "wallet_checks": wallet_checks,
         })
         return snapshot
 
-    def wallet_snapshot(self, chain_slug=None, max_pages=5):
+    def wallet_snapshot(self, chain_slug=None, max_pages=5, wallet_id="primary"):
         """Read native balances, OpenSea NFT counts, and recent local mint status."""
+        profile = select_wallet_profiles(self.wallet_profiles, [wallet_id])[0]
         if chain_slug:
             chain_slug = str(chain_slug).strip().lower()
             if not config.chain_config(chain_slug):
@@ -218,8 +252,8 @@ class DailyMintService:
             try:
                 minter = Minter(
                     config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
-                    self.private_key,
-                    self.wallet_address,
+                    profile.private_key,
+                    profile.address,
                     int(chain["chain_id"]),
                 )
                 live_chain, _ = minter.warm_up()
@@ -238,7 +272,7 @@ class DailyMintService:
                 try:
                     for _ in range(max_pages):
                         nfts, cursor = opensea_client.get_account_nfts(
-                            client, slug, self.wallet_address, self.api_key,
+                            client, slug, profile.address, self.api_key,
                             limit=200, cursor=cursor,
                         )
                         count += len(nfts)
@@ -278,7 +312,7 @@ class DailyMintService:
                     response = httpx.get(
                         f"{prefix}/nft/v3/{key}/getNFTsForOwner",
                         params={
-                            "owner": self.wallet_address,
+                            "owner": profile.address,
                             "withMetadata": "true",
                             "pageSize": 100,
                         },
@@ -355,7 +389,9 @@ class DailyMintService:
                 record["ownership_source"] = chain_result.get("nft_source")
                 record["ownership_scan_capped"] = bool(chain_result.get("nft_count_capped"))
         return {
-            "address": self.wallet_address,
+            "address": profile.address,
+            "wallet": profile.public(),
+            "available_wallets": self.public_wallets(),
             "chains": results,
             "recent_mints": recent_mints,
             "selected_chain": chain_slug,
@@ -428,6 +464,7 @@ class DailyMintService:
         return {
             "mode": self.mode or "stopped",
             "live_enabled": self.live_enabled,
+            "wallet_count": len(self.wallet_profiles),
             "chains": self.supported_chains(),
             "invalid_chains": [slug for slug in self.configured_chains() if not config.chain_config(slug)],
             "candidate_count": candidate_count,
@@ -550,8 +587,33 @@ class DailyMintService:
                         if info:
                             break
                     if not info:
+                        try:
+                            collection = opensea_client.get_collection_details(
+                                client, slug, self.api_key
+                            )
+                            collection = collection if isinstance(collection, dict) else {}
+                            collection.setdefault(
+                                "opensea_url", f"https://opensea.io/collection/{slug}"
+                            )
+                            candidate, route_note = external_mint.resolve_collection_mint(
+                                collection,
+                                slug,
+                                self.alchemy_key,
+                                self.wallet_address,
+                            )
+                        except Exception as route_error:
+                            raise RuntimeError(
+                                "This collection is not an OpenSea-hosted drop, and its "
+                                "external contract route could not be verified safely. "
+                                "Use NFT info to inspect it or buy an active OpenSea listing."
+                            ) from route_error
+                        if candidate:
+                            candidate["route_note"] = route_note
+                            return [candidate]
                         raise RuntimeError(
-                            "OpenSea could not load this mint right now; try again shortly"
+                            "This collection uses a custom external mint. "
+                            f"{route_note} Use NFT info to inspect it or buy an active "
+                            "OpenSea listing."
                         ) from detail_error
             finally:
                 client.close()
@@ -684,30 +746,118 @@ class DailyMintService:
                     candidates = self.inspect_drop(
                         f"https://opensea.io/collection/{slug}"
                     )
-                except Exception:
+                    route_note = ""
+                except Exception as exc:
                     candidates = []
+                    route_note = redact_secrets(exc)
             else:
                 research = self._minimal_asset_research(reference, nft)
                 candidates = []
+                route_note = "This asset has no collection-level mint route."
             research = dict(research)
             research.update({
                 "reference": reference,
                 "asset_nft": nft,
                 "mint_candidates": candidates,
+                "mint_route_note": str(route_note or ""),
             })
+            if slug:
+                try:
+                    research["best_listing"] = self.purchase_preview(slug)
+                except Exception:
+                    research["best_listing"] = None
             return research
 
         slug = str(reference.get("slug") or "").strip()
         research = self.research_collection(slug)
         try:
             candidates = self.inspect_drop(value)
-        except Exception:
+            route_note = ""
+        except Exception as exc:
             # A collection can be worth researching even when its drop has no
             # active/upcoming stage or OpenSea temporarily rejects that route.
             candidates = []
+            route_note = redact_secrets(exc)
         research = dict(research)
-        research.update({"reference": reference, "mint_candidates": candidates})
+        try:
+            best_listing = self.purchase_preview(slug)
+        except Exception:
+            best_listing = None
+        research.update({
+            "reference": reference,
+            "mint_candidates": candidates,
+            "mint_route_note": str(route_note or ""),
+            "best_listing": best_listing,
+        })
         return research
+
+    def purchase_preview(self, value):
+        """Return the exact cheapest active OpenSea listing without signing."""
+        slug = opensea_client.parse_drop_slug(value)
+        client = opensea_client.get_api_client(self.api_key)
+        try:
+            return marketplace.best_listing_preview(
+                client, slug, self.api_key, self.wallet_address
+            )
+        finally:
+            client.close()
+
+    def buy_listing(self, preview, wallet_id="primary"):
+        """Fulfill one explicitly confirmed listing with one selected wallet."""
+        if not self.live_enabled:
+            raise RuntimeError("live transactions are disabled; set ENABLE_LIVE_MINTS=true first")
+        profiles = select_wallet_profiles(self.wallet_profiles, [wallet_id])
+        profile = profiles[0]
+        preview = dict(preview or {})
+        key = f"buy:{preview.get('chain')}:{preview.get('order_hash')}:{profile.id}"
+        with self.execution_lock:
+            with self.state_lock:
+                results = self._day_state(self._today()).setdefault("results", {})
+                if key in results:
+                    raise RuntimeError("this exact listing was already attempted with this wallet today")
+            try:
+                result = self.purchase_engine.execute(preview, profile)
+            except Exception as exc:
+                with self.state_lock:
+                    self._day_state(self._today()).setdefault("results", {})[key] = {
+                        "action": "buy",
+                        "chain": preview.get("chain"),
+                        "name": preview.get("name") or preview.get("slug") or "OpenSea purchase",
+                        "slug": preview.get("slug"),
+                        "contract_address": preview.get("contract_address"),
+                        "token_id": preview.get("token_id"),
+                        "wallet": profile.public(),
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {redact_secrets(exc)}",
+                        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    self._save_state()
+                raise
+            saved = {
+                "action": "buy",
+                "chain": preview.get("chain"),
+                "name": preview.get("name") or preview.get("slug") or "OpenSea purchase",
+                "slug": preview.get("slug"),
+                "contract_address": preview.get("contract_address"),
+                "token_id": preview.get("token_id"),
+                "wallet": profile.public(),
+                "quantity": 1,
+                "mint_value_wei": result.get("summary", {}).get("value_wei", 0),
+                "gas_wei": result.get("summary", {}).get("worst_case_fee_wei", 0),
+                "actual_gas_wei": result.get("actual_gas_wei"),
+                "status": (
+                    "confirmed" if result.get("confirmed") is True
+                    else "reverted" if result.get("confirmed") is False
+                    else "sent"
+                ),
+                "tx_hash": result.get("tx_hash"),
+                "confirmed": result.get("confirmed"),
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            with self.state_lock:
+                self._day_state(self._today()).setdefault("results", {})[key] = saved
+                self._save_state()
+            return result
 
     def research_collection(self, slug, chain_hint=None):
         """Collect bounded, public OpenSea metadata for a collection."""
@@ -935,6 +1085,9 @@ class DailyMintService:
             raise ValueError("schedule data is incomplete; inspect the OpenSea URL again")
         if not self.live_enabled:
             raise RuntimeError("live minting is disabled; set ENABLE_LIVE_MINTS=true first")
+        # Resolve aliases now so a typo or removed wallet can never create an
+        # apparently armed schedule that has no signer at launch.
+        self.selected_wallets(candidate)
         if candidate.get("price_wei") is not None:
             try:
                 quantity = validate_quantity(
@@ -1137,6 +1290,16 @@ class DailyMintService:
             "mint_value_wei": result.get("summary", {}).get("value_wei", 0),
             "gas_wei": result.get("worst_case_gas_wei", 0),
             "actual_gas_wei": result.get("actual_gas_wei"),
+            "wallet_results": [
+                {
+                    "wallet": item.get("wallet"),
+                    "status": item.get("status"),
+                    "tx_hash": item.get("tx_hash"),
+                    "confirmed": item.get("confirmed"),
+                    "error": item.get("error"),
+                }
+                for item in result.get("wallet_results", [])
+            ],
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         with self.state_lock:
@@ -1220,6 +1383,113 @@ class DailyMintService:
             candidate, candidate.get("quantity") or config.MINT_QUANTITY
         )
         return self._execute_candidate(candidate, self._today())
+
+    def _engine_for_wallet(self, profile):
+        if profile.id == "primary":
+            return self.engine
+        engine = self._wallet_engines.get(profile.id)
+        if engine is None:
+            engine = MintEngine(
+                self.alchemy_key,
+                profile.private_key,
+                profile.address,
+                self.api_key,
+            )
+            self._wallet_engines[profile.id] = engine
+        return engine
+
+    def _execute_wallet_batch(
+        self, candidate, gas_used, quantity, scheduled_at=None
+    ):
+        profiles = self.selected_wallets(candidate)
+        batch_cap = self.max_daily_gas_wei
+        if batch_cap > 0:
+            remaining = max(0, batch_cap - int(gas_used))
+            share = remaining // len(profiles)
+            if share <= 0:
+                raise RuntimeError("daily gas cap has no remaining multi-wallet allowance")
+            per_wallet_cap = int(gas_used) + share
+        else:
+            per_wallet_cap = 0
+
+        def execute_one(profile):
+            result = self._engine_for_wallet(profile).execute(
+                candidate,
+                daily_gas_used_wei=gas_used,
+                # Divide the remaining daily envelope before any parallel
+                # broadcast so all wallets combined cannot exceed the cap.
+                daily_gas_cap_wei=per_wallet_cap,
+                quantity=quantity,
+                scheduled_at=scheduled_at,
+            )
+            result["wallet"] = profile.public()
+            return result
+
+        if len(profiles) == 1:
+            result = execute_one(profiles[0])
+            result["wallet_results"] = [dict(result)]
+            return result
+
+        successes = []
+        failures = []
+        # Every wallet has independent nonce space. Parallel preparation and
+        # broadcast keeps a multi-wallet launch within the same block window.
+        with ThreadPoolExecutor(
+            max_workers=min(len(profiles), 10), thread_name_prefix="wallet-mint"
+        ) as pool:
+            futures = {pool.submit(execute_one, profile): profile for profile in profiles}
+            for future in as_completed(futures):
+                profile = futures[future]
+                try:
+                    successes.append(future.result())
+                except Exception as exc:
+                    failures.append({
+                        "wallet": profile.public(),
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {redact_secrets(exc)}",
+                    })
+        order = {profile.id: index for index, profile in enumerate(profiles)}
+        wallet_results = sorted(
+            successes + failures,
+            key=lambda item: order.get((item.get("wallet") or {}).get("id"), 999),
+        )
+        if not successes:
+            details = "; ".join(
+                f"{item['wallet']['label']}: {item['error']}" for item in failures
+            )
+            raise RuntimeError(f"all selected wallets failed: {details}")
+        confirmed_values = [item.get("confirmed") for item in successes]
+        result = {
+            "candidate": candidate,
+            "status": "partial" if failures else "sent",
+            "wallet_results": wallet_results,
+            "tx_hashes": [item.get("tx_hash") for item in successes if item.get("tx_hash")],
+            "tx_hash": next((item.get("tx_hash") for item in successes if item.get("tx_hash")), None),
+            "confirmed": (
+                True if confirmed_values and all(value is True for value in confirmed_values)
+                else False if any(value is False for value in confirmed_values)
+                else None
+            ),
+            "worst_case_gas_wei": sum(
+                int(item.get("worst_case_gas_wei") or 0) for item in successes
+            ),
+            "actual_gas_wei": sum(
+                int(item.get("actual_gas_wei") or 0) for item in successes
+            ),
+            "summary": {
+                "value_wei": sum(
+                    int((item.get("summary") or {}).get("value_wei") or 0)
+                    for item in successes
+                )
+            },
+        }
+        delays = [
+            int(item["launch_delay_ms"])
+            for item in successes if item.get("launch_delay_ms") is not None
+        ]
+        if delays:
+            result["launch_delay_ms"] = max(delays)
+        return result
 
     def _daily_loop(self):
         try:
@@ -1313,14 +1583,13 @@ class DailyMintService:
                     if item.get("chain") == candidate.get("chain")
                 )
             try:
-                result = self.engine.execute(
+                result = self._execute_wallet_batch(
                     candidate,
-                    daily_gas_used_wei=gas_used,
-                    daily_gas_cap_wei=self.max_daily_gas_wei,
-                    quantity=validate_quantity(
+                    gas_used,
+                    validate_quantity(
                         candidate, candidate.get("quantity") or config.MINT_QUANTITY
                     ),
-                    scheduled_at=scheduled_at,
+                    scheduled_at,
                 )
             except Exception as exc:
                 # Record every failed/uncertain execution attempt before the
@@ -1355,6 +1624,19 @@ class DailyMintService:
                 ),
                 "gas_wei": result.get("worst_case_gas_wei", 0),
                 "actual_gas_wei": result.get("actual_gas_wei"),
+                "wallet_results": [
+                    {
+                        "wallet": item.get("wallet"),
+                        "status": (
+                            "confirmed" if item.get("confirmed") is True
+                            else "reverted" if item.get("confirmed") is False
+                            else item.get("status", "sent")
+                        ),
+                        "tx_hash": item.get("tx_hash"),
+                        "error": item.get("error"),
+                    }
+                    for item in result.get("wallet_results", [])
+                ],
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             if result.get("tx_hash"):
@@ -1470,4 +1752,6 @@ def candidate_key(candidate):
         candidate["slug"],
         candidate.get("stage_index", 0),
         candidate.get("start_time", 0),
+        candidate.get("route", "opensea_drop"),
+        candidate.get("contract_address", ""),
     ))

@@ -1,4 +1,4 @@
-"""Read-only readiness report for the OpenSea Mint Bot.
+"""Read-only readiness report for the NFT Mint Bot.
 
 Run from this directory:
 
@@ -69,6 +69,11 @@ def check_config():
     else:
         add("WARN", "Mint-value safety cap", f"paid mints allowed up to {config.MAX_MINT_PRICE_NATIVE} native coin")
 
+    if config.MAX_BUY_VALUE_WEI == 0:
+        add("OK", "Purchase safety cap", "secondary buying locked")
+    else:
+        add("WARN", "Purchase safety cap", f"buys allowed up to {config.MAX_BUY_PRICE_NATIVE} native coin")
+
     configured = config.monitored_chain_slugs()
     unsupported = [slug for slug in configured if not config.chain_config(slug)]
     supported = [slug for slug in configured if config.chain_config(slug)]
@@ -98,6 +103,16 @@ def check_environment():
         add("BLOCKED", "Required .env values", "missing or placeholder: " + ", ".join(missing))
     else:
         add("OK", "Required .env values", "Alchemy key, private key, wallet address, and OpenSea API key are present")
+
+    if not missing:
+        try:
+            from wallets import load_wallet_profiles
+            profiles = load_wallet_profiles(
+                os.getenv("PRIVATE_KEY"), os.getenv("WALLET_ADDRESS")
+            )
+            add("OK", "Signing wallets", f"{len(profiles)} configured; keys not printed")
+        except ValueError as exc:
+            add("BLOCKED", "Signing wallets", str(exc))
 
     if filled("OPENSEA_API_KEY"):
         add("OK", "Official OpenSea API key", "present (not printed)")
@@ -236,6 +251,15 @@ def check_official_opensea_api():
 
 
 def run_full_recon():
+    import config
+
+    if not config.target_collection_slug():
+        add(
+            "INFO",
+            "One-drop CLI audit",
+            "skipped because no TARGET_COLLECTION_URL is configured; Telegram link lookup is ready",
+        )
+        return
     print("\n--- OpenSea API audit ---")
     completed = subprocess.run(
         [sys.executable, str(ROOT / "recon_check.py")],
@@ -255,12 +279,12 @@ def run_full_recon():
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only OpenSea Mint Bot readiness report")
+    parser = argparse.ArgumentParser(description="Read-only NFT Mint Bot readiness report")
     parser.add_argument("--no-network", action="store_true", help="skip RPC and OpenSea endpoint checks")
     parser.add_argument("--full-recon", action="store_true", help="also run the OpenSea API audit")
     args = parser.parse_args()
 
-    print(f"OpenSea Mint Bot status — {ROOT}")
+    print(f"NFT Mint Bot status — {ROOT}")
     print("Read-only checks only; no transaction is signed or broadcast.\n")
     check_config()
     check_environment()

@@ -173,6 +173,35 @@ def set_max_mint_price_native(value):
     return text
 
 
+# Separate hard ceiling for secondary-market purchases. A floor-price preview
+# is never permission to spend more if the listing changes before confirmation.
+MAX_BUY_PRICE_NATIVE = os.getenv("MAX_BUY_PRICE_NATIVE", "0").strip() or "0"
+
+
+def _native_cap_wei(value, name):
+    try:
+        scaled = Decimal(str(value)) * (10 ** 18)
+        if scaled < 0 or scaled > Decimal("10000") * (10 ** 18):
+            raise ValueError
+        if scaled != scaled.to_integral_value():
+            raise ValueError
+        return int(scaled)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{name} must be a non-negative decimal with at most 18 decimals")
+
+
+MAX_BUY_VALUE_WEI = _native_cap_wei(MAX_BUY_PRICE_NATIVE, "MAX_BUY_PRICE_NATIVE")
+
+
+def set_max_buy_price_native(value):
+    """Update the in-process hard purchase-value ceiling safely."""
+    global MAX_BUY_PRICE_NATIVE, MAX_BUY_VALUE_WEI
+    text = str(value or "").strip()
+    MAX_BUY_VALUE_WEI = _native_cap_wei(text, "buy price cap")
+    MAX_BUY_PRICE_NATIVE = text
+    return text
+
+
 # ---------------------------------------------------------------------------
 # OPENSEA ENDPOINTS AND HEADERS  (verified live 2026-08-11)
 # ---------------------------------------------------------------------------

@@ -12,6 +12,9 @@ import daily_runner
 import discovery
 import opensea_client
 import nft_card
+import external_mint
+import marketplace
+import wallets
 from daily_runner import DailyMintService, quantity_limit, validate_quantity
 from minter import Minter
 from telegram_bot import TelegramBot, explorer_tx_url
@@ -892,6 +895,138 @@ class DiscoverySafetyTests(unittest.TestCase):
             "minter": "0x0000000000000000000000000000000000000001",
             "quantity": 7,
         })
+
+    def test_generic_route_only_accepts_unambiguous_quantity_arguments(self):
+        safe = [{
+            "type": "function",
+            "name": "publicMint",
+            "stateMutability": "payable",
+            "inputs": [{"name": "quantity", "type": "uint256"}],
+            "outputs": [],
+        }]
+        unsafe = [{
+            "type": "function",
+            "name": "mint",
+            "stateMutability": "payable",
+            "inputs": [{"name": "tokenId", "type": "uint256"}],
+            "outputs": [],
+        }]
+        self.assertEqual(
+            external_mint.detect_simple_mint_route(safe)["arg_bindings"],
+            ["quantity"],
+        )
+        self.assertIsNone(external_mint.detect_simple_mint_route(unsafe))
+
+    def test_wallet_registry_derives_extra_addresses_and_rejects_duplicates(self):
+        primary_key = "0x" + "11" * 32
+        extra_key = "0x" + "22" * 32
+        from eth_account import Account
+        primary_address = Account.from_key(primary_key).address
+        profiles = wallets.load_wallet_profiles(
+            primary_key, primary_address, f"Backup:{extra_key}"
+        )
+        self.assertEqual([item.label for item in profiles], ["Primary", "Backup"])
+        self.assertNotEqual(profiles[0].address.lower(), profiles[1].address.lower())
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            wallets.load_wallet_profiles(
+                primary_key, primary_address, f"Duplicate:{primary_key}"
+            )
+
+    def test_basic_listing_fulfillment_is_encoded_with_attribution_suffix(self):
+        function = (
+            "fulfillBasicOrder_efficient_6GL6yc((address,uint256,uint256,address,address,"
+            "address,uint256,uint256,uint8,uint256,uint256,bytes32,uint256,bytes32,bytes32,"
+            "uint256,(uint256,address)[],bytes))"
+        )
+        payload = {
+            "fulfillment_data": {"transaction": {
+                "function": function,
+                "chain": 8453,
+                "to": "0x0000000000000068F116a894984e2DB1123eB395",
+                "value": "101",
+                "calldata_suffix": "0xcdb44011",
+                "input_data": {"parameters": {
+                    "considerationToken": "0x0000000000000000000000000000000000000000",
+                    "considerationIdentifier": "0",
+                    "considerationAmount": "100",
+                    "offerer": "0x0000000000000000000000000000000000000001",
+                    "zone": "0x0000000000000000000000000000000000000000",
+                    "offerToken": "0x0000000000000000000000000000000000000002",
+                    "offerIdentifier": "7",
+                    "offerAmount": "1",
+                    "basicOrderType": 0,
+                    "startTime": "1",
+                    "endTime": "9999999999",
+                    "zoneHash": "0x" + "00" * 32,
+                    "salt": "3",
+                    "offererConduitKey": "0x" + "00" * 32,
+                    "fulfillerConduitKey": "0x" + "00" * 32,
+                    "totalOriginalAdditionalRecipients": "1",
+                    "additionalRecipients": [{
+                        "amount": "1",
+                        "recipient": "0x0000000000000000000000000000000000000003",
+                    }],
+                    "signature": "0x" + "12" * 65,
+                }},
+            }}
+        }
+        with patch.object(
+            opensea_client, "get_listing_fulfillment_data", return_value=payload
+        ):
+            result = marketplace.build_fulfillment_calldata(
+                object(), {}, "0x0000000000000000000000000000000000000004", "key"
+            )
+        from web3 import Web3
+        self.assertTrue(result["data"].startswith(Web3.to_hex(Web3.keccak(text=function)[:4])))
+        self.assertTrue(result["data"].endswith("cdb44011"))
+        self.assertEqual(result["value"], 101)
+
+    def test_advanced_listing_fulfillment_is_encoded_for_zone_orders(self):
+        function = (
+            "fulfillAdvancedOrder(((address,address,(uint8,address,uint256,uint256,uint256)[],"
+            "(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,"
+            "uint256,bytes32,uint256),uint120,uint120,bytes,bytes),"
+            "(uint256,uint8,uint256,uint256,bytes32[])[],bytes32,address)"
+        )
+        transaction = {
+            "function": function,
+            "chain": 4663,
+            "to": "0x0000000000000068F116a894984e2DB1123eB395",
+            "value": "101",
+            "calldata_suffix": "0xcdb44011",
+            "input_data": {
+                "advancedOrder": {
+                    "parameters": {
+                        "offerer": "0x0000000000000000000000000000000000000001",
+                        "zone": "0x0000000000000000000000000000000000000000",
+                        "offer": [{
+                            "itemType": 2, "token": "0x0000000000000000000000000000000000000002",
+                            "identifierOrCriteria": "7", "startAmount": "1", "endAmount": "1",
+                        }],
+                        "consideration": [{
+                            "itemType": 0, "token": "0x0000000000000000000000000000000000000000",
+                            "identifierOrCriteria": "0", "startAmount": "101", "endAmount": "101",
+                            "recipient": "0x0000000000000000000000000000000000000001",
+                        }],
+                        "orderType": 3, "startTime": "1", "endTime": "9999999999",
+                        "zoneHash": "0x" + "00" * 32, "salt": "0",
+                        "conduitKey": "0x" + "00" * 32,
+                        "totalOriginalConsiderationItems": "1",
+                    },
+                    "numerator": 1, "denominator": 1,
+                    "signature": "0x" + "12" * 64,
+                    "extraData": "0x00",
+                },
+                "criteriaResolvers": [],
+                "fulfillerConduitKey": "0x" + "00" * 32,
+                "recipient": "0x0000000000000000000000000000000000000004",
+            },
+        }
+        result = marketplace._encode_advanced_order(transaction, function)
+        from web3 import Web3
+        self.assertTrue(result["data"].startswith(Web3.to_hex(Web3.keccak(text=function)[:4])))
+        self.assertTrue(result["data"].endswith("cdb44011"))
+        self.assertEqual(result["function"], "fulfillAdvancedOrder")
 
     def test_drop_url_parser_rejects_asset_urls_and_accepts_collection_urls(self):
         self.assertEqual(

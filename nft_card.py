@@ -53,7 +53,7 @@ def build_mint_card(candidate, research=None, output_dir=None):
     receipt_status = str(candidate.get("receipt_status") or "").strip().lower()
     header = "NFT MINT P&L" if receipt_status else "NFT MINT CARD"
     draw.text((92, 79), header, font=_font(24, bold=True), fill=accent)
-    brand = os.getenv("NFT_CARD_BRAND_NAME", "OpenSea Mint Bot").strip() or "OpenSea Mint Bot"
+    brand = os.getenv("NFT_CARD_BRAND_NAME", "NFT Mint Bot").strip() or "NFT Mint Bot"
     brand_width = _text_width(draw, brand, _font(23, bold=True))
     draw.text((CARD_WIDTH - 92 - brand_width, 82), brand,
               font=_font(23, bold=True), fill=muted)

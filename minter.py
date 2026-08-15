@@ -121,7 +121,15 @@ class Minter:
         self._cached_gas_fees = fees
         return fees
 
-    def build_transaction(self, to, data, value, approved_value_wei=None):
+    def build_transaction(
+        self,
+        to,
+        data,
+        value,
+        approved_value_wei=None,
+        max_value_wei=None,
+        value_label="mint",
+    ):
         """
         Build the signed-but-not-yet-sent transaction from OpenSea's calldata.
         Returns (signed_tx, human_summary_dict).
@@ -135,13 +143,12 @@ class Minter:
                 f"in Telegram (approved {int(approved_value_wei)} wei; returned {value} wei). "
                 "Refresh the drop and confirm the current stage again. Nothing was signed or sent."
             )
-        if value > config.MAX_MINT_VALUE_WEI:
+        cap_wei = config.MAX_MINT_VALUE_WEI if max_value_wei is None else int(max_value_wei)
+        if value > cap_wei:
             raise RuntimeError(
-                f"OpenSea's mint instructions ask to send {value} wei of the "
-                f"chain's coin, but the configured cap is "
-                f"{config.MAX_MINT_PRICE_NATIVE} native coin. "
-                f"Refusing to build the transaction. If this paid drop is intended, "
-                f"raise MAX_MINT_PRICE_NATIVE in Telegram Settings or .env deliberately."
+                f"The {value_label} transaction asks to send {value} wei of the "
+                f"chain's coin, above the configured hard cap of {cap_wei} wei. "
+                "Nothing was signed or sent."
             )
         if self._cached_nonce is None:
             self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")

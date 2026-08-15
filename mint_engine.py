@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 
 import config
+import external_mint
 import opensea_client
 from minter import Minter
 
@@ -28,7 +29,11 @@ class MintEngine:
         chain_id = int(candidate["chain_id"])
         rpc_url = config.rpc_url_for_chain(self.alchemy_key, chain_id)
         minter = Minter(rpc_url, self.private_key, self.wallet_address, chain_id)
-        client = opensea_client.get_api_client(self.opensea_api_key)
+        route = str(candidate.get("route") or "opensea_drop")
+        client = (
+            opensea_client.get_api_client(self.opensea_api_key)
+            if route == "opensea_drop" else None
+        )
 
         # RPC nonce/fee/balance reads and OpenSea TLS setup are independent,
         # so do them concurrently during the pre-launch window.
@@ -39,22 +44,29 @@ class MintEngine:
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mint-warmup") as pool:
                 rpc_future = pool.submit(warm_rpc)
-                api_future = pool.submit(
-                    opensea_client.prewarm_drop_route,
-                    client,
-                    candidate["slug"],
-                    self.opensea_api_key,
+                api_future = (
+                    pool.submit(
+                        opensea_client.prewarm_drop_route,
+                        client,
+                        candidate["slug"],
+                        self.opensea_api_key,
+                    )
+                    if client is not None else None
                 )
                 live_chain, nonce, balance = rpc_future.result()
-                api_future.result()
+                if api_future is not None:
+                    api_future.result()
         except Exception:
-            client.close()
+            if client is not None:
+                client.close()
             raise
         if live_chain != chain_id:
-            client.close()
+            if client is not None:
+                client.close()
             raise RuntimeError(f"RPC chain mismatch: got {live_chain}, expected {chain_id}")
         if balance <= 0:
-            client.close()
+            if client is not None:
+                client.close()
             raise RuntimeError("wallet has no native coin for gas")
 
         launch_at = float(scheduled_at or 0)
@@ -62,9 +74,15 @@ class MintEngine:
             self._wait_until(launch_at)
         request_started_at = time.time()
         try:
-            calldata = self._request_calldata(client, candidate, quantity or config.MINT_QUANTITY)
+            calldata = self._request_calldata(
+                client,
+                candidate,
+                quantity or config.MINT_QUANTITY,
+                rpc_url,
+            )
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
         signed, summary = minter.build_transaction(
             calldata["to"],
@@ -113,7 +131,31 @@ class MintEngine:
             result["confirmation_error"] = f"{type(exc).__name__}: confirmation timed out"
         return result
 
-    def _request_calldata(self, client, candidate, quantity):
+    def _request_calldata(self, client, candidate, quantity, rpc_url=None):
+        route = str(candidate.get("route") or "opensea_drop")
+        if route == "generic_contract":
+            deadline = max(int(candidate.get("start_time") or 0), time.time()) + config.FIRE_TIMEOUT_SECONDS
+            last_error = None
+            for attempt in range(config.FIRE_MAX_ATTEMPTS):
+                try:
+                    return external_mint.build_generic_calldata(
+                        candidate,
+                        rpc_url,
+                        self.wallet_address,
+                        quantity,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if attempt + 1 >= config.FIRE_MAX_ATTEMPTS or time.time() >= deadline:
+                        break
+                    delays = config.FIRE_RETRY_DELAYS_SECONDS
+                    time.sleep(min(delays[min(attempt, len(delays) - 1)], max(0, deadline - time.time())))
+            raise RuntimeError(
+                "external mint transaction did not pass launch simulation: "
+                f"{type(last_error).__name__ if last_error else 'unknown error'}"
+            ) from last_error
+        if route != "opensea_drop":
+            raise RuntimeError("this mint route needs a dedicated adapter")
         start_time = int(candidate.get("start_time") or 0)
         deadline = max(start_time, time.time()) + config.FIRE_TIMEOUT_SECONDS
         attempts = 0

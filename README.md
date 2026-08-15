@@ -1,16 +1,21 @@
-# OpenSea Mint Bot
+# NFT Mint Bot
 
-A Telegram-controlled mint bot for OpenSea EVM drops. It can scan one network,
-research a collection, select quantity, mint immediately, or arm a one-time
-schedule. It supports free, paid, public, and restricted stages; OpenSea makes
-the final wallet-eligibility decision.
+A Telegram-controlled EVM NFT bot. Paste an OpenSea collection link to:
 
-This is a mint bot, not a secondary-market buying bot. Use a separate wallet
-and never commit `.env`.
+- mint an OpenSea Drop;
+- mint through a simple verified external collection contract;
+- choose quantity and one or many wallets;
+- schedule a launch while the bot runs on a PC or VPS;
+- research the collection; or
+- buy its cheapest active OpenSea listing at an exact confirmed price.
+
+Custom puzzles, CAPTCHAs, backend signatures, and unknown allowlist proofs need
+a dedicated adapter. The bot reports those routes as unsupported instead of
+guessing a transaction.
 
 ## Install
 
-Install Python 3.11 or newer, then:
+Install Python 3.11 or newer, then run:
 
 ```powershell
 git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
@@ -18,100 +23,64 @@ cd OpenSea-Mint-Bot
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 notepad .env
-```
-
-Add your Alchemy key, OpenSea key, wallet private key/address, Telegram token,
-and allowed chat ID to `.env`. Keep `MAX_MINT_PRICE_NATIVE=0` for free-only, or
-set your maximum transaction mint value in Telegram under **Settings**.
-
-Run the checks and start the bot:
-
-```powershell
 python -m unittest discover -s tests -v
 python status.py
-python recon_check.py
 python telegram_bot.py
 ```
 
-Only one PC or VPS may run `telegram_bot.py` for the same Telegram token.
+Only one machine may run the same Telegram token.
+
+## Setup
+
+Required `.env` values:
+
+```text
+ALCHEMY_API_KEY=...
+PRIVATE_KEY=0x...
+WALLET_ADDRESS=0x...
+OPENSEA_API_KEY=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ALLOWED_CHAT_ID=...
+ENABLE_LIVE_MINTS=true
+MAX_MINT_PRICE_NATIVE=0
+MAX_BUY_PRICE_NATIVE=0
+```
+
+Add extra wallets with private keys separated by semicolons:
+
+```text
+MINT_WALLETS=Backup:0xPRIVATE_KEY;Third:0xPRIVATE_KEY
+```
+
+The bot derives their addresses. Keys stay in `.env`, never in Telegram or
+schedule files. Use separate low-value wallets.
 
 ## Telegram
 
-Send `/start` for the button dashboard. Main commands:
+Send `/start`, then:
 
-```text
-/scan                 choose one network
-/scan base            scan one network directly
-/info                 research an OpenSea URL
-/schedule             paste a URL and arm one stage
-/schedules            inspect or cancel schedules
-/mint 1               review candidate 1 and confirm it
-/settings             price cap and mint-card background
-/wallet               balances, NFT totals, and latest mint status
-/wallet base          check one network only
-/mints                recent mint results and transaction links
-/status               runtime status
-```
+- **Find today’s mints** scans one OpenSea network calendar.
+- **Schedule from link** accepts an OpenSea collection/drop link and resolves
+  OpenSea-hosted or safe verified-contract mint routes.
+- **Quantity** is the number minted by each selected wallet.
+- **Wallets** chooses one or all configured wallets for parallel transactions.
+- **Look up an NFT** shows research, mint routes, and **Buy now** when an active
+  listing exists.
+- **Settings** controls mint and purchase price caps plus mint-card appearance.
+- **My wallet** lets you inspect each configured wallet.
 
-Every mint requires a confirmation screen. Before signing, the bot checks the
-exact selected price × quantity, configured price cap, gas cap, wallet balance,
-chain ID, daily attempt limit, and OpenSea eligibility. If OpenSea returns a
-different transaction value from the Telegram preview, it refuses to sign.
+Every live action requires a confirmation screen. Before signing, the bot
+checks the exact value, chain, balance, gas envelope, price cap, wallet limit,
+and transaction simulation. A changed listing price or mint value is refused.
 
-One-time schedules warm the RPC, nonce, fee data, balance, and OpenSea HTTPS
-connection 10 seconds before launch. The first mint-data request starts at the
-scheduled second, followed by short bounded retries if OpenSea activates late.
-Completed schedule notifications include the measured broadcast delay.
-
-The scanner is chain-by-chain in Telegram and covers midnight to midnight at
-`DISCOVERY_UTC_OFFSET_HOURS`. OpenSea's public feeds are incomplete, so a scan
-cannot guarantee it finds every mint. Paste a known collection URL into
-`/schedule` when timing matters.
-
-### Mint cards and receipts
-
-Open **Settings → Set card background**, then send a JPG/PNG/WEBP or a direct
-image URL. The bot crops it to 1200×675 and stores it locally. **Reset card
-background** restores the built-in design. Settings also controls the accent
-color and brand name, and includes a preview button.
-
-Before a mint is confirmed, Telegram shows the exact mint value, current
-wallet balance, a current-fee gas estimate, total estimated funding needed,
-and the configured absolute ceiling. The balance and exact transaction are
-checked again immediately before signing.
-
-After a transaction is sent, the bot posts a branded mint P&L receipt with the
-mint value, actual gas when mined, total spent, a clickable chain-explorer
-link, and estimated unrealized P&L when a same-currency OpenSea floor is
-available. `/wallet` shows native balances, indexed NFT totals, and recent mint
-status. A transaction may be confirmed on-chain before the NFT index updates.
+The `/scan` calendar is not an exhaustive index of externally hosted launches.
+If you already know a project, paste its OpenSea collection link directly.
 
 ## VPS
 
-The VPS needs Ubuntu, Python, internet access, and the bot running as one
-service. Chrome, OpenSea, and MetaMask are not required. A ready systemd unit
-is included in `deploy/opensea-mint-bot.service`; see [QUICKGUIDE.md](QUICKGUIDE.md).
+Chrome, MetaMask, and OpenSea do not need to stay open. The Python service must
+stay online for schedules, so use the included systemd unit on a VPS. See
+[QUICKGUIDE.md](QUICKGUIDE.md).
 
-Schedules and scans are local to the machine in `state/`. Copy that folder when
-moving an armed bot, and stop the old instance before starting the VPS.
-
-## Optional one-drop CLI
-
-Set the target URL, chain, stage, quantity, and cap in `config.py`. Then run:
-
-```powershell
-python status.py
-python recon_check.py
-python main.py --confirm-live
-```
-
-The CLI is live-only and also requires `ENABLE_LIVE_MINTS=true` in `.env`.
-
-## Browser helper
-
-`opensea_mint_assist.user.js` is an optional Tampermonkey page helper. It can
-click one visible Mint/Claim button, but wallet approval remains manual. See
-[TAMPERMONKEY.md](TAMPERMONKEY.md).
-
-No bot can guarantee a mint: supply, allowlists, wallet limits, API uptime,
-network gas, and OpenSea timing can change.
+Never commit `.env`. No bot can guarantee supply, eligibility, API uptime, gas,
+or inclusion in the first block.
