@@ -27,6 +27,7 @@ from daily_runner import (
     is_free_public_candidate,
     quantity_limit,
     redact_secrets,
+    same_candidate_stage,
     validate_quantity,
 )
 from nft_card import (
@@ -56,7 +57,8 @@ def esc(value):
 
 
 def pretty_chain(chain):
-    return str(chain).replace("_", " ").replace("-", " ").title()
+    """Network display name, shared with config so labels never drift."""
+    return config.chain_label(chain)
 
 
 def short_text(value, length=28):
@@ -66,8 +68,28 @@ def short_text(value, length=28):
 
 def candidate_token(candidate):
     """Return a short identity token so old inline buttons cannot mint a new candidate."""
-    identity = ":".join(str(candidate.get(name, "")) for name in (
-        "chain", "slug", "stage_index", "start_time", "route", "contract_address"))
+    # Older saved scans did not carry an explicit route. Treat those records as
+    # the normal OpenSea drop route so a fresh scan does not invalidate their
+    # buttons merely because route metadata was added later.
+    route = candidate.get("route") or ("opensea_drop" if candidate.get("slug") else "")
+    stage_identity = str(candidate.get("stage_id") or "").strip().lower()
+    if not stage_identity:
+        stage_identity = ":".join(str(candidate.get(name, "")) for name in (
+            "stage_index", "start_time", "stage_type"
+        ))
+    # Bind the button to the stable OpenSea stage UUID and the exact terms the
+    # user saw. A stage reorder remains valid; a price/access change does not.
+    identity = ":".join(str(value) for value in (
+        candidate.get("chain", ""),
+        candidate.get("slug", ""),
+        stage_identity,
+        candidate.get("start_time", ""),
+        candidate.get("end_time", ""),
+        candidate.get("price_wei", ""),
+        candidate.get("access_label", ""),
+        candidate.get("contract_address", ""),
+        route,
+    ))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
 
 
@@ -76,11 +98,19 @@ def project_token(candidate):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
 
 
-def project_groups(candidates):
-    """Group mint windows by collection while preserving scan order/indexes."""
+def project_groups(candidates, indexes=None):
+    """Group mint windows by collection while preserving scan order/indexes.
+
+    ``indexes`` is used by a chain-filtered view.  The Telegram callback still
+    needs the candidate's absolute position in the service's last scan, even
+    when the visible list contains only one network.
+    """
     grouped = []
     positions = {}
-    for index, candidate in enumerate(candidates or [], 1):
+    candidates = list(candidates or [])
+    if indexes is None:
+        indexes = range(1, len(candidates) + 1)
+    for index, candidate in zip(indexes, candidates):
         key = (str(candidate.get("chain") or "").lower(), str(candidate.get("slug") or "").lower())
         if key not in positions:
             positions[key] = len(grouped)
@@ -91,6 +121,8 @@ def project_groups(candidates):
 
 def candidate_badge(candidate):
     """Return a compact status label for the all-mints Telegram list."""
+    if candidate.get("is_sold_out") is True:
+        return "⛔ SOLD OUT"
     if candidate.get("is_free") is True and candidate.get("is_public") is True:
         return "🟢 FREE + PUBLIC"
     if candidate.get("is_free") is True:
@@ -146,17 +178,9 @@ def description_block(candidate):
 
 
 CHAIN_EXPLORER_ADDRESS_URLS = {
-    "ethereum": "https://etherscan.io/address/{address}",
-    "base": "https://basescan.org/address/{address}",
-    "polygon": "https://polygonscan.com/address/{address}",
-    "optimism": "https://optimistic.etherscan.io/address/{address}",
-    "arbitrum": "https://arbiscan.io/address/{address}",
-    "zora": "https://explorer.zora.energy/address/{address}",
-    "blast": "https://blastscan.io/address/{address}",
-    "avalanche": "https://snowtrace.io/address/{address}",
-    "unichain": "https://uniscan.xyz/address/{address}",
-    "shape": "https://shapescan.xyz/address/{address}",
-    "robinhood": "https://robinhoodchain.blockscout.com/address/{address}",
+    slug: f"{str(settings.get('explorer') or '').rstrip('/')}/address/{{address}}"
+    for slug, settings in config.CHAIN_CONFIGS.items()
+    if settings.get("explorer")
 }
 
 CHAIN_EXPLORER_TX_URLS = {
@@ -575,14 +599,30 @@ class TelegramBot:
         elif data == "wallet:mints":
             self.show_mint_history(chat_id, message_id)
         elif data == "chains":
-            self._present(chat_id, self.scan_picker_text(), self.chain_keyboard(), message_id)
+            self.show_chain_picker(chat_id, message_id)
+        elif data == "chains:all":
+            self.show_chain_picker(chat_id, message_id, show_empty=True)
+        elif data == "chains:refresh":
+            self.show_chain_picker(chat_id, message_id, force=True)
         elif data == "candidates":
             self.show_candidates(chat_id, message_id=message_id)
+        elif data.startswith("candidates:chain:"):
+            parts = data.split(":")
+            if len(parts) != 5 or parts[3] != "page" or not parts[4].isdigit():
+                raise ValueError("invalid candidate network page")
+            self.show_candidates(
+                chat_id,
+                message_id=message_id,
+                page=int(parts[4]),
+                scan_chain=parts[2],
+            )
         elif data.startswith("candidates:page:"):
             page_text = data.rsplit(":", 1)[-1]
             if not page_text.isdigit():
                 raise ValueError("invalid candidate page")
             self.show_candidates(chat_id, message_id=message_id, page=int(page_text))
+        elif data.startswith("project:mint:") or data.startswith("project:schedule:"):
+            self.dispatch_project_action(chat_id, message_id, data)
         elif data.startswith("project:"):
             self.show_project(chat_id, data.split(":", 1)[1], message_id)
         elif data == "daily":
@@ -645,6 +685,22 @@ class TelegramBot:
             self.dispatch_wallets_callback(chat_id, message_id, data)
         else:
             self._present(chat_id, "That button has expired. Open the dashboard again.", self.home_keyboard(), message_id)
+
+    def dispatch_project_action(self, chat_id, message_id, data):
+        parts = data.split(":")
+        if len(parts) != 4 or parts[0] != "project" or parts[1] not in {"mint", "schedule"}:
+            raise ValueError("invalid project action")
+        group, index, candidate = self._project_option_from_ref(parts[2], parts[3])
+        if parts[1] == "mint":
+            self.show_live_mint_confirmation(
+                chat_id,
+                index,
+                message_id,
+                self._with_quantity(chat_id, candidate),
+            )
+            return
+        self._save_schedule_draft(chat_id, [candidate])
+        self.show_schedule_stage(chat_id, candidate, message_id)
 
     def dispatch_schedule_callback(self, chat_id, message_id, data):
         parts = data.split(":")
@@ -837,7 +893,7 @@ class TelegramBot:
                 chat_id,
                 index,
                 message_id,
-                self._fresh_candidate(candidate),
+                candidate,
             )
         else:
             raise ValueError("invalid mint button")
@@ -906,25 +962,19 @@ class TelegramBot:
 
     def start_scan(self, chat_id, chain=None, message_id=None):
         chain = str(chain or "").strip().lower()
-        if not chain or chain == "all":
-            notice = ""
-            if chain == "all":
-                notice = "\n\n<i>Choose one network at a time.</i>"
-            self._present(
+        if not chain:
+            self.show_chain_picker(chat_id, message_id)
+            return
+        if chain == "all":
+            self._background(
                 chat_id,
-                self.scan_picker_text() + notice,
-                self.chain_keyboard(),
+                "Scanning OpenSea networks",
+                lambda target_id: self.scan_job(chat_id, "all", target_id),
                 message_id,
             )
             return
         if chain not in self.service.supported_chains():
-            self._present(
-                chat_id,
-                f"⚠️ <b>Network unavailable</b>\n\n"
-                f"{esc(pretty_chain(chain))} is not enabled. Choose one of the networks below.",
-                self.chain_keyboard(),
-                message_id,
-            )
+            self.show_chain_picker(chat_id, message_id)
             return
         self._background(
             chat_id,
@@ -934,14 +984,24 @@ class TelegramBot:
         )
 
     def scan_job(self, chat_id, chain, target_id):
-        candidates, errors = self.service.scan_now(chain)
+        scan_chain = None if chain == "all" else chain
+        candidates, errors = self.service.scan_now(scan_chain)
         self.last_scan_chain = chain
+        if chain == "all":
+            self._present(
+                chat_id,
+                self.render_chain_summary(candidates, errors),
+                self.chain_summary_keyboard(candidates),
+                target_id,
+            )
+            return
+        title = f"🎨 <b>OpenSea mints · {esc(pretty_chain(chain))}</b>"
         self._present(
             chat_id,
             self.render_candidates(
                 candidates,
                 errors,
-                title=f"🎨 <b>OpenSea mints · {esc(pretty_chain(chain))}</b>",
+                title=title,
             ),
             self.candidates_keyboard(candidates, scan_chain=chain),
             target_id,
@@ -960,10 +1020,11 @@ class TelegramBot:
         self._present(
             chat_id,
             "<b>📌 Schedule one mint</b>\n\n"
-            "Send an OpenSea <b>collection or drop URL</b> as your next message.\n\n"
-            "The bot first checks OpenSea Drops. If minting happens on the project's own "
-            "contract, it will use a verified and simulatable external route when available.\n\n"
-            "<i>Individual NFT asset URLs are not mint routes. Use the collection/drop page.</i>",
+            "Send an OpenSea <b>collection, drop, item, or asset URL</b> (or a collection slug) as your next message.\n\n"
+            "Every safe mint route resolved from that OpenSea link will be shown. Pick one, "
+            "review its current price and access rule, then arm it.\n\n"
+            "<i>Marketplace listings are not mint transactions. If OpenSea exposes no hosted stage "
+            "and no verified on-chain route, the bot stops without signing.</i>",
             self.schedule_input_keyboard(),
             message_id,
         )
@@ -972,7 +1033,7 @@ class TelegramBot:
         self._clear_pending_input(chat_id)
         self._background(
             chat_id,
-            "Inspect OpenSea drop",
+            "Inspect OpenSea mint route",
             lambda target_id: self.schedule_lookup_job(chat_id, value, target_id),
             message_id,
         )
@@ -995,12 +1056,10 @@ class TelegramBot:
             }
         self._present(
             chat_id,
-            "<b>🔬 Research an NFT or collection</b>\n\n"
-            "Paste an OpenSea collection/drop URL or an individual NFT asset URL.\n\n"
-            "The bot will show the description, supply, floor/stats when available, "
-            "social links, contract, OpenSea owner/editor wallet attributions, and "
-            "any mint options OpenSea exposes. Research is read-only until you choose "
-            "a mint action.",
+            "<b>ℹ️ OpenSea mint info</b>\n\n"
+            "Paste an OpenSea <b>collection, drop, item, or asset URL</b> (or a slug).\n\n"
+            "The bot resolves hosted stages first, then shows a direct SeaDrop or verified "
+            "contract route when it can simulate one safely.",
             self.research_input_keyboard(),
             message_id,
         )
@@ -1009,7 +1068,7 @@ class TelegramBot:
         self._clear_pending_input(chat_id)
         self._background(
             chat_id,
-            "Research OpenSea reference",
+            "Load OpenSea mint info",
             lambda target_id: self.research_lookup_job(chat_id, value, target_id),
             message_id,
         )
@@ -1030,7 +1089,7 @@ class TelegramBot:
     def start_candidate_research(self, chat_id, index, candidate, message_id=None):
         self._background(
             chat_id,
-            "Research mint candidate",
+            "Load mint info",
             lambda target_id: self.candidate_research_job(
                 chat_id, index, candidate, target_id
             ),
@@ -1039,9 +1098,22 @@ class TelegramBot:
 
     def candidate_research_job(self, chat_id, index, candidate, target_id):
         research = self.service.research_candidate(candidate)
-        research["candidate"] = dict(candidate)
-        research["mint_candidates"] = [dict(candidate)]
+        fresh = research.get("candidate")
+        if isinstance(fresh, dict):
+            fresh = dict(fresh)
+            fresh["quantity"] = candidate.get("quantity", fresh.get("quantity", 1))
+            if candidate.get("wallet_ids"):
+                fresh["wallet_ids"] = list(candidate["wallet_ids"])
+            research["candidate"] = fresh
         research["candidate_index"] = index
+        stages = [
+            fresh if isinstance(fresh, dict) and same_candidate_stage(fresh, item) else dict(item)
+            for item in (research.get("mint_candidates") or [])
+            if isinstance(item, dict)
+        ]
+        research["mint_candidates"] = stages
+        if stages:
+            self._save_schedule_draft(chat_id, stages)
         self._save_schedule_draft(chat_id, [candidate])
         token = self._save_research_draft(chat_id, research)
         self._present(
@@ -1054,7 +1126,7 @@ class TelegramBot:
     def start_schedule_research(self, chat_id, candidate, token, message_id=None):
         self._background(
             chat_id,
-            "Research scheduled mint",
+            "Load scheduled mint info",
             lambda target_id: self.schedule_research_job(
                 chat_id, candidate, token, target_id
             ),
@@ -1063,9 +1135,22 @@ class TelegramBot:
 
     def schedule_research_job(self, chat_id, candidate, schedule_token, target_id):
         research = self.service.research_candidate(candidate)
-        research["candidate"] = dict(candidate)
-        research["mint_candidates"] = [dict(candidate)]
+        fresh = research.get("candidate")
+        if isinstance(fresh, dict):
+            fresh = dict(fresh)
+            fresh["quantity"] = candidate.get("quantity", fresh.get("quantity", 1))
+            if candidate.get("wallet_ids"):
+                fresh["wallet_ids"] = list(candidate["wallet_ids"])
+            research["candidate"] = fresh
         research["schedule_token"] = schedule_token
+        stages = [
+            fresh if isinstance(fresh, dict) and same_candidate_stage(fresh, item) else dict(item)
+            for item in (research.get("mint_candidates") or [])
+            if isinstance(item, dict)
+        ]
+        research["mint_candidates"] = stages
+        if stages:
+            self._save_schedule_draft(chat_id, stages)
         self._save_schedule_draft(chat_id, [candidate])
         token = self._save_research_draft(chat_id, research)
         self._present(
@@ -1118,7 +1203,7 @@ class TelegramBot:
     def start_research_card(self, chat_id, token, candidate, message_id=None):
         self._background(
             chat_id,
-            "Create research card",
+            "Create mint card",
             lambda target_id: self.research_card_job(
                 chat_id, token, candidate, target_id
             ),
@@ -1151,7 +1236,7 @@ class TelegramBot:
             self._present(
                 chat_id,
                 "✅ <b>NFT mint card sent.</b>\n\n"
-                "Use the buttons on the image for OpenSea, full research, and the available mint actions.",
+                "Use the buttons on the image for OpenSea, mint info, and the available mint actions.",
                 keyboard,
                 target_id,
             )
@@ -1183,7 +1268,7 @@ class TelegramBot:
         )
 
     def draft_mint_job(self, chat_id, candidate, target_id):
-        result = self.service.mint_candidate(self._fresh_candidate(candidate))
+        result = self.service.mint_candidate(candidate)
         self._present(
             chat_id,
             self.render_result(result),
@@ -1218,7 +1303,7 @@ class TelegramBot:
         funding = self._funding_block(candidate)
         route_note = self._route_guard_text(candidate)
         text = (
-            "⚠️ <b>Confirm live mint now</b>\n\n"
+            "⚠️ <b>Confirm mint now</b>\n\n"
             f"<b>Collection:</b> {collection}\n"
             f"<b>Chain:</b> {esc(pretty_chain(candidate.get('chain')))}\n"
             f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))}\n"
@@ -1235,8 +1320,8 @@ class TelegramBot:
             chat_id,
             text,
             self.markup([
-                [self.button("✅ Broadcast this mint", confirm)],
-                [self.button("↩️ Cancel", cancel)],
+                [self.button("✅ Confirm mint now", confirm)],
+                [self.button("↩️ Back", cancel)],
             ]),
             message_id,
         )
@@ -1284,7 +1369,7 @@ class TelegramBot:
         funding = self._funding_block(candidate)
         route_note = self._route_guard_text(candidate)
         text = (
-            "⚠️ <b>Confirm live mint schedule</b>\n\n"
+            "⚠️ <b>Confirm schedule</b>\n\n"
             f"<b>Collection:</b> {collection_link}\n"
             f"<b>Chain:</b> {esc(pretty_chain(candidate.get('chain')))}\n"
             f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))}\n"
@@ -1306,9 +1391,7 @@ class TelegramBot:
         self._present(chat_id, text, self.confirm_schedule_keyboard(candidate), message_id)
 
     def arm_schedule(self, chat_id, candidate, message_id=None):
-        candidate = self._fresh_candidate(
-            self._rich_candidate(self._with_quantity(chat_id, candidate))
-        )
+        candidate = self._with_quantity(chat_id, candidate)
         try:
             schedule = self.service.add_schedule(candidate)
         except Exception as exc:
@@ -1325,7 +1408,7 @@ class TelegramBot:
             chat_id,
             self.render_schedule(
                 schedule,
-                notice="🔴 <b>Live schedule armed.</b> It will still obey every cap, simulation, and route eligibility check.",
+                notice="✅ <b>Schedule armed.</b> It will still obey every cap, simulation, and route eligibility check.",
             ),
             self.schedule_detail_keyboard(schedule),
             message_id,
@@ -1366,7 +1449,7 @@ class TelegramBot:
         )
 
     def mint_job(self, chat_id, index, candidate, target_id):
-        result = self.service.mint_candidate(self._fresh_candidate(candidate))
+        result = self.service.mint_candidate(candidate)
         candidate = result.get("candidate") or {}
         text = self.render_result(result)
         keyboard = self.candidate_detail_keyboard(index, candidate) if candidate else self.home_keyboard()
@@ -1542,15 +1625,14 @@ class TelegramBot:
         brand = os.getenv("NFT_CARD_BRAND_NAME", "NFT Mint Bot").strip() or "NFT Mint Bot"
         text = (
             (notice + "\n\n" if notice else "")
-            + "<b>⚙️ Settings</b>\n\n"
+            + "<b>⚙️ More</b>\n\n"
             f"<b>Live transactions:</b> {'Enabled' if self.service.live_enabled else 'Locked'}\n"
             f"<b>Maximum mint price:</b> {esc(config.MAX_MINT_PRICE_NATIVE)} native coin\n"
-            f"<b>Maximum buy price:</b> {esc(config.MAX_BUY_PRICE_NATIVE)} native coin\n"
-            f"<b>Card background:</b> {'Custom' if custom else 'Built in'}\n"
+            f"<b>Fallback background:</b> {'Custom' if custom else 'Built in'}\n"
             f"<b>Card accent:</b> <code>{esc(accent)}</code>\n"
             f"<b>Card brand:</b> {esc(brand)}\n\n"
-            "Preview cards and automatic mint receipts use these same visual settings. "
-            "The price cap covers mint value; gas has a separate hard cap."
+            "<i>The price cap covers mint value only. Gas has its own separate "
+            "hard cap.</i>"
         )
         self._present(chat_id, text, self.settings_keyboard(custom), message_id)
 
@@ -1562,8 +1644,9 @@ class TelegramBot:
             }
         self._present(
             chat_id,
-            "<b>🖼 Mint-card background</b>\n\n"
+            "<b>🖼 Card fallback background</b>\n\n"
             "Send a JPG, PNG, or WEBP as a photo/document, or paste a direct HTTPS image URL. "
+            "It appears behind the NFT artwork and is used when artwork is unavailable. "
             "The bot crops it to 1200×675. Maximum size: 8 MB.",
             self.markup([[self.button("↩️ Cancel", "settings")]]),
             message_id,
@@ -1700,7 +1783,11 @@ class TelegramBot:
             path = build_mint_card(candidate, {})
             self.api.send_photo(
                 chat_id, path,
-                caption="<b>🎨 Mint-card preview</b>\nYour background, accent, and brand are applied.",
+                caption=(
+                    "<b>🎨 Mint-card preview</b>\n"
+                    "Your fallback background, accent, and brand are applied. "
+                    "Live cards use the actual NFT artwork when OpenSea provides it."
+                ),
                 reply_markup=self.settings_keyboard(
                     bool(os.getenv("NFT_CARD_BACKGROUND", "").strip() or PERSISTENT_BACKGROUND.is_file())
                 ),
@@ -1900,20 +1987,45 @@ class TelegramBot:
             text = notice + "\n\n" + text
         self._present(chat_id, text, self.daily_keyboard(), message_id)
 
-    def show_candidates(self, chat_id, message_id=None, notice=None, page=0):
-        text = self.render_candidates(
-            self.service.last_candidates,
-            self.service.last_errors,
-            title="🎨 <b>Today’s mint options</b>",
-            page=page,
-        )
+    def show_candidates(
+        self, chat_id, message_id=None, notice=None, page=0, scan_chain=None
+    ):
+        scan_chain = str(
+            scan_chain if scan_chain is not None else self.last_scan_chain or ""
+        ).strip().lower()
+        if scan_chain == "all" and scan_chain is not None:
+            text = self.render_chain_summary(
+                self.service.last_candidates,
+                self.service.last_errors,
+            )
+            keyboard = self.chain_summary_keyboard(self.service.last_candidates)
+        else:
+            visible_candidates = self._candidates_for_chain(
+                self.service.last_candidates, scan_chain
+            )
+            chain_title = (
+                f"🎨 <b>OpenSea mints · {esc(pretty_chain(scan_chain))}</b>"
+                if scan_chain in self.service.supported_chains()
+                else "🎨 <b>Today’s mint options</b>"
+            )
+            text = self.render_candidates(
+                visible_candidates,
+                self.service.last_errors,
+                title=chain_title,
+                page=page,
+            )
+            keyboard = self.candidates_keyboard(
+                self.service.last_candidates,
+                page=page,
+                scan_chain=scan_chain,
+            )
         if notice:
             text = esc(notice) + "\n\n" + text
-        self._present(chat_id, text, self.candidates_keyboard(page=page), message_id)
+        self._present(chat_id, text, keyboard, message_id)
 
     def show_candidate(self, chat_id, index, message_id=None, candidate=None):
         candidate = self._with_quantity(chat_id, candidate or self._candidate_at(index))
-        page = max(0, (index - 1) // CANDIDATE_PAGE_SIZE)
+        page = self._candidate_group_page(index, candidate)
         self._present(
             chat_id,
             self.render_candidate(candidate, index),
@@ -1930,19 +2042,32 @@ class TelegramBot:
             candidate.get("opensea_url") or candidate.get("url"),
         )
         lines = [
-            f"<b>🎨 {name}</b>",
-            f"<i>{esc(pretty_chain(candidate.get('chain', 'unknown')))} · {esc(len(options))} mint option(s) today</i>",
+            "<b>🎨 Project</b>",
+            f"<b>Name:</b> {name}",
+            f"<b>Network:</b> {esc(pretty_chain(candidate.get('chain', 'unknown')))}",
+            f"<b>Mint windows today:</b> {esc(len(options))}",
             "",
-            "Choose the mint window you want to inspect:",
+            "Choose what you want to do:",
             "",
         ]
         for position, (_, option) in enumerate(options, 1):
+            timing = self._candidate_time_summary([(position, option)])
             lines.extend([
-                f"<b>{position}. {esc(option.get('stage_label', 'Mint window'))}</b>",
-                f"   {esc(option.get('price_display', 'Price unknown'))} · {esc(option.get('access_label', 'Eligibility unknown'))}",
-                f"   {esc(format_time(option.get('start_time')))}",
+                f"<b>{position}. {esc(option.get('stage_label', 'Mint window'))}</b> · {esc(option.get('price_display', 'Price unknown'))}",
+                f"   {esc(option.get('access_label', 'Eligibility unknown'))} · {esc(timing)}",
                 "",
             ])
+        route_links = self._mint_links_html(candidate)
+        if route_links:
+            lines.extend([
+                "<b>Open</b>",
+                route_links,
+                "",
+            ])
+        lines.append(
+            f"<b>Mint method:</b> {esc(self._mint_method(candidate))}\n"
+            "Mint now and Schedule both refresh the selected window and run the same safety checks."
+        )
         self._present(
             chat_id,
             "\n".join(lines).rstrip(),
@@ -2243,12 +2368,11 @@ class TelegramBot:
             candidate.get("name", candidate.get("slug", "Unknown")),
             candidate.get("opensea_url") or candidate.get("url"),
         )
-        description = esc(shorten_description(candidate.get("description")))
         links = self.rich_links(candidate)
         funding = self._funding_block(candidate)
         route_note = self._route_guard_text(candidate)
         text = (
-            "⚠️ <b>Confirm one live mint request</b>\n\n"
+            "⚠️ <b>Confirm mint now</b>\n\n"
             f"<b>Collection:</b> {collection_link}\n"
             f"<b>Chain:</b> {esc(pretty_chain(candidate['chain']))}\n"
             f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}\n"
@@ -2266,24 +2390,26 @@ class TelegramBot:
 
     def home_text(self):
         snapshot = self.service.status_snapshot()
-        automatic = {
-            "stopped": "Off",
-            "live": "Live and monitoring",
-        }.get(snapshot["mode"], str(snapshot["mode"]).title())
-        live = "Enabled" if snapshot["live_enabled"] else "Locked"
-        return (
-            "<b>🛰 NFT Mint Bot</b>\n"
-            "<i>Find, inspect, schedule, and buy EVM NFTs.</i>\n\n"
-            f"<b>Today:</b> {esc(snapshot.get('project_count', 0))} projects · "
-            f"{esc(snapshot['candidate_count'])} mint options\n"
-            f"<b>Free + public:</b> {esc(snapshot['free_candidate_count'])}\n"
-            f"<b>Scheduled:</b> {esc(snapshot.get('schedule_count', 0))}\n"
-            f"<b>Signing wallets:</b> {esc(snapshot.get('wallet_count', 1))}\n"
-            f"<b>Automatic scanning:</b> {esc(automatic)}\n"
-            f"<b>Live transactions:</b> {live}\n"
-            f"<b>Last scan:</b> {esc(format_saved_time(snapshot.get('last_scan_at')))}\n\n"
-            "Start with <b>Find today’s mints</b>, or paste a link into <b>Look up an NFT</b>."
-        )
+        lines = [
+            "<b>\U0001f6f0 Mint Bot</b>",
+            "",
+        ]
+        options = int(snapshot["candidate_count"] or 0)
+        if options:
+            lines.append(
+                f"<b>{esc(snapshot.get('project_count', 0))}</b> projects \u00b7 "
+                f"<b>{esc(options)}</b> mint windows from the last scan"
+            )
+        else:
+            lines.append("No scan results yet.")
+        armed = int(snapshot.get("schedule_count", 0) or 0)
+        if armed:
+            lines.append(f"<b>{esc(armed)}</b> armed schedule(s)")
+        if snapshot["mode"] != "stopped":
+            lines.append("Automatic scanning is <b>on</b>")
+        if not snapshot["live_enabled"]:
+            lines.append("<i>Live transactions are locked</i>")
+        return "\n".join(lines)
 
     def status_card(self):
         snapshot = self.service.status_snapshot()
@@ -2293,9 +2419,6 @@ class TelegramBot:
         }.get(snapshot["mode"], snapshot["mode"])
         live = "Enabled" if snapshot["live_enabled"] else "Locked"
         chains = ", ".join(pretty_chain(chain) for chain in snapshot["chains"])
-        runtime = "online" if snapshot["worker_alive"] else "idle"
-        if snapshot["stop_requested"]:
-            runtime = "stopping"
         invalid = snapshot.get("invalid_chains") or []
         chain_note = f"\n<b>Ignored chains:</b> {esc(', '.join(invalid))}" if invalid else ""
         return (
@@ -2337,14 +2460,133 @@ class TelegramBot:
             "run independently of this broad daily scanner."
         )
 
-    def scan_picker_text(self):
-        return (
-            "<b>🔎 Find OpenSea mints</b>\n\n"
-            "Which network do you want to search?\n\n"
-            "The bot shows every live mint and every mint opening today that "
-            "OpenSea exposes for that network.\n\n"
-            "<i>One scan · OpenSea-hosted mints only</i>"
+    def scan_picker_text(self, coverage=None, errors=None, age=None):
+        """Describe what the drop calendar actually holds right now."""
+        live = {chain: count for chain, count in (coverage or {}).items() if count}
+        lines = ["<b>🔎 Pick a network</b>", ""]
+        if coverage is None:
+            lines.append("Choose a network to scan for OpenSea mints.")
+            lines.append("")
+            lines.append(
+                "<i>Per-network drop counts are unavailable right now.</i>"
+            )
+        elif live:
+            total = sum(live.values())
+            word = "network" if len(live) == 1 else "networks"
+            lines.append(
+                f"<b>{esc(total)}</b> drops across <b>{esc(len(live))}</b> {word} "
+                "in the next 24 hours."
+            )
+            lines.append("")
+            lines.append(
+                "<i>Counts come from OpenSea's own drop calendar. A network that is "
+                "not listed has nothing scheduled.</i>"
+            )
+        else:
+            lines.append("<b>OpenSea has no drops scheduled on any network.</b>")
+            lines.append("")
+            lines.append(
+                "<i>This is OpenSea's calendar, not a failed scan. Tap Refresh "
+                "in a few minutes.</i>"
+            )
+        for error in (errors or [])[:2]:
+            lines.append(f"⚠️ <i>{esc(error)}</i>")
+        return "\n".join(lines).rstrip()
+
+    def show_chain_picker(self, chat_id, message_id=None, show_empty=False, force=False):
+        """Load real per-network drop counts, then render the picker.
+
+        Counts are read from the cached drop calendar, so this costs one API
+        read per cache window rather than one per network.
+        """
+        reader = getattr(self.service, "chain_coverage", None)
+        if not callable(reader):
+            coverage, errors, age = None, [], None
+        else:
+            try:
+                coverage, errors, age = reader(force_refresh=force)
+            except Exception as exc:
+                coverage = None
+                errors = [f"calendar unavailable ({type(exc).__name__})"]
+                age = None
+        self._present(
+            chat_id,
+            self.scan_picker_text(coverage, errors, age),
+            self.chain_keyboard(coverage, show_empty=show_empty),
+            message_id,
         )
+
+    @staticmethod
+    def _candidates_for_chain(candidates, chain):
+        chain = str(chain or "").strip().lower()
+        if not chain or chain == "all":
+            return list(candidates or [])
+        return [
+            candidate for candidate in (candidates or [])
+            if str(candidate.get("chain") or "").strip().lower() == chain
+        ]
+
+    def _chain_candidate_groups(self, candidates):
+        grouped = {}
+        for candidate in candidates or []:
+            chain = str(candidate.get("chain") or "unknown").strip().lower() or "unknown"
+            grouped.setdefault(chain, []).append(candidate)
+        supported = [
+            str(chain).strip().lower()
+            for chain in self.service.supported_chains()
+            if str(chain).strip()
+        ]
+        ordered = []
+        for chain in supported:
+            if chain not in ordered:
+                ordered.append(chain)
+        for chain in grouped:
+            if chain not in ordered:
+                ordered.append(chain)
+        return [(chain, grouped.get(chain, [])) for chain in ordered]
+
+    def render_chain_summary(self, candidates, errors, title="🎨 <b>All OpenSea mints today</b>"):
+        candidates = list(candidates or [])
+        groups = self._chain_candidate_groups(candidates)
+        project_count = len(project_groups(candidates))
+        lines = [
+            title,
+            "<i>Grouped by network · choose a network to see its projects</i>",
+            f"<i>{esc(project_count)} projects · {esc(len(candidates))} mint options</i>",
+            "",
+        ]
+        if not candidates:
+            lines.extend([
+                "<b>No OpenSea mints are live or opening today.</b>",
+                "Try a specific network again later. Marketplace listings are not mint routes.",
+            ])
+        else:
+            for chain, chain_candidates in groups:
+                if not chain_candidates:
+                    summary = "No live or upcoming mint windows"
+                    detail = "0 projects · 0 mint options"
+                else:
+                    chain_projects = len(project_groups(chain_candidates))
+                    free_count = sum(1 for item in chain_candidates if item.get("is_free"))
+                    public_count = sum(1 for item in chain_candidates if item.get("is_public"))
+                    detail = (
+                        f"{chain_projects} projects · {len(chain_candidates)} mint options · "
+                        f"{free_count} free · {public_count} public"
+                    )
+                    summary = self._candidate_time_summary(
+                        list(enumerate(chain_candidates, 1))
+                    )
+                lines.extend([
+                    f"⛓ <b>{esc(pretty_chain(chain))}</b>",
+                    f"   {esc(detail)}",
+                    f"   {esc(summary)}",
+                    "",
+                ])
+        if errors:
+            lines.extend([
+                f"⚠️ <i>{esc(len(errors))} network scan issue(s). Open a network below to retry it.</i>",
+            ])
+        return "\n".join(lines).rstrip()
 
     def render_candidates(self, candidates, errors, title="🎨 <b>Today’s mint options</b>", page=0):
         total_options = len(candidates)
@@ -2365,9 +2607,9 @@ class TelegramBot:
             public_count = sum(1 for candidate in candidates if candidate.get("is_public"))
             lines = [
                 title,
-                f"<i>{esc(total)} projects · {esc(total_options)} mint options · "
+                f"<i>{esc(total)} collections · {esc(total_options)} mint options · "
                 f"{esc(free_count)} free · {esc(public_count)} public</i>",
-                f"<i>Page {page + 1} of {total_pages} · tap a project to continue</i>",
+                f"<i>Page {page + 1} of {total_pages} · tap a collection to review its mint windows</i>",
                 "",
             ]
             for offset, group in enumerate(visible):
@@ -2386,8 +2628,13 @@ class TelegramBot:
                     "",
                 ])
             text = "\n".join(lines).rstrip()
-        if errors and not candidates:
-            text += "\n\n⚠️ <i>Some OpenSea data could not load. Try Refresh.</i>"
+        if errors:
+            note = (
+                "Some OpenSea data could not load. Try Refresh."
+                if not candidates
+                else "Some OpenSea stage details used the compact catalogue fallback; refresh for the full stage list."
+            )
+            text += f"\n\n⚠️ <i>{esc(note)}</i>"
         return text
 
     @staticmethod
@@ -2425,18 +2672,7 @@ class TelegramBot:
         end = candidate.get("end_time")
         end_text = format_time(end) if end else "not provided"
         collection_url = candidate.get("opensea_url") or candidate.get("url")
-        if candidate.get("route") == "generic_contract":
-            route = "🟣 Verified external contract · simulation required"
-        elif candidate.get("is_public") is True and candidate.get("contract_address"):
-            route = "⚡ Direct public SeaDrop first · OpenSea fallback"
-        elif is_free_public_candidate(candidate):
-            route = "🟢 Free/public · ready to request"
-        elif candidate.get("is_public") is False:
-            route = "🟡 Restricted · OpenSea will verify wallet eligibility"
-        elif str(candidate.get("price_display", "")).lower().startswith("paid"):
-            route = "💰 Paid · MAX_MINT_PRICE_NATIVE cap applies"
-        else:
-            route = "⚪ Price/access unknown · OpenSea will verify"
+        route = self._mint_method(candidate)
         links = self.rich_links(candidate)
         supply = self.supply_text(candidate)
         collection_link = embedded_link(
@@ -2454,7 +2690,7 @@ class TelegramBot:
             f"<b>Ends:</b> {esc(end_text)}\n"
             f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))} per wallet\n"
             f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n"
-            f"<b>Route:</b> {route}\n\n"
+            f"<b>Method:</b> {esc(route)}\n\n"
             f"{description_block(candidate)}\n\n"
             f"{supply + chr(10) if supply else ''}"
             f"<b>Links:</b> {links}\n\n"
@@ -2532,7 +2768,7 @@ class TelegramBot:
         """Render a fresh read-only wallet check for a confirmation screen."""
         try:
             snapshot = self.service.funding_snapshot(candidate)
-        except Exception as exc:
+        except Exception:
             return "<b>💳 Funds needed</b>\n⚠️ Could not check right now. Try again."
         native = snapshot.get("native") or "native"
         estimated_ok = snapshot.get("estimated_shortfall_wei", 0) == 0
@@ -2568,29 +2804,7 @@ class TelegramBot:
 
     def _fresh_candidate(self, candidate):
         """Refresh one stage immediately before an arm or broadcast action."""
-        candidate = dict(candidate or {})
-        token = candidate_token(candidate)
-        quantity = validate_quantity(
-            candidate, candidate.get("quantity") or config.MINT_QUANTITY
-        )
-        stages = self.service.inspect_drop(candidate.get("opensea_url") or candidate.get("url") or candidate.get("slug"))
-        for fresh in stages:
-            if candidate_token(fresh) != token:
-                continue
-            fresh = dict(fresh)
-            if fresh.get("price_wei") != candidate.get("price_wei"):
-                raise RuntimeError(
-                    "the OpenSea mint price changed; reopen the drop and approve the new total"
-                )
-            if fresh.get("access_label") != candidate.get("access_label"):
-                raise RuntimeError(
-                    "the OpenSea eligibility rule changed; reopen the drop and review it again"
-                )
-            fresh["quantity"] = validate_quantity(fresh, quantity)
-            return fresh
-        raise RuntimeError(
-            "the selected OpenSea mint stage changed or ended; reopen the drop and confirm it again"
-        )
+        return self.service.refresh_candidate(candidate, require_same_terms=True)
 
     @staticmethod
     def _research_candidate(research):
@@ -2663,25 +2877,48 @@ class TelegramBot:
             candidate["wallet_ids"] = self._selected_wallet_ids(chat_id, candidate)
         return candidate
 
+    def _ordered_schedule_candidates(self, candidates):
+        chain_order = {
+            str(chain).strip().lower(): position
+            for position, chain in enumerate(self.service.supported_chains())
+        }
+        return sorted(
+            [dict(candidate) for candidate in candidates or []],
+            key=lambda candidate: (
+                chain_order.get(str(candidate.get("chain") or "").lower(), 999),
+                str(candidate.get("chain") or "").lower(),
+                str(candidate.get("name") or candidate.get("slug") or "").lower(),
+                int(candidate.get("start_time") or 0),
+                str(candidate.get("stage_label") or "").lower(),
+            ),
+        )
+
     def render_schedule_stages(self, candidates, page=0):
+        candidates = self._ordered_schedule_candidates(candidates)
         total_pages = max(1, (len(candidates) + SCHEDULE_STAGE_PAGE_SIZE - 1) // SCHEDULE_STAGE_PAGE_SIZE)
         page = min(max(0, int(page)), total_pages - 1)
         first = page * SCHEDULE_STAGE_PAGE_SIZE
         visible = candidates[first:first + SCHEDULE_STAGE_PAGE_SIZE]
         lines = [
-            "<b>📌 Choose a mint stage</b>",
-            f"<i>{esc(len(candidates))} active/upcoming stage(s) · page {page + 1}/{total_pages}</i>",
+            "<b>📌 Choose one mint to schedule</b>",
+            f"<i>{esc(len(candidates))} active/upcoming mint window(s) · page {page + 1}/{total_pages}</i>",
             "",
         ]
+        last_chain = None
         for index, candidate in enumerate(visible, first + 1):
+            chain = str(candidate.get("chain") or "unknown").lower()
+            if chain != last_chain:
+                lines.extend([
+                    f"⛓ <b>{esc(pretty_chain(chain))}</b>",
+                ])
+                last_chain = chain
             lines.extend([
                 f"<b>{index}. {esc(short_text(candidate.get('name', candidate.get('slug')), 44))}</b>",
-                f"   {candidate_badge(candidate)} · ⛓ {esc(pretty_chain(candidate.get('chain')))}",
-                f"   🧩 {esc(candidate.get('stage_label', 'Unknown'))} · 💵 {esc(candidate.get('price_display', 'Price unknown'))}",
-                f"   🕒 {esc(format_time(candidate.get('start_time')))}",
+                f"   {candidate_badge(candidate)} · {esc(candidate.get('stage_label', 'Mint window'))}",
+                f"   💵 {esc(candidate.get('price_display', 'Price unknown'))} · 🕒 {esc(format_time(candidate.get('start_time')))}",
                 "",
             ])
-        lines.append("Tap a stage to review it before arming the schedule.")
+        lines.append("Tap a mint to review it, then confirm the schedule.")
         return "\n".join(lines).rstrip()
 
     def render_schedule_candidate(self, candidate):
@@ -2700,7 +2937,7 @@ class TelegramBot:
             "<b>📌 Schedule preview</b>\n\n"
             f"<b>Collection:</b> {collection_link}\n"
             f"<b>Chain:</b> {esc(pretty_chain(candidate.get('chain', 'unknown')))}\n"
-            f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))} · index {esc(candidate.get('stage_index', 'unknown'))}\n"
+            f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))}\n"
             f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}\n"
             f"<b>Total mint value:</b> {esc(self._total_mint_value(candidate))}\n"
             f"<b>Access:</b> {esc(access)}\n"
@@ -2710,7 +2947,7 @@ class TelegramBot:
             f"<b>Wallets:</b> {esc(len(candidate.get('wallet_ids') or ['primary']))}\n\n"
             f"{warning}\n"
             f"{self._route_guard_text(candidate)}\n\n"
-            "Review the details, then use the live confirmation screen.\n\n"
+            "Check the details, then confirm the schedule.\n\n"
             f"{description_block(candidate)}\n\n"
             f"{supply + chr(10) if supply else ''}"
             f"<b>Links:</b> {links}\n\n"
@@ -2727,16 +2964,13 @@ class TelegramBot:
             "failed": "🔴 Failed",
             "cancelled": "⏹ Cancelled",
         }.get(status, f"⚪ {status.title()}")
-        mode = "🔴 LIVE" if schedule.get("mode") == "live" else "Legacy non-live schedule"
         result = schedule.get("result") or {}
         error = schedule.get("error")
         warning = self._schedule_price_warning(candidate)
         text = (
             (notice + "\n\n" if notice else "")
             + "<b>📌 Mint schedule</b>\n\n"
-            f"<b>ID:</b> <code>{esc(schedule.get('id', 'unknown'))}</code>\n"
             f"<b>Status:</b> {status_label}\n"
-            f"<b>Mode:</b> {mode}\n"
             f"<b>Collection:</b> {embedded_link(candidate.get('name', candidate.get('slug', 'Unknown')), candidate.get('opensea_url') or candidate.get('url'))}\n"
             f"<b>Chain:</b> {esc(pretty_chain(candidate.get('chain', 'unknown')))}\n"
             f"<b>Stage:</b> {esc(candidate.get('stage_label', 'Unknown'))}\n"
@@ -2781,7 +3015,7 @@ class TelegramBot:
         if not schedules:
             lines.extend([
                 "No one-time schedules yet.",
-                "Tap <b>New schedule</b> and paste an OpenSea collection/drop URL.",
+                "Tap <b>New schedule</b> and paste any OpenSea collection, drop, item, or asset URL.",
             ])
         else:
             for item in schedules[:10]:
@@ -2893,101 +3127,110 @@ class TelegramBot:
         return self.error_card("The mint finished without a transaction hash. Check the saved attempt before retrying.")
 
     def render_research(self, research):
-        """Render a read-only OpenSea research report with safe embedded links."""
+        """Render only actionable facts from OpenSea's hosted-drop record."""
         research = dict(research or {})
-        candidate = research.get("candidate") or self._research_candidate(research) or {}
-        name = research.get("name") or candidate.get("name") or research.get("slug") or "NFT"
-        collection_url = research.get("opensea_url") or candidate.get("opensea_url") or candidate.get("url")
-        title = embedded_link(name, collection_url)
-        lines = [
-            "<b>🔬 NFT research</b>",
-            f"<b>Collection:</b> {title}",
+        candidates = [
+            dict(item) for item in (research.get("mint_candidates") or [])
+            if isinstance(item, dict)
         ]
-        if research.get("asset_nft"):
-            asset = research.get("asset_nft") or {}
-            asset_url = asset.get("opensea_url") or (research.get("reference") or {}).get("url")
-            lines.append(f"<b>Asset:</b> {embedded_link(asset.get('name', 'Open NFT asset'), asset_url)}")
-            lines.append("<i>Asset research is read-only. Mint actions apply to a collection/drop stage, not an already minted token.</i>")
-        if candidate:
+        candidate = research.get("candidate") or (candidates[0] if len(candidates) == 1 else {})
+        name = research.get("name") or candidate.get("name") or research.get("slug") or "OpenSea drop"
+        collection_url = research.get("opensea_url") or candidate.get("opensea_url")
+        chain = research.get("chain") or candidate.get("chain") or "unknown"
+        now = int(time.time())
+        live_count = sum(
+            1 for item in candidates
+            if int(item.get("start_time") or 0) <= now
+            and (item.get("end_time") is None or int(item.get("end_time") or 0) >= now)
+        )
+        if research.get("is_sold_out") is True:
+            status = "⛔ Sold out"
+        elif live_count:
+            status = f"🟢 Live · {live_count} stage{'s' if live_count != 1 else ''}"
+        elif candidates:
+            status = f"🕒 Scheduled · {len(candidates)} stage{'s' if len(candidates) != 1 else ''}"
+        else:
+            status = "⚪ No active or upcoming stage"
+
+        lines = [
+            "<b>ℹ️ OpenSea mint info</b>",
+            f"<b>Collection:</b> {embedded_link(name, collection_url)}",
+            f"<b>Network:</b> {esc(pretty_chain(chain))}",
+            f"<b>Status:</b> {esc(status)}",
+        ]
+        supply = self._research_supply(research)
+        if supply != "Unknown":
+            lines.append(f"<b>Supply:</b> {esc(supply)}")
+        contract = str(research.get("contract_address") or candidate.get("contract_address") or "").strip()
+        explorer = CHAIN_EXPLORER_ADDRESS_URLS.get(str(chain).lower())
+        if contract:
+            contract_label = f"{contract[:8]}…{contract[-6:]}" if len(contract) > 18 else contract
+            contract_url = explorer.format(address=contract) if explorer else ""
+            lines.append(f"<b>Contract:</b> {embedded_link(contract_label, contract_url)}")
+
+        lines.extend(["", "<b>Mint stages</b>"])
+        if not candidates:
+            lines.append("<i>OpenSea currently exposes no live or upcoming mint stage.</i>")
+        for position, item in enumerate(candidates, 1):
+            start = int(item.get("start_time") or 0)
+            end = item.get("end_time")
+            is_live = start <= now and (end is None or int(end or 0) >= now)
+            timing = "Live now" if is_live else f"Opens {format_time(start)}"
+            if is_live and end:
+                timing += f" · ends {format_time(end)}"
+            sold_out = " · SOLD OUT" if item.get("is_sold_out") is True else ""
             lines.extend([
-                f"<b>Mint chain:</b> {esc(pretty_chain(candidate.get('chain', 'unknown')))}",
-                f"<b>Mint stage:</b> {esc(candidate.get('stage_label', 'No active stage selected'))}",
-                f"<b>Price:</b> {esc(candidate.get('price_display', 'Price unknown'))}",
-                f"<b>Access:</b> {esc(candidate.get('access_label', 'Unknown'))}",
-                f"<b>Opens:</b> {esc(format_time(candidate.get('start_time')))}",
-                f"<b>Quantity:</b> {esc(candidate.get('quantity', config.MINT_QUANTITY))}",
+                f"{position}. <b>{esc(item.get('stage_label') or 'Mint stage')}</b>",
+                f"   {esc(item.get('price_display') or 'Price unknown')} · "
+                f"{esc(item.get('access_label') or 'Access unknown')}",
+                f"   {esc(timing + sold_out)}",
             ])
-        elif research.get("mint_route_note"):
-            lines.extend([
-                "<b>Mint route:</b> Custom or unavailable",
-                f"<i>{esc(shorten_description(research.get('mint_route_note'), 320))}</i>",
-            ])
-        best_listing = research.get("best_listing") or {}
-        if best_listing:
-            lines.append(
-                f"<b>Cheapest active listing:</b> "
-                f"{embedded_link(best_listing.get('price_display', 'View listing'), best_listing.get('opensea_url'))}"
-            )
-        description = shorten_description(research.get("description") or candidate.get("description"), 900)
+
+        description = shorten_description(research.get("description") or candidate.get("description"), 500)
         if description:
             lines.extend(["", f"<b>Description:</b>\n{esc(description)}"])
-        collection_rows = []
-        self._append_research_row(collection_rows, "Category", research.get("category"))
-        self._append_research_row(collection_rows, "Created", research.get("created_date"))
-        safelist = str(research.get("safelist_status") or "").strip()
-        if safelist and safelist.lower() not in {"unknown", "not_requested"}:
-            self._append_research_row(collection_rows, "Safelist", safelist.replace("_", " ").title())
-        supply_label = "Mint progress" if research.get("max_supply") is not None else "Supply"
-        self._append_research_row(collection_rows, supply_label, self._research_supply(research))
-        self._append_research_row(collection_rows, "Floor", self._research_floor(research), hide_zero=True)
-        self._append_research_row(
-            collection_rows,
-            "All-time volume",
-            self._research_metric(research, "stats_total", "volume", currency=True),
-            hide_zero=True,
-        )
-        self._append_research_row(
-            collection_rows, "All-time sales", self._research_metric(research, "stats_total", "sales"), hide_zero=True
-        )
-        self._append_research_row(collection_rows, "Owners", self._research_owners(research))
-        one_day_volume = self._research_metric(research, "stats_one_day", "volume", currency=True)
-        one_day_sales = self._research_metric(research, "stats_one_day", "sales")
-        self._append_research_row(collection_rows, "24h volume", one_day_volume, hide_zero=True)
-        self._append_research_row(collection_rows, "24h sales", one_day_sales, hide_zero=True)
-        if collection_rows:
-            lines.extend(["", "<b>Collection data</b>", *collection_rows])
-        social = self.research_links(research)
-        if social:
-            lines.extend(["", f"<b>Links:</b> {social}"])
-        owner = str(research.get("owner") or "").strip()
-        editors = self._unique_wallets(research.get("editors") or [], exclude={owner})
-        if owner or editors:
-            lines.extend(["", "<b>Wallet attribution</b>"])
-            if owner:
-                lines.append(self.owner_link(research, owner, "Attributed owner"))
-            if editors:
-                for position, item in enumerate(editors[:4], 1):
-                    label = "Attributed editor" if len(editors) == 1 else f"Attributed editor {position}"
-                    lines.append(self.owner_link(research, item, label))
-            lines.append(f"<i>{esc(research.get('developer_note') or 'These are public OpenSea attributions, not verified developer identities.')}</i>")
-        samples = research.get("sample_nfts") or []
-        if isinstance(samples, list) and samples:
-            sample_links = []
-            for sample in samples[:3]:
-                if not isinstance(sample, dict):
-                    continue
-                identifier = str(sample.get("identifier") or "").strip()
-                sample_name = str(sample.get("name") or "").strip()
-                label = f"#{identifier}" if identifier else (sample_name or "View NFT")
-                if sample_name and identifier and sample_name.lower() not in {"untitled", "unnamed"}:
-                    label = f"{sample_name} #{identifier}"
-                sample_links.append(embedded_link(
-                    short_text(label, 32),
-                    sample.get("opensea_url") or sample.get("permalink"),
-                ))
-            if sample_links:
-                lines.extend(["", f"<b>Recent NFTs:</b> {' · '.join(sample_links)}"])
+        source = str(research.get("source") or "OpenSea Drops API")
+        lines.extend(["", f"<i>Source: {esc(source)} · refreshed for this request</i>"])
         return "\n".join(lines)
+
+    @staticmethod
+    def _mint_method(candidate):
+        """Return a human label for the transaction path, without raw diagnostics."""
+        candidate = candidate if isinstance(candidate, dict) else {}
+        route = str(candidate.get("route") or "opensea_drop").strip().lower()
+        if route == "generic_contract":
+            return "Verified contract · simulated before signing"
+        if route == "opensea_drop" and candidate.get("route_label"):
+            return str(candidate.get("route_label"))
+        if candidate.get("is_public") is True and candidate.get("contract_address"):
+            return "Direct public SeaDrop · checked on-chain"
+        return "OpenSea drop transaction · refreshed at confirmation"
+
+    def _mint_links_html(self, candidate=None, research=None):
+        """Return one non-duplicated set of useful project/mint links."""
+        candidate = candidate if isinstance(candidate, dict) else {}
+        research = research if isinstance(research, dict) else {}
+        collection_url = candidate.get("opensea_url") or candidate.get("url") or research.get("opensea_url")
+        explicit_mint_url = (
+            candidate.get("mint_url")
+            or candidate.get("drop_url")
+            or research.get("mint_url")
+            or research.get("drop_url")
+        )
+        links = []
+        if safe_http_url(explicit_mint_url) and str(explicit_mint_url).strip() != str(collection_url or "").strip():
+            links.append(embedded_link("Mint page", explicit_mint_url))
+        # A collection URL is only an actionable drop page when a candidate
+        # exists. For research with no verified stage it remains the title
+        # link above, not a falsely labelled mint route.
+        if candidate and safe_http_url(collection_url):
+            links.append(embedded_link("OpenSea drop", collection_url))
+        project_url = candidate.get("project_url") or research.get("project_url")
+        if safe_http_url(project_url) and str(project_url).strip() not in {
+            str(collection_url or "").strip(), str(explicit_mint_url or "").strip()
+        }:
+            links.append(embedded_link("Project site", project_url))
+        return " · ".join(links)
 
     @staticmethod
     def _append_research_row(lines, label, value, hide_zero=False):
@@ -3231,6 +3474,50 @@ class TelegramBot:
                 return group
         raise ValueError("that project button is stale; run a fresh scan")
 
+    def _project_option_from_ref(self, project_ref, candidate_ref):
+        group = self._project_from_ref(project_ref)
+        for index, candidate in group["options"]:
+            if candidate_token(candidate) == str(candidate_ref):
+                return group, index, dict(candidate)
+        raise ValueError("that mint window is stale; run a fresh scan")
+
+    def _candidate_group_page(self, index, candidate):
+        chain = str(candidate.get("chain") or "").strip().lower()
+        if chain in self.service.supported_chains():
+            source = self.service.last_candidates
+            visible = self._candidates_for_chain(source, chain)
+            absolute_indexes = [
+                position
+                for position, item in enumerate(source or [], 1)
+                if str(item.get("chain") or "").strip().lower() == chain
+            ]
+            for page, group in enumerate(
+                project_groups(visible, absolute_indexes)
+            ):
+                if any(option_index == index for option_index, _ in group["options"]):
+                    return page // CANDIDATE_PAGE_SIZE
+        return max(0, (int(index) - 1) // CANDIDATE_PAGE_SIZE)
+
+    def _project_group_page(self, group):
+        candidate = group.get("candidate") or {}
+        chain = str(candidate.get("chain") or "").strip().lower()
+        source = self.service.last_candidates
+        if chain in self.service.supported_chains():
+            visible = self._candidates_for_chain(source, chain)
+            absolute_indexes = [
+                position
+                for position, item in enumerate(source or [], 1)
+                if str(item.get("chain") or "").strip().lower() == chain
+            ]
+            groups = project_groups(visible, absolute_indexes)
+        else:
+            groups = project_groups(source)
+        target = project_token(candidate)
+        for position, item in enumerate(groups):
+            if project_token(item["candidate"]) == target:
+                return position // CANDIDATE_PAGE_SIZE
+        return 0
+
     def _save_schedule_draft(self, chat_id, candidates):
         with self.input_lock:
             self.schedule_drafts[int(chat_id)] = {
@@ -3332,13 +3619,19 @@ class TelegramBot:
 
     def home_keyboard(self):
         return self.markup([
-            [self.button("🔎 Find today’s mints", "chains")],
-            [self.button("🔗 Look up an NFT", "research:new")],
-            [self.button("⏰ Schedule from link", "schedule:new"), self.button("📋 My schedules", "schedules")],
-            [self.button("💼 My wallet", "wallet"), self.button("🧾 Mint history", "wallet:mints")],
-            [self.button("🎨 Last scan", "candidates"), self.button("📊 Bot status", "status")],
-            [self.button("🤖 Automatic mode", "daily"), self.button("⚙️ Settings", "settings")],
-            [self.button("❓ Help", "help")],
+            [self.button("\U0001f50e Scan for mints", "chains")],
+            [
+                self.button("\U0001f517 Paste a link", "research:new"),
+                self.button("\u23f0 Schedule", "schedule:new"),
+            ],
+            [
+                self.button("\U0001f3a8 Last scan", "candidates"),
+                self.button("\U0001f4bc Wallet", "wallet"),
+            ],
+            [
+                self.button("\U0001f4cb Schedules", "schedules"),
+                self.button("\u2699\ufe0f More", "settings"),
+            ],
         ])
 
     def status_keyboard(self):
@@ -3348,18 +3641,117 @@ class TelegramBot:
             [self.button("⚙️ Automatic mode", "daily"), self.button("🏠 Home", "home")],
         ])
 
-    def chain_keyboard(self):
+    def chain_keyboard(self, coverage=None, show_empty=False):
+        """Network picker ordered by how many drops each network actually has.
+
+        Listing every supported network as equally clickable was the main
+        reason /scan felt broken: most have no OpenSea drop on a given day, so
+        an honest empty result looked like a failure. Counts come from the
+        cached drop calendar and cost no extra API call.
+        """
         chains = self.service.supported_chains()
+        if coverage is None:
+            # Counts could not be read. That is not the same as "no drops", so
+            # fall back to the plain list rather than hiding every network.
+            rows = [[self.button("\U0001f310 Scan all networks", "scan:all")]]
+            for position in range(0, len(chains), 2):
+                rows.append([
+                    self.button(
+                        f"{config.chain_icon(chain)} {pretty_chain(chain)}",
+                        f"scan:{chain}",
+                    )
+                    for chain in chains[position:position + 2]
+                ])
+            rows.append([
+                self.button("\U0001f504 Refresh", "chains:refresh"),
+                self.button("\U0001f3e0 Home", "home"),
+            ])
+            return self.markup(rows)
+
+        counts = {
+            str(chain).strip().lower(): int(count)
+            for chain, count in coverage.items()
+        }
+        live = sorted(
+            (chain for chain in chains if counts.get(chain)),
+            key=lambda chain: (-counts[chain], chain),
+        )
+        empty = [chain for chain in chains if not counts.get(chain)]
+
         rows = []
-        for position in range(0, len(chains), 2):
-            row = [self.button(f"🔎 {pretty_chain(chain)}", f"scan:{chain}") for chain in chains[position:position + 2]]
-            rows.append(row)
-        rows.append([self.button("🏠 Home", "home")])
+        if live:
+            total = sum(counts[chain] for chain in live)
+            rows.append([self.button(f"\U0001f310 All networks \u00b7 {total}", "scan:all")])
+            for position in range(0, len(live), 2):
+                rows.append([
+                    self.button(
+                        f"{config.chain_icon(chain)} {pretty_chain(chain)} \u00b7 {counts[chain]}",
+                        f"scan:{chain}",
+                    )
+                    for chain in live[position:position + 2]
+                ])
+        else:
+            rows.append([self.button("\U0001f310 Scan all networks", "scan:all")])
+
+        if show_empty:
+            for position in range(0, len(empty), 3):
+                rows.append([
+                    self.button(
+                        f"{config.chain_icon(chain)} {pretty_chain(chain)}",
+                        f"scan:{chain}",
+                    )
+                    for chain in empty[position:position + 3]
+                ])
+        elif empty:
+            rows.append([self.button(f"\u2795 Other networks ({len(empty)})", "chains:all")])
+
+        rows.append([
+            self.button("\U0001f504 Refresh", "chains:refresh"),
+            self.button("\U0001f3e0 Home", "home"),
+        ])
+        return self.markup(rows)
+
+    def chain_summary_keyboard(self, candidates=None):
+        counts = {
+            chain: len(items)
+            for chain, items in self._chain_candidate_groups(candidates)
+        }
+        rows = []
+        for chain in [
+            str(value).strip().lower()
+            for value in self.service.supported_chains()
+            if str(value).strip()
+        ]:
+            count = counts.get(chain, 0)
+            project_count = len(
+                project_groups(self._candidates_for_chain(candidates, chain))
+            )
+            rows.append([
+                self.button(
+                    f"⛓ {pretty_chain(chain)} · {project_count} projects / {count} mints",
+                    f"candidates:chain:{chain}:page:0",
+                )
+            ])
+        rows.extend([
+            [self.button("🔄 Scan all again", "scan:all")],
+            [self.button("🔎 Choose one network", "chains"), self.button("🏠 Home", "home")],
+        ])
         return self.markup(rows)
 
     def candidates_keyboard(self, candidates=None, page=0, scan_chain=None):
-        candidates = self.service.last_candidates if candidates is None else candidates
-        groups = project_groups(candidates)
+        source_candidates = self.service.last_candidates if candidates is None else candidates
+        scan_chain = str(scan_chain or self.last_scan_chain or "").strip().lower()
+        if scan_chain in self.service.supported_chains():
+            visible_candidates = self._candidates_for_chain(source_candidates, scan_chain)
+            absolute_indexes = [
+                index
+                for index, candidate in enumerate(source_candidates or [], 1)
+                if str(candidate.get("chain") or "").strip().lower() == scan_chain
+            ]
+            groups = project_groups(visible_candidates, absolute_indexes)
+        else:
+            visible_candidates = list(source_candidates or [])
+            groups = project_groups(visible_candidates)
         total_pages = max(1, (len(groups) + CANDIDATE_PAGE_SIZE - 1) // CANDIDATE_PAGE_SIZE)
         page = min(max(0, int(page)), total_pages - 1)
         first = page * CANDIDATE_PAGE_SIZE
@@ -3377,12 +3769,23 @@ class TelegramBot:
         if total_pages > 1:
             navigation = []
             if page > 0:
-                navigation.append(self.button("⬅️ Previous", f"candidates:page:{page - 1}"))
+                callback = (
+                    f"candidates:chain:{scan_chain}:page:{page - 1}"
+                    if scan_chain in self.service.supported_chains()
+                    else f"candidates:page:{page - 1}"
+                )
+                navigation.append(self.button("⬅️ Previous", callback))
             if page < total_pages - 1:
-                navigation.append(self.button("Next ➡️", f"candidates:page:{page + 1}"))
+                callback = (
+                    f"candidates:chain:{scan_chain}:page:{page + 1}"
+                    if scan_chain in self.service.supported_chains()
+                    else f"candidates:page:{page + 1}"
+                )
+                navigation.append(self.button("Next ➡️", callback))
             rows.append(navigation)
-        scan_chain = str(scan_chain or self.last_scan_chain or "").strip().lower()
-        if scan_chain in self.service.supported_chains():
+        if scan_chain == "all":
+            scan_button = self.button("🔄 Scan all networks again", "scan:all")
+        elif scan_chain in self.service.supported_chains():
             scan_button = self.button(f"🔄 Scan {pretty_chain(scan_chain)} again", f"scan:{scan_chain}")
         else:
             scan_button = self.button("🔎 Scan another network", "chains")
@@ -3392,30 +3795,71 @@ class TelegramBot:
 
     def project_keyboard(self, group):
         rows = []
-        for position, (index, candidate) in enumerate(group["options"], 1):
-            rows.append([self.button(
-                f"{position}. {short_text(candidate.get('stage_label', 'Mint'), 20)} · {short_text(candidate.get('price_display', 'Unknown'), 18)}",
-                f"candidate:{index}:{candidate_token(candidate)}",
-            )])
-        rows.append([self.button("↩️ All projects", "candidates"), self.button("🏠 Home", "home")])
+        project_ref = project_token(group["candidate"])
+        multiple = len(group["options"]) > 1
+        for _, candidate in group["options"]:
+            candidate_ref = candidate_token(candidate)
+            stage = short_text(candidate.get("stage_label", "Mint"), 14)
+            price = short_text(candidate.get("price_display", "Unknown"), 12)
+            if multiple:
+                mint_label = f"🚀 Mint {stage} · {price}"
+                schedule_label = f"⏰ Schedule {stage} · {price}"
+            else:
+                mint_label = "🚀 Mint now"
+                schedule_label = "⏰ Schedule"
+            rows.append([
+                self.button(mint_label, f"project:mint:{project_ref}:{candidate_ref}"),
+                self.button(schedule_label, f"project:schedule:{project_ref}:{candidate_ref}"),
+            ])
+        candidate = group["candidate"]
+        collection_url = candidate.get("opensea_url") or candidate.get("url")
+        explicit_mint_url = candidate.get("mint_url")
+        if safe_http_url(explicit_mint_url):
+            rows.append([self.url_button("🚀 Open mint page", explicit_mint_url)])
+        if safe_http_url(collection_url):
+            rows.append([self.url_button("🌊 OpenSea drop page", collection_url)])
+        project_url = candidate.get("project_url")
+        if safe_http_url(project_url) and str(project_url).strip() != str(collection_url or "").strip():
+            rows.append([self.url_button("🌐 Project site", project_url)])
+        chain = str(candidate.get("chain") or "").strip().lower()
+        page = self._project_group_page(group)
+        back = (
+            self.button(f"↩️ {pretty_chain(chain)} projects", f"candidates:chain:{chain}:page:{page}")
+            if chain in self.service.supported_chains()
+            else self.button("↩️ All projects", "candidates")
+        )
+        rows.append([back, self.button("🏠 Home", "home")])
         return self.markup(rows)
 
     def candidate_detail_keyboard(self, index, candidate=None, page=None):
         candidate = candidate or self._candidate_at(index)
         token = candidate_token(candidate)
         if page is None:
-            page = max(0, (index - 1) // CANDIDATE_PAGE_SIZE)
+            page = self._candidate_group_page(index, candidate)
         quantity = int(candidate.get("quantity") or config.MINT_QUANTITY)
         wallet_count = len(candidate.get("wallet_ids") or ["primary"])
-        rows = [
-            [self.button("🔬 Full info", f"info:candidate:{index}:{token}"), self.button("🖼 Mint card", f"card:candidate:{index}:{token}")],
-            [self.button(f"📦 Quantity: {quantity}", f"quantity:candidate:{index}:{token}")],
-            [self.button(f"👛 Wallets: {wallet_count}", f"wallets:candidate:{index}:{token}")],
-            [self.button("🚀 Mint now", f"mint:{index}:{token}:live")],
-            [self.button("📌 Schedule this mint", f"schedule:candidate:{index}:{token}")],
-        ]
+        rows = []
+        if candidate.get("is_sold_out") is not True:
+            rows.extend([
+                [
+                    self.button("🚀 Mint now", f"mint:{index}:{token}:live"),
+                    self.button("⏰ Schedule", f"schedule:candidate:{index}:{token}"),
+                ],
+                [self.button(f"📦 Quantity: {quantity}", f"quantity:candidate:{index}:{token}"),
+                 self.button(f"👛 Wallets: {wallet_count}", f"wallets:candidate:{index}:{token}")],
+            ])
         rows.append([
-            self.button("↩️ Back to results", f"candidates:page:{page}"),
+            self.button("ℹ️ Mint info", f"info:candidate:{index}:{token}"),
+            self.button("🖼 Mint card", f"card:candidate:{index}:{token}"),
+        ])
+        chain = str(candidate.get("chain") or "").strip().lower()
+        back_callback = (
+            f"candidates:chain:{chain}:page:{page}"
+            if chain in self.service.supported_chains()
+            else f"candidates:page:{page}"
+        )
+        rows.append([
+            self.button("↩️ Back to results", back_callback),
             self.button("🏠 Home", "home"),
         ])
         return self.markup(rows)
@@ -3428,16 +3872,29 @@ class TelegramBot:
         ])
 
     def settings_keyboard(self, custom_background=False):
+        """Everything the home screen no longer shows lives one tap in here."""
         rows = [
-            [self.button("🖼 Set card background", "settings:bg")],
-            [self.button("🎨 Set accent color", "settings:accent"), self.button("✏️ Set card brand", "settings:brand")],
-            [self.button("👁 Preview card", "settings:preview")],
-            [self.button("💰 Set maximum mint price", "settings:cap")],
-            [self.button("🛍 Set maximum buy price", "settings:buycap")],
+            [
+                self.button("\U0001f4ca Status", "status"),
+                self.button("\U0001f9fe Mint history", "wallet:mints"),
+            ],
+            [
+                self.button("\U0001f916 Automatic mode", "daily"),
+                self.button("\u2753 Help", "help"),
+            ],
+            [self.button("\U0001f4b0 Maximum mint price", "settings:cap")],
+            [
+                self.button("\U0001f441 Preview card", "settings:preview"),
+                self.button("\U0001f5bc Card background", "settings:bg"),
+            ],
+            [
+                self.button("\U0001f3a8 Accent color", "settings:accent"),
+                self.button("\u270f\ufe0f Card brand", "settings:brand"),
+            ],
         ]
         if custom_background:
-            rows.append([self.button("↩️ Reset card background", "settings:bg:reset")])
-        rows.append([self.button("🏠 Home", "home")])
+            rows.append([self.button("\u21a9\ufe0f Reset card background", "settings:bg:reset")])
+        rows.append([self.button("\U0001f3e0 Home", "home")])
         return self.markup(rows)
 
     def schedule_input_keyboard(self):
@@ -3453,6 +3910,7 @@ class TelegramBot:
         ])
 
     def schedule_stage_keyboard(self, candidates, page=0):
+        candidates = self._ordered_schedule_candidates(candidates)
         total_pages = max(1, (len(candidates) + SCHEDULE_STAGE_PAGE_SIZE - 1) // SCHEDULE_STAGE_PAGE_SIZE)
         page = min(max(0, int(page)), total_pages - 1)
         first = page * SCHEDULE_STAGE_PAGE_SIZE
@@ -3460,10 +3918,11 @@ class TelegramBot:
         rows = []
         for index, candidate in enumerate(visible, first + 1):
             token = candidate_token(candidate)
-            label = short_text(candidate.get("stage_label", "Stage"), 24)
+            name = short_text(candidate.get("name", candidate.get("slug", "Mint")), 20)
+            label = short_text(candidate.get("stage_label", "Mint"), 14)
             rows.append([
                 self.button(
-                    f"{index}. {label} · {candidate.get('price_display', 'unknown')}",
+                    f"{index}. {name} · {label} · {short_text(candidate.get('price_display', 'unknown'), 12)}",
                     f"schedule:stage:{token}",
                 )
             ])
@@ -3484,21 +3943,31 @@ class TelegramBot:
         token = candidate_token(candidate)
         quantity = int(candidate.get("quantity") or config.MINT_QUANTITY)
         wallet_count = len(candidate.get("wallet_ids") or ["primary"])
-        return self.markup([
-            [self.button("🔬 Full info", f"info:schedule:{token}"), self.button("🖼 Mint card", f"card:schedule:{token}")],
-            [self.button(f"📦 Quantity: {quantity}", f"quantity:schedule:{token}")],
-            [self.button(f"👛 Wallets: {wallet_count}", f"wallets:schedule:{token}")],
-            [self.button("🚀 Mint now", f"schedule:mint:live:{token}")],
-            [self.button("⏰ Arm live schedule", f"schedule:live:{token}")],
-            [self.button("↩️ Choose another stage", "schedule:stages")],
+        rows = []
+        if candidate.get("is_sold_out") is not True:
+            rows.extend([
+                [
+                    self.button("✅ Schedule mint", f"schedule:live:{token}"),
+                    self.button("🚀 Mint now", f"schedule:mint:live:{token}"),
+                ],
+                [self.button(f"📦 Quantity: {quantity}", f"quantity:schedule:{token}"),
+                 self.button(f"👛 Wallets: {wallet_count}", f"wallets:schedule:{token}")],
+            ])
+        rows.append([
+            self.button("ℹ️ Mint info", f"info:schedule:{token}"),
+            self.button("🖼 Mint card", f"card:schedule:{token}"),
+        ])
+        rows.extend([
+            [self.button("↩️ Choose another mint", "schedule:stages")],
             [self.button("📋 My schedules", "schedules"), self.button("🏠 Home", "home")],
         ])
+        return self.markup(rows)
 
     def confirm_schedule_keyboard(self, candidate):
         token = candidate_token(candidate)
         return self.markup([
-            [self.button("✅ Arm this live schedule", f"schedule:live:confirm:{token}")],
-            [self.button("↩️ Back to preview", f"schedule:stage:{token}")],
+            [self.button("✅ Confirm schedule", f"schedule:live:confirm:{token}")],
+            [self.button("↩️ Back", f"schedule:stage:{token}")],
         ])
 
     def schedules_keyboard(self, schedules):
@@ -3535,28 +4004,31 @@ class TelegramBot:
         candidate = candidate or self._candidate_at(index)
         token = candidate_token(candidate)
         return self.markup([
-            [self.button("✅ Broadcast this mint", f"mint:{index}:{token}:live:confirm")],
-            [self.button("↩️ Cancel", f"candidate:{index}:{token}")],
+            [self.button("✅ Confirm mint now", f"mint:{index}:{token}:live:confirm")],
+            [self.button("↩️ Back", f"candidate:{index}:{token}")],
         ])
 
     def candidate_card_keyboard(self, index, candidate):
         token = candidate_token(candidate)
         return self.markup([
-            [self.button("🔬 Full info", f"info:candidate:{index}:{token}")],
+            [self.button("ℹ️ Mint info", f"info:candidate:{index}:{token}")],
             [self.button("🚀 Mint now", f"mint:{index}:{token}:live")],
             [self.button("🏠 Home", "home")],
         ])
 
     def schedule_card_keyboard(self, candidate, token):
         return self.markup([
-            [self.button("🔬 Full info", f"info:schedule:{token}"), self.button("📌 Schedule preview", f"schedule:stage:{token}")],
+            [self.button("ℹ️ Mint info", f"info:schedule:{token}"), self.button("📌 Schedule preview", f"schedule:stage:{token}")],
             [self.button("🏠 Home", "home")],
         ])
 
     def research_keyboard(self, token, research):
         candidate = self._research_candidate(research)
-        rows = [[self.button("📄 View report", f"research:view:{token}")]]
-        if candidate:
+        rows = []
+        collection_url = (candidate or {}).get("opensea_url") or research.get("opensea_url")
+        if safe_http_url(collection_url):
+            rows.append([self.url_button("🌊 OpenSea drop page", collection_url)])
+        if candidate and candidate.get("is_sold_out") is not True:
             rows.append([
                 self.button("🖼 Mint card", f"research:card:{token}"),
                 self.button("📦 Quantity", f"quantity:schedule:{candidate_token(candidate)}"),
@@ -3566,18 +4038,12 @@ class TelegramBot:
             ])
             rows.append([self.button("🚀 Mint now", f"research:live:{token}")])
         if research.get("mint_candidates"):
-            rows.append([self.button("📌 Choose mint stage", f"research:stages:{token}")])
-        if research.get("best_listing"):
-            price = short_text(
-                (research.get("best_listing") or {}).get("price_display", "current price"),
-                20,
-            )
-            rows.append([self.button(f"🛍 Buy now · {price}", f"research:buy:{token}")])
-        rows.append([self.button("🔬 New research", "research:new"), self.button("🏠 Home", "home")])
+            rows.append([self.button("📌 Choose a mint", f"research:stages:{token}")])
+        rows.append([self.button("ℹ️ New mint info", "research:new"), self.button("🏠 Home", "home")])
         return self.markup(rows)
 
     def research_card_keyboard(self, token, candidate, research):
-        rows = [[self.button("🔬 Full info", f"research:view:{token}")]]
+        rows = [[self.button("ℹ️ Mint info", f"research:view:{token}")]]
         if candidate:
             rows.append([self.button("🚀 Mint now", f"research:live:{token}")])
         rows.append([self.button("🏠 Home", "home")])
@@ -3593,14 +4059,14 @@ class TelegramBot:
             {"command": "status", "description": "show safe runner status"},
             {"command": "wallet", "description": "balances, NFT counts, and mint status"},
             {"command": "mints", "description": "show recent mint transactions"},
-            {"command": "scan", "description": "choose one network to scan"},
+            {"command": "scan", "description": "choose a network and scan OpenSea mints"},
             {"command": "candidates", "description": "review scan results"},
-            {"command": "info", "description": "research an NFT or collection"},
+            {"command": "info", "description": "show concise OpenSea hosted-mint info"},
             {"command": "schedule", "description": "arm a one-time mint schedule"},
             {"command": "schedules", "description": "view or cancel schedules"},
             {"command": "daily", "description": "open daily runner controls"},
             {"command": "mint", "description": "review one candidate"},
-            {"command": "settings", "description": "mint, buy, wallet, and card controls"},
+            {"command": "settings", "description": "mint cap, wallet, and card controls"},
             {"command": "stop", "description": "stop the daily runner"},
             {"command": "help", "description": "show command help"},
         ]
@@ -3608,32 +4074,22 @@ class TelegramBot:
     @staticmethod
     def help_text():
         return (
-            "<b>❓ NFT Mint Bot</b>\n\n"
-            "<b>Dashboard</b>\n"
-            "Use /start or /home for the button-based control center.\n\n"
-            "<b>Commands</b>\n"
-            "<code>/status</code> · read-only status\n"
-            "<code>/wallet</code> · balances, NFT totals, and latest mint status\n"
-            "<code>/wallet base</code> · check one network\n"
-            "<code>/mints</code> · recent mint attempts and transaction links\n"
-            "<code>/scan</code> · choose one network to search\n"
-            "<code>/scan base</code> · search Base directly\n"
-            "<code>/candidates</code> · review all stages and mint details\n"
-            "<code>/info</code> · paste an OpenSea collection, drop, or NFT asset URL\n"
-            "<code>/info https://opensea.io/collection/SLUG</code> · research directly\n"
-            "<code>/schedule</code> · paste an OpenSea collection/drop URL, then choose a stage\n"
-            "<code>/schedule https://opensea.io/collection/SLUG</code> · inspect directly\n"
-            "<code>/schedules</code> · view, inspect, or cancel one-time schedules\n"
-            "<code>/daily live CONFIRM</code> · start guarded live mode\n"
-            "<code>/mint 1</code> · review and confirm one live mint\n"
-            "<code>/settings</code> · separate mint/buy caps and mint-card controls\n"
-            "<code>/stop</code> · request the daily runner to stop\n\n"
-            "Live mode requires <code>ENABLE_LIVE_MINTS=true</code> and a second confirmation. "
-            "Use Quantity and Wallets on a mint preview to launch selected wallets in parallel. "
-            "OpenSea Drops use OpenSea eligibility; safe external routes require verified ABI and simulation. "
-            "Buy now always targets one exact active listing and has a separate price cap. "
-            "Owner/editor wallets shown in research are OpenSea attributions, not verified developer identities. "
-            "A one-time schedule runs only while this Python process is online, so use a VPS for unattended operation."
+            "<b>\u2753 How this bot works</b>\n\n"
+            "<b>1. Scan</b> \u2014 <code>/scan</code> shows which networks have OpenSea "
+            "drops right now, with a count each. Pick one.\n\n"
+            "<b>2. Review</b> \u2014 tap a project to see its mint windows, price, "
+            "eligibility, and wallet limit.\n\n"
+            "<b>3. Mint or schedule</b> \u2014 mint now, or arm a window that has not "
+            "opened yet. Both re-check the live drop before signing.\n\n"
+            "<b>Have a link already?</b> <code>/info &lt;OpenSea URL&gt;</code> jumps "
+            "straight to a drop.\n\n"
+            "<b>Other commands</b>\n"
+            "<code>/wallet</code> \u00b7 <code>/mints</code> \u00b7 "
+            "<code>/schedules</code> \u00b7 <code>/status</code> \u00b7 "
+            "<code>/settings</code> \u00b7 <code>/stop</code>\n\n"
+            "<i>Live transactions need ENABLE_LIVE_MINTS=true plus a confirmation tap. "
+            "Automatic mode only ever attempts free public stages. Schedules run only "
+            "while this process is online.</i>"
         )
 
 
