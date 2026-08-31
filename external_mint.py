@@ -16,6 +16,7 @@ import httpx
 from web3 import Web3
 
 import config
+import opensea_direct_executor
 
 
 SOURCIFY_CONTRACT_URL = "https://sourcify.dev/server/v2/contract/{chain_id}/{address}"
@@ -83,11 +84,72 @@ def resolve_collection_mint(collection, slug, alchemy_key, wallet_address, chain
 
     reasons = []
     for chain, address, chain_settings in records:
+        # A collection can have a live public SeaDrop stage without appearing
+        # in OpenSea's calendar. Resolve that deterministic on-chain route
+        # before attempting ABI inference, because the NFT contract itself may
+        # not expose a mint function at all—the SeaDrop singleton does.
+        try:
+            public_stage = opensea_direct_executor.inspect_public_stage(
+                config.rpc_url_for_chain(alchemy_key, int(chain_settings["chain_id"])),
+                address,
+            )
+        except Exception:
+            public_stage = None
+        if public_stage:
+            price_wei = int(public_stage["mint_price_wei"])
+            start_time = int(public_stage.get("start_time") or int(time.time()))
+            end_time = int(public_stage["end_time"]) if public_stage.get("end_time") else None
+            max_per_wallet = int(public_stage["max_per_wallet"] or 0) or None
+            opensea_url = str(
+                collection.get("opensea_url") or f"https://opensea.io/collection/{slug}"
+            )
+            native = str(chain_settings.get("native") or "native")
+            return {
+                "slug": str(slug),
+                "name": str(collection.get("name") or slug),
+                "chain": chain,
+                "chain_id": int(chain_settings["chain_id"]),
+                "stage_index": 0,
+                # The SeaDrop contract has no OpenSea stage UUID. Keep a
+                # deterministic route identity so a live-stage refresh does
+                # not fail merely because ``time.time()`` advanced by a
+                # second between inspect and schedule-arm.
+                "stage_id": "seadrop-public",
+                "stage_type": "public_seadrop",
+                "stage_label": "Public SeaDrop",
+                "start_time": start_time,
+                "end_time": end_time,
+                "price_wei": price_wei,
+                "price_display": (
+                    "Free" if price_wei == 0
+                    else f"Paid · {_format_native(price_wei)} {native}"
+                ),
+                "access_label": "Public · SeaDrop",
+                "is_free": price_wei == 0,
+                "is_public": True,
+                "max_per_wallet": max_per_wallet,
+                "contract_address": address,
+                "opensea_url": opensea_url,
+                "project_url": str(collection.get("project_url") or ""),
+                "mint_url": str(collection.get("mint_url") or ""),
+                "description": str(collection.get("description") or ""),
+                "image_url": str(collection.get("image_url") or ""),
+                "route": "opensea_drop",
+                "route_label": "Direct public SeaDrop",
+                "route_note": (
+                    "Resolved from the collection contract's live SeaDrop stage; "
+                    "the final on-chain values are checked again before signing."
+                ),
+                "url": opensea_url,
+            }, (
+                "Resolved from the live public SeaDrop contract even though this "
+                "collection was not present in OpenSea's drop calendar."
+            )
         try:
             abi = fetch_verified_abi(
                 int(chain_settings["chain_id"]), address, chain=chain
             )
-        except Exception as exc:
+        except Exception:
             reasons.append(f"{chain}: verified ABI unavailable")
             continue
         route = detect_simple_mint_route(abi)
@@ -236,6 +298,8 @@ def inspect_route(route, abi, chain, address, chain_settings, slug, collection, 
         "chain": chain,
         "chain_id": int(chain_settings["chain_id"]),
         "stage_index": 0,
+        "stage_id": f"verified:{_abi_signature(function_abi)}",
+        "stage_type": "verified_contract",
         "stage_label": "External public mint",
         "start_time": start_time,
         "end_time": None,
@@ -250,6 +314,7 @@ def inspect_route(route, abi, chain, address, chain_settings, slug, collection, 
             collection.get("opensea_url") or f"https://opensea.io/collection/{slug}"
         ),
         "project_url": str(collection.get("project_url") or ""),
+        "mint_url": str(collection.get("mint_url") or ""),
         "description": str(collection.get("description") or ""),
         "image_url": str(collection.get("image_url") or ""),
         "route": "generic_contract",

@@ -10,7 +10,6 @@ broadcasts a transaction.
 """
 
 import os
-import sys
 from pathlib import Path
 
 import httpx

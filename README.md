@@ -1,8 +1,8 @@
 # OpenSea Mint Bot
 
-An open-source, Telegram-controlled bot for discovering OpenSea Drops,
-researching collections, scheduling supported mints, and buying OpenSea
-listings with explicit limits and confirmation steps.
+An open-source, Telegram-controlled bot for discovering OpenSea mints, showing
+concise mint information, and scheduling EVM mints from collection, drop, item,
+or NFT asset links with explicit limits and confirmation steps.
 
 The normal setup runs on your own Windows, macOS, or Linux computer. A VPS is
 optional when the computer must stay online for scheduled mints.
@@ -31,35 +31,46 @@ Scanning and research can run with live mode disabled.
 
 From Telegram, you can:
 
-- scan one configured EVM network at a time for OpenSea live mints and mints
-  opening today;
+- open a network picker that shows how many drops each network actually has
+  right now, busiest first, so you never scan an empty chain by accident;
+- scan one network, or all of them into a chain-grouped summary;
 - see free, paid, public, and restricted stages;
-- paste an OpenSea collection or drop link for research;
-- schedule a supported OpenSea Drop mint;
-- use a safe generic route for some verified external contracts;
+- paste an OpenSea collection, drop, item, or NFT asset link (or collection
+  slug) for mint-route resolution;
+- schedule any active/upcoming hosted stage, or a compatible public SeaDrop /
+  verified-contract route resolved from that OpenSea link;
+- use direct SeaDrop for compatible public stages and OpenSea mint calldata for
+  hosted stages that require OpenSea eligibility/signatures;
 - choose quantity and one or more configured wallets;
 - check wallet balances, NFT counts, and mint transaction receipts;
-- preview the cheapest OpenSea listing and buy it only after confirmation;
-- configure the NFT receipt-card background and accent color.
+- configure the mint-card accent color, brand text, and fallback background;
+  cards show the real NFT artwork as the main image whenever OpenSea has it.
 
 For compatible public SeaDrop stages, the bot uses a direct on-chain fast path:
 it reads the public price/window from SeaDrop, prepares calldata, signs during
 the warm-up window, and broadcasts the same signed transaction to optional RPC
-endpoints at launch. Other routes keep their required checks: OpenSea calldata
-for allowlists/signatures and the verified-contract adapter for a small set of
-safe external routes.
+endpoints at launch. Other hosted stages keep the OpenSea calldata route
+required for allowlists/signatures.
 
-The scanner uses OpenSea's official Drops feeds. A collection that is merely
-indexed or traded on OpenSea is not automatically an OpenSea Drop. Custom
-puzzles, CAPTCHAs, backend signatures, unknown Merkle proofs, and ambiguous
-contract arguments are refused instead of guessed.
+The scanner walks every cursor in all three official Drops feeds once, merges
+the results across every supported EVM network, and expands relevant drops via
+OpenSea's per-drop endpoint. That merged calendar is cached briefly
+(`DISCOVERY_CALENDAR_TTL_SECONDS`), so switching networks is local work rather
+than a second full cursor walk, and the per-network counts on the picker cost
+no extra API request. A collection that is merely indexed or traded on
+OpenSea is not automatically a mint. A pasted asset link is first resolved
+through OpenSea NFT metadata; the bot then prefers the hosted Drops route and
+falls back only to the existing direct SeaDrop or verified simple-contract
+resolver. Marketplace listings, custom proof flows, and guessed calldata are
+still rejected.
 
 ## Requirements
 
 - Python 3.11 or newer
 - An EVM wallet created specifically for this bot
 - Native gas on the network you will use
-- An Alchemy API key for RPC access
+- An Alchemy API key for most RPC networks (the few unsupported networks use
+  their official public RPC by default)
 - An OpenSea API key for discovery and OpenSea Drop transaction data
 - A Telegram bot token if you want Telegram control
 
@@ -156,7 +167,7 @@ DIRECT_PUBLIC_SEADROP=true
 MINT_RPC_URLS_BASE=https://rpc-one.example,https://rpc-two.example
 ```
 
-The Alchemy endpoint remains the primary endpoint for reads and preparation.
+The configured chain endpoint remains primary for reads and preparation.
 At launch, each extra endpoint receives the same signed transaction; this does
 not create multiple mints because the raw transaction and hash are identical.
 
@@ -168,14 +179,24 @@ midnight-to-midnight scan. For example, West Africa Time is `1`; UTC is `0`.
 1. Start the process with `python telegram_bot.py`.
 2. Send `/start` to your bot.
 3. Use **My wallet** to confirm the displayed public address and gas balance.
-4. Use **Find OpenSea mints**, select one network, and open a result.
-5. Use **Schedule from link** when you already know the collection URL.
-6. Choose the stage, quantity, wallets, and price cap.
+4. Use **Scan for mints**. The picker lists only networks that have drops,
+   with a count on each. Pick one, then open a project. **All networks** gives
+   a chain-grouped summary; **Other networks** reveals the quiet chains.
+5. Use **Schedule from link** with any OpenSea collection, drop, item, or asset
+   URL. Asset links are resolved back to their collection before mint routing.
+6. Choose **Mint now** or **Schedule** for the mint window, then adjust
+   quantity/wallets if needed and review the price cap.
 7. Review the confirmation screen before enabling any live action.
 
-The scanner is chain-specific. It shows OpenSea Drops, not every collection
-that happens to have a secondary-market page. Paid mints are included when
-OpenSea exposes them; a price cap only controls whether execution is allowed.
+The default scan covers what is live now plus what opens through the rest of
+the day, and never looks less than `DISCOVERY_MIN_WINDOW_HOURS` ahead. That
+floor matters: anchoring the horizon strictly to midnight made an evening scan
+return almost nothing, which looks like a broken scan rather than a narrow
+window. `/scan all` shows every usable stage OpenSea exposes in its hosted
+Drops feeds, not collections that merely have secondary-market pages. Link scheduling is broader: it can
+also resolve a live public SeaDrop or verified simple mint contract that is not
+listed in the calendar. Paid and gated stages are included; the explicit price
+and eligibility checks control whether execution can occur.
 
 ## Enabling a real mint
 
@@ -195,7 +216,7 @@ For a compatible public SeaDrop stage, the direct path signs before the
 opening second so the launch path is only the raw-transaction broadcast. It is
 used only when the on-chain price and opening time match the Telegram preview.
 If the collection is not SeaDrop-compatible, the bot keeps the normal OpenSea
-or verified-contract route. Allowlists and signature stages cannot use the
+hosted-mint route. Allowlists and signature stages cannot use the
 direct path because they require project-specific authorization.
 
 A successful broadcast is not a guarantee of inclusion. The network can still
@@ -306,12 +327,25 @@ controller.
 Confirm that the file is named `.env`, it is in the project root, and the key
 is not still a placeholder. Restart the process after editing it.
 
+### `/scan` came back empty
+
+First check the network picker. It reports drop counts straight from OpenSea's
+calendar, and on most days the large majority of supported networks genuinely
+have nothing scheduled. If the picker says "OpenSea has no drops scheduled on
+any network", that is OpenSea's own answer, not a failed scan. Tap **Refresh**
+to bypass the cached calendar.
+
+If the picker shows a count but the scan for that network is empty, the stages
+are outside the scan window. Raise `DISCOVERY_WINDOW_HOURS` in `config.py`.
+
 ### A collection is visible on OpenSea but not in `/scan`
 
 The collection may be secondary-market-only, externally hosted, sold out, or
-not published in OpenSea's Drops feeds. Paste its collection URL into the
-research route. The bot will show whether an OpenSea Drop route is available;
-it will not pretend that a secondary listing is a mint route.
+not published in OpenSea's Drops feeds. `/scan` remains calendar-only, while
+`/info` and `/schedule` accept any supported OpenSea collection, drop, item, or
+asset URL. If OpenSea metadata exposes no hosted stage and the contract is not
+verified/simulatable through a supported route, the bot refuses to invent a
+mint transaction.
 
 ### The bot says the wallet is not eligible
 
@@ -329,7 +363,7 @@ Run the full local suite before submitting changes:
 
 ```powershell
 python -m compileall -q .
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 ```
 
 Do not include `.env`, `state/`, logs, browser sessions, wallet files, or

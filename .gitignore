@@ -27,3 +27,10 @@ test-nft/out/
 test-nft/cache/
 test-nft/broadcast/
 test-nft/upload/
+
+# Foundry belongs to the test-nft sub-project. A `forge install` run from the
+# repository root creates a duplicate 17 MB tree that must never be committed.
+/lib/
+/foundry.lock
+/out/
+/cache/
