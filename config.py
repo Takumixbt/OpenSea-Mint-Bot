@@ -47,7 +47,7 @@ def target_collection_slug():
                 "TARGET_COLLECTION_URL must look like https://opensea.io/collection/<slug> "
                 "or https://opensea.io/drops/<slug>"
             )
-        raw = parts[-1]
+        raw = parts[1]
 
     slug = raw.strip("/")
     if not slug or any(char.isspace() for char in slug):
@@ -237,32 +237,126 @@ if DIRECT_SEADROP_START_TOLERANCE_SECONDS < 0:
 # DISCOVERY, DAILY RUNNER, AND CHAIN SUPPORT
 # ---------------------------------------------------------------------------
 
-# OpenSea chain slugs that have an EVM chain ID and an Alchemy RPC mapping.
-# Set MONITORED_CHAINS to a comma-separated subset, or "all" for every entry
-# below. OpenSea also lists non-EVM chains; those are intentionally skipped by
-# this wallet signer instead of being misclassified as EVM drops.
+# OpenSea mainnet chain slugs that can be signed by the configured EVM wallet.
+# The list mirrors OpenSea's current /chains response. Solana and Hyperliquid
+# (the non-EVM exchange chain, distinct from HyperEVM) are intentionally absent.
+# Most routes use Alchemy's universal-key endpoint; the three networks Alchemy
+# does not currently expose use their official public RPC by default. Every
+# network can be overridden with MINT_RPC_URL_<CHAIN> in .env.
 CHAIN_CONFIGS = {
-    "ethereum": {"chain_id": 1, "rpc_subdomain": "eth-mainnet", "native": "ETH"},
-    "base": {"chain_id": 8453, "rpc_subdomain": "base-mainnet", "native": "ETH"},
-    "polygon": {"chain_id": 137, "rpc_subdomain": "polygon-mainnet", "native": "POL"},
-    "optimism": {"chain_id": 10, "rpc_subdomain": "opt-mainnet", "native": "ETH"},
-    "arbitrum": {"chain_id": 42161, "rpc_subdomain": "arb-mainnet", "native": "ETH"},
-    "robinhood": {"chain_id": 4663, "rpc_subdomain": "robinhood-mainnet", "native": "ETH"},
-    "zora": {"chain_id": 7777777, "rpc_subdomain": "zora-mainnet", "native": "ETH"},
-    "blast": {"chain_id": 81457, "rpc_subdomain": "blast-mainnet", "native": "ETH"},
-    "avalanche": {"chain_id": 43114, "rpc_subdomain": "avax-mainnet", "native": "AVAX"},
-    "unichain": {"chain_id": 130, "rpc_subdomain": "unichain-mainnet", "native": "ETH"},
-    "shape": {"chain_id": 360, "rpc_subdomain": "shape-mainnet", "native": "ETH"},
+    "ethereum": {"chain_id": 1, "rpc_subdomain": "eth-mainnet", "native": "ETH", "explorer": "https://etherscan.io"},
+    "optimism": {"chain_id": 10, "rpc_subdomain": "opt-mainnet", "native": "ETH", "explorer": "https://optimistic.etherscan.io"},
+    "unichain": {"chain_id": 130, "rpc_subdomain": "unichain-mainnet", "native": "ETH", "explorer": "https://uniscan.xyz"},
+    "polygon": {"chain_id": 137, "rpc_subdomain": "polygon-mainnet", "native": "POL", "explorer": "https://polygonscan.com"},
+    "monad": {"chain_id": 143, "rpc_subdomain": "monad-mainnet", "native": "MON", "explorer": "https://monadscan.com"},
+    "shape": {"chain_id": 360, "rpc_subdomain": "shape-mainnet", "native": "ETH", "explorer": "https://shapescan.xyz"},
+    "flow": {"chain_id": 747, "rpc_subdomain": "flow-mainnet", "native": "FLOW", "explorer": "https://evm.flowscan.io"},
+    "stablechain": {"chain_id": 988, "rpc_subdomain": "stable-mainnet", "native": "USDT0", "explorer": "https://stablescan.xyz"},
+    "hyperevm": {"chain_id": 999, "rpc_subdomain": "hyperliquid-mainnet", "native": "HYPE", "explorer": "https://hyperevmscan.io"},
+    "sei": {"chain_id": 1329, "rpc_subdomain": "sei-mainnet", "native": "SEI", "explorer": "https://seiscan.io"},
+    "soneium": {"chain_id": 1868, "rpc_subdomain": "soneium-mainnet", "native": "ETH", "explorer": "https://soneium.blockscout.com"},
+    "ronin": {"chain_id": 2020, "rpc_subdomain": "ronin-mainnet", "native": "RON", "explorer": "https://app.roninchain.com"},
+    "abstract": {"chain_id": 2741, "rpc_subdomain": "abstract-mainnet", "native": "ETH", "explorer": "https://abscan.org"},
+    "megaeth": {"chain_id": 4326, "rpc_subdomain": "megaeth-mainnet", "native": "ETH", "explorer": "https://mega.etherscan.io"},
+    "robinhood": {"chain_id": 4663, "rpc_subdomain": "robinhood-mainnet", "native": "ETH", "explorer": "https://robinhoodchain.blockscout.com"},
+    "somnia": {"chain_id": 5031, "rpc_url": "https://api.infra.mainnet.somnia.network", "native": "SOMI", "explorer": "https://explorer.somnia.network"},
+    "b3": {"chain_id": 8333, "rpc_url": "https://mainnet-rpc.b3.fun", "native": "ETH", "explorer": "https://explorer.b3.fun"},
+    "base": {"chain_id": 8453, "rpc_subdomain": "base-mainnet", "native": "ETH", "explorer": "https://basescan.org"},
+    "ape_chain": {"chain_id": 33139, "rpc_subdomain": "apechain-mainnet", "native": "APE", "explorer": "https://apescan.io"},
+    "arbitrum": {"chain_id": 42161, "rpc_subdomain": "arb-mainnet", "native": "ETH", "explorer": "https://arbiscan.io"},
+    "avalanche": {"chain_id": 43114, "rpc_subdomain": "avax-mainnet", "native": "AVAX", "explorer": "https://snowtrace.io"},
+    "gunzilla": {
+        "chain_id": 43419,
+        "rpc_url": "https://subnets.avax.network/gunzilla/mainnet/rpc",
+        "native": "GUN",
+        "explorer": "https://gunzscan.io",
+    },
+    "ink": {"chain_id": 57073, "rpc_subdomain": "ink-mainnet", "native": "ETH", "explorer": "https://explorer.inkonchain.com"},
+    "animechain": {"chain_id": 69000, "rpc_subdomain": "anime-mainnet", "native": "ANIME", "explorer": "https://explorer.anime.xyz"},
+    "bera_chain": {"chain_id": 80094, "rpc_subdomain": "berachain-mainnet", "native": "BERA", "explorer": "https://berascan.com"},
+    "blast": {"chain_id": 81457, "rpc_subdomain": "blast-mainnet", "native": "ETH", "explorer": "https://blastscan.io"},
+    "zora": {"chain_id": 7777777, "rpc_subdomain": "zora-mainnet", "native": "ETH", "explorer": "https://explorer.zora.energy"},
 }
 
-# The default set covers the main EVM chains. Add a supported key above if your
-# Alchemy account supports it.
-MONITORED_CHAINS = "ethereum,base,polygon,optimism,arbitrum,robinhood"
+# Telegram inline buttons render emoji but not images, so each network gets one
+# glyph. Every glyph is distinct so networks stay tellable apart at a glance.
+# These are labels only: the signer still resolves everything from
+# CHAIN_CONFIGS above.
+CHAIN_ICONS = {
+    "ethereum": "\u27e0",
+    "optimism": "\U0001f534",
+    "unichain": "\U0001f984",
+    "polygon": "\U0001f7e3",
+    "monad": "\U0001f7ea",
+    "shape": "\U0001f537",
+    "flow": "\U0001f30a",
+    "stablechain": "\U0001f4b5",
+    "hyperevm": "\U0001f7e2",
+    "sei": "\U0001f33e",
+    "soneium": "\u26ab",
+    "ronin": "\u2694\ufe0f",
+    "abstract": "\U0001f7e9",
+    "megaeth": "\u26a1",
+    "robinhood": "\U0001fab6",
+    "somnia": "\U0001f31b",
+    "b3": "\U0001f3ae",
+    "base": "\U0001f535",
+    "ape_chain": "\U0001f9a7",
+    "arbitrum": "\U0001f30c",
+    "avalanche": "\U0001f3d4\ufe0f",
+    "gunzilla": "\U0001f996",
+    "ink": "\U0001f5a4",
+    "animechain": "\U0001f338",
+    "bera_chain": "\U0001f43b",
+    "blast": "\U0001f7e1",
+    "zora": "\U0001f7e0",
+}
+DEFAULT_CHAIN_ICON = "\u26d3\ufe0f"
+
+# Title-casing a slug gets most networks right but mangles the few that carry
+# internal capitals or no space at all.
+CHAIN_DISPLAY_NAMES = {
+    "hyperevm": "HyperEVM",
+    "megaeth": "MegaETH",
+    "ape_chain": "ApeChain",
+    "bera_chain": "Berachain",
+    "animechain": "AnimeChain",
+    "stablechain": "Stable",
+    "b3": "B3",
+    "sei": "Sei",
+}
+
+
+def chain_icon(chain_slug):
+    """Return the display glyph for an OpenSea network slug."""
+    return CHAIN_ICONS.get((chain_slug or "").strip().lower(), DEFAULT_CHAIN_ICON)
+
+
+def chain_label(chain_slug):
+    """Return the human network name used in Telegram text and buttons."""
+    slug = (chain_slug or "unknown").strip().lower()
+    override = CHAIN_DISPLAY_NAMES.get(slug)
+    if override:
+        return override
+    return slug.replace("_", " ").replace("-", " ").title()
+
+
+# A blank MONITORED_CHAINS value also falls back to this setting. "all" makes
+# /scan cover every OpenSea EVM drop instead of silently omitting newer chains.
+MONITORED_CHAINS = "all"
 
 # Discovery requests this many OpenSea drops per API page. The Telegram route
 # lists live stages plus stages opening today, including free, paid, and
 # restricted entries.
 DISCOVERY_WINDOW_HOURS = 24
+# A "today" scan still keeps at least this many hours of forward view. Pinning
+# the horizon to local midnight made an evening /scan return almost nothing,
+# which reads as a broken scan rather than a narrow window.
+DISCOVERY_MIN_WINDOW_HOURS = 12
+# The global /drops cursor already covers every network, so the merged calendar
+# is cached for this long and filtered locally. Scanning a second network then
+# costs no extra OpenSea requests.
+DISCOVERY_CALENDAR_TTL_SECONDS = 90
 DISCOVERY_LIMIT_PER_CHAIN = 100
 # Follow every cursor returned by OpenSea. Set a positive value only as an
 # emergency ceiling; 0 means no artificial page limit.
@@ -270,11 +364,11 @@ DISCOVERY_MAX_PAGES_PER_CHAIN = 0
 # OpenSea exposes its mintable collections through three drop feeds. Merge all
 # three and exhaust every page so /scan is not a featured/top-project sample.
 DISCOVERY_DROP_TYPES = ("upcoming", "recently_minted", "featured")
-# A chain-specific Telegram scan also checks OpenSea's most active collections
-# and validates each one through the drop-details endpoint. This catches live
-# SeaDrop mints that OpenSea has not placed in any drop-calendar feed yet.
+# Legacy knobs retained for configuration compatibility. Ranked/trending
+# collections are trading data and are no longer mixed into mint discovery.
 DISCOVERY_RANKED_FALLBACK_LIMIT = 100
 DISCOVERY_RANKED_FALLBACK_WORKERS = 8
+DISCOVERY_DETAIL_WORKERS = 16
 DISCOVERY_PUBLIC_ONLY = True
 DISCOVERY_REQUEST_DELAY_SECONDS = 0.15
 # The day boundary is a fixed UTC offset so Windows and Linux VPS machines
@@ -325,7 +419,9 @@ def discovery_day_bounds(timestamp=None):
 
 def monitored_chain_slugs():
     """Return configured OpenSea chain slugs with duplicates removed."""
-    raw = (MONITORED_CHAINS or "").strip().lower()
+    raw = os.getenv("MONITORED_CHAINS", "").strip().lower()
+    if not raw:
+        raw = (MONITORED_CHAINS or "").strip().lower()
     if raw == "all":
         return list(CHAIN_CONFIGS)
     result = []
@@ -342,19 +438,31 @@ def chain_config(chain_slug):
 
 
 def rpc_url_for_chain(alchemy_key, chain_id):
-    """Build the Alchemy RPC URL for a configured EVM chain ID."""
-    for settings in CHAIN_CONFIGS.values():
-        if settings["chain_id"] == chain_id:
-            return f"https://{settings['rpc_subdomain']}.g.alchemy.com/v2/{alchemy_key}"
-    raise ValueError(f"chain ID {chain_id} has no configured Alchemy RPC mapping")
+    """Return the configured primary RPC URL for an OpenSea EVM chain."""
+    for slug, settings in CHAIN_CONFIGS.items():
+        if settings["chain_id"] != chain_id:
+            continue
+        override = os.getenv(f"MINT_RPC_URL_{slug.upper()}", "").strip()
+        if override.startswith(("http://", "https://")):
+            return override
+        subdomain = str(settings.get("rpc_subdomain") or "").strip()
+        if subdomain:
+            if not str(alchemy_key or "").strip():
+                raise ValueError(f"ALCHEMY_API_KEY is required for {slug}")
+            return f"https://{subdomain}.g.alchemy.com/v2/{alchemy_key}"
+        public_rpc = str(settings.get("rpc_url") or "").strip()
+        if public_rpc.startswith(("http://", "https://")):
+            return public_rpc
+        raise ValueError(f"chain ID {chain_id} has no configured RPC endpoint")
+    raise ValueError(f"chain ID {chain_id} has no configured RPC mapping")
 
 
 def rpc_urls_for_chain(alchemy_key, chain_id):
     """Return the primary RPC plus optional broadcast endpoints.
 
     ``MINT_RPC_URLS_<CHAIN>`` (or the generic ``MINT_RPC_URLS``) may contain
-    comma-separated HTTP(S) endpoints.  The Alchemy endpoint remains first for
-    reads and transaction preparation; the extra endpoints are used only to
+    comma-separated HTTP(S) endpoints. The chain's primary endpoint remains
+    first for reads and transaction preparation; extra endpoints are used to
     fan out an identical signed transaction at launch.
     """
     primary = rpc_url_for_chain(alchemy_key, chain_id)

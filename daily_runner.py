@@ -63,15 +63,9 @@ def _wei_env(name, fallback):
 
 
 def _configured_chains():
-    raw = os.getenv("MONITORED_CHAINS", config.MONITORED_CHAINS).strip().lower()
-    if raw == "all":
-        return list(config.CHAIN_CONFIGS)
-    result = []
-    for slug in raw.split(","):
-        slug = slug.strip()
-        if slug and slug not in result:
-            result.append(slug)
-    return result
+    # Centralize parsing in config so a present-but-blank .env value cannot
+    # accidentally remove every network from Telegram's /scan picker.
+    return config.monitored_chain_slugs()
 
 
 def is_free_public_candidate(candidate):
@@ -506,8 +500,13 @@ class DailyMintService:
             f"Armed schedules: {snapshot['schedule_count']}"
         )
 
-    def scan_now(self, chain_slug=None):
-        """Scan configured chains, or one requested chain, immediately."""
+    def scan_now(self, chain_slug=None, force_refresh=False):
+        """Scan configured chains, or one requested chain, immediately.
+
+        A single-network scan replaces only that network's rows in the saved
+        result so switching networks does not discard what the previous scan
+        already found.
+        """
         if chain_slug and chain_slug != "all":
             chain_slug = str(chain_slug).strip().lower()
             if chain_slug not in _configured_chains():
@@ -516,6 +515,7 @@ class DailyMintService:
                 raise ValueError(f"chain '{chain_slug}' has no configured EVM RPC mapping")
             chains = [chain_slug]
         else:
+            chain_slug = None
             chains = _configured_chains()
         with self.scan_lock:
             client = opensea_client.get_api_client(self.api_key)
@@ -526,106 +526,126 @@ class DailyMintService:
                     chains,
                     config.DISCOVERY_WINDOW_HOURS,
                     today_only=True,
-                    # /scan only indexes collections OpenSea exposes as drops.
-                    # It does not probe arbitrary on-chain or top collections.
+                    # The official three drop feeds are the canonical mint
+                    # catalogue. Trending/top collections are trading data and
+                    # must never leak into /scan as false mint results.
                     include_ranked_fallback=False,
+                    force_refresh=force_refresh,
                 )
             finally:
                 client.close()
+        scanned = [candidate.to_dict() for candidate in candidates]
         with self.state_lock:
-            self.last_candidates = [candidate.to_dict() for candidate in candidates]
+            if chain_slug:
+                kept = [
+                    row for row in (self.last_candidates or [])
+                    if str(row.get("chain") or "").strip().lower() != chain_slug
+                ]
+                self.last_candidates = kept + scanned
+            else:
+                self.last_candidates = scanned
             self.last_errors = list(errors)
             self.last_scan_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._save_candidates(self.last_candidates)
-            return list(self.last_candidates), list(self.last_errors)
+            return list(scanned), list(self.last_errors)
 
-    def inspect_drop(self, value):
-        """Read one OpenSea drop and return its currently usable stages."""
-        slug = opensea_client.parse_drop_slug(value)
-        with self.scan_lock:
-            client = opensea_client.get_api_client(self.api_key)
-            try:
+    def chain_coverage(self, force_refresh=False):
+        """Return ``(counts, errors, age_seconds)`` of drops per network.
+
+        This reads only OpenSea's drop calendar, so the network picker can show
+        which networks actually have something without expanding any drop.
+        """
+        client = opensea_client.get_api_client(self.api_key)
+        try:
+            return discovery.chain_coverage(
+                client,
+                self.api_key,
+                _configured_chains(),
+                config.DISCOVERY_WINDOW_HOURS,
+                force=force_refresh,
+            )
+        finally:
+            client.close()
+
+    def _hosted_candidates_for_slug(self, client, slug):
+        """Load calendar/detail stages without assuming the detail route works."""
+        slug = str(slug or "").strip()
+        info = None
+        detail_error = None
+        try:
+            info = opensea_client.get_drop_info(
+                client, slug, self.api_key, include_metadata=False
+            )
+        except Exception as exc:
+            detail_error = exc
+            # A transient detail outage should not make a known calendar drop
+            # impossible to arm. The compact Drops feed is still a bounded,
+            # official OpenSea source and contains enough stage data to show a
+            # candidate while the final transaction is fetched later.
+            for drop_type in config.DISCOVERY_DROP_TYPES:
+                cursor = None
+                seen_cursors = set()
+                page_count = 0
                 try:
-                    info = opensea_client.get_drop_info(client, slug, self.api_key)
-                except Exception as detail_error:
-                    info = None
-                    for drop_type in config.DISCOVERY_DROP_TYPES:
-                        cursor = None
-                        seen_cursors = set()
-                        page_count = 0
-                        while True:
-                            page_count += 1
-                            cards, next_cursor = opensea_client.list_drops(
-                                client, self.api_key, "", drop_type,
-                                config.DISCOVERY_LIMIT_PER_CHAIN, cursor,
-                            )
-                            for card in cards:
-                                if str(discovery._drop_slug(card) or "").lower() != slug.lower():
-                                    continue
-                                stages = discovery._calendar_stages(card)
-                                try:
-                                    page_stages = opensea_client.get_public_drop_schedule(
-                                        client, slug
-                                    )
-                                except Exception:
-                                    page_stages = []
-                                if page_stages:
-                                    stages = page_stages
-                                chain = str(card.get("chain") or "").strip().lower()
-                                if stages and chain:
-                                    info = {
-                                        "slug": slug,
-                                        "name": discovery._drop_name(card, slug),
-                                        "chain": chain,
-                                        "contract_address": card.get("contract_address") or "",
-                                        "opensea_url": card.get("opensea_url") or f"https://opensea.io/collection/{slug}",
-                                        "metadata": discovery._calendar_metadata(card),
-                                        "stages": stages,
-                                    }
-                                    break
-                            if info or not next_cursor or str(next_cursor) in seen_cursors:
+                    while True:
+                        page_count += 1
+                        cards, next_cursor = opensea_client.list_drops(
+                            client,
+                            self.api_key,
+                            "",
+                            drop_type,
+                            config.DISCOVERY_LIMIT_PER_CHAIN,
+                            cursor,
+                        )
+                        card = next((
+                            row for row in cards
+                            if str(discovery._drop_slug(row) or "").lower() == slug.lower()
+                        ), None)
+                        if card:
+                            stages = discovery._calendar_stages(card)
+                            chain = str(card.get("chain") or "").strip().lower()
+                            if stages and chain:
+                                metadata = discovery._calendar_metadata(card)
+                                metadata.update({
+                                    "drop_type": card.get("drop_type") or "",
+                                    "is_minting": card.get("is_minting"),
+                                    "details_verified": False,
+                                })
+                                info = {
+                                    "slug": slug,
+                                    "name": discovery._drop_name(card, slug),
+                                    "chain": chain,
+                                    "contract_address": card.get("contract_address") or "",
+                                    "opensea_url": card.get("opensea_url") or f"https://opensea.io/collection/{slug}",
+                                    "metadata": metadata,
+                                    "stages": stages,
+                                }
                                 break
-                            page_limit = int(config.DISCOVERY_MAX_PAGES_PER_CHAIN or 0)
-                            if page_limit > 0 and page_count >= page_limit:
-                                break
-                            seen_cursors.add(str(next_cursor))
-                            cursor = next_cursor
-                        if info:
+                        if not next_cursor or str(next_cursor) in seen_cursors:
                             break
-                    if not info:
-                        try:
-                            collection = opensea_client.get_collection_details(
-                                client, slug, self.api_key
-                            )
-                            collection = collection if isinstance(collection, dict) else {}
-                            collection.setdefault(
-                                "opensea_url", f"https://opensea.io/collection/{slug}"
-                            )
-                            candidate, route_note = external_mint.resolve_collection_mint(
-                                collection,
-                                slug,
-                                self.alchemy_key,
-                                self.wallet_address,
-                            )
-                        except Exception as route_error:
-                            raise RuntimeError(
-                                "This collection is not an OpenSea-hosted drop, and its "
-                                "external contract route could not be verified safely. "
-                                "Use NFT info to inspect it or buy an active OpenSea listing."
-                            ) from route_error
-                        if candidate:
-                            candidate["route_note"] = route_note
-                            return [candidate]
-                        raise RuntimeError(
-                            "This collection uses a custom external mint. "
-                            f"{route_note} Use NFT info to inspect it or buy an active "
-                            "OpenSea listing."
-                        ) from detail_error
-            finally:
-                client.close()
-        chain = (info.get("chain") or "").strip().lower()
+                        page_limit = int(config.DISCOVERY_MAX_PAGES_PER_CHAIN or 0)
+                        if page_limit > 0 and page_count >= page_limit:
+                            break
+                        seen_cursors.add(str(next_cursor))
+                        cursor = next_cursor
+                except Exception as fallback_error:
+                    detail_error = fallback_error
+                if info:
+                    break
+
+        if not isinstance(info, dict):
+            return [], None, detail_error
+        chain = str(info.get("chain") or "").strip().lower()
         if not chain:
-            raise RuntimeError("OpenSea did not return a chain for this drop")
+            return [], info, RuntimeError("OpenSea did not return a network for this collection")
+        metadata = dict(info.get("metadata") or {})
+        metadata.update({
+            "total_supply": info.get("total_supply", metadata.get("total_supply")),
+            "max_supply": info.get("max_supply", metadata.get("max_supply")),
+            "drop_type": info.get("drop_type") or metadata.get("drop_type") or "",
+            "is_minting": info.get("is_minting", metadata.get("is_minting")),
+            "details_verified": metadata.get("details_verified", True),
+        })
         try:
             candidates = discovery.build_drop_candidates(
                 info.get("slug") or slug,
@@ -633,17 +653,316 @@ class DailyMintService:
                 chain,
                 info.get("stages") or [],
                 now=int(time.time()),
-                metadata=info.get("metadata"),
+                metadata=metadata,
                 contract_address=info.get("contract_address") or "",
                 opensea_url=info.get("opensea_url") or "",
             )
-        except ValueError as exc:
+        except ValueError:
+            return [], info, RuntimeError(
+                f"OpenSea reports network '{chain}', but it is not an EVM signer network"
+            )
+        return [candidate.to_dict() for candidate in candidates], info, detail_error
+
+    @staticmethod
+    def _synthetic_asset_slug(reference):
+        """Create a stable internal key when OpenSea omits the collection slug."""
+        contract = str(reference.get("contract_address") or "").lower().replace("0x", "")
+        identifier = str(reference.get("identifier") or "")
+        safe_identifier = "".join(
+            char if char.isalnum() else "-" for char in identifier
+        ).strip("-") or "token"
+        return f"asset-{contract[:12] or 'contract'}-{safe_identifier[:32]}"
+
+    def _collection_for_reference(self, client, reference, slug, nft=None):
+        """Merge collection metadata with an asset record and its URL identity."""
+        collection = {}
+        if slug:
+            try:
+                value = opensea_client.get_collection_details(
+                    client, slug, self.api_key
+                )
+                if isinstance(value, dict):
+                    collection = dict(value)
+            except Exception:
+                collection = {}
+        nft = nft if isinstance(nft, dict) else {}
+        for key in (
+            "name", "description", "image_url", "display_image_url",
+            "project_url", "mint_url", "twitter_url", "discord_url",
+            "telegram_url", "wiki_url", "opensea_url",
+        ):
+            if not collection.get(key) and nft.get(key):
+                collection[key] = nft.get(key)
+        if not collection.get("name"):
+            collection["name"] = str(nft.get("collection_name") or slug or "OpenSea asset")
+        if not collection.get("opensea_url"):
+            collection["opensea_url"] = reference.get("url") or (
+                f"https://opensea.io/collection/{slug}" if slug else ""
+            )
+        contracts = collection.get("contracts")
+        contract = str(reference.get("contract_address") or "").strip()
+        chain = str(reference.get("chain") or "").strip().lower()
+        has_reference_contract = any(
+            isinstance(item, dict)
+            and str(item.get("chain") or "").strip().lower() == chain
+            and str(item.get("address") or "").strip().lower() == contract.lower()
+            for item in (contracts if isinstance(contracts, list) else [])
+        )
+        if contract and chain and not has_reference_contract:
+            collection["contracts"] = list(contracts) if isinstance(contracts, list) else []
+            collection["contracts"].append({"chain": chain, "address": contract})
+        return collection
+
+    @staticmethod
+    def _decorate_reference_candidate(candidate, reference, source_url, nft=None):
+        result = dict(candidate or {})
+        result["source_url"] = source_url
+        result["reference_kind"] = reference.get("kind")
+        result.setdefault("is_sold_out", False)
+        if reference.get("kind") == "asset":
+            # Keep the exact pasted asset URL on the candidate so a scheduled
+            # refresh resolves the same NFT again instead of silently switching
+            # to a similarly named collection.
+            result["asset_url"] = source_url
+            result["token_id"] = reference.get("identifier")
+            result["asset_contract_address"] = reference.get("contract_address")
+            result["opensea_url"] = source_url
+            result["url"] = source_url
+            nft = nft if isinstance(nft, dict) else {}
+            if nft.get("name") and not result.get("name"):
+                result["name"] = nft["name"]
+        return result
+
+    def _resolve_opensea_reference(self, value):
+        """Resolve an OpenSea URL into hosted or safely inferred mint routes."""
+        reference = opensea_client.parse_opensea_reference(value)
+        source_url = reference.get("url") or str(value or "").strip()
+        nft = {}
+        slug = str(reference.get("slug") or "").strip()
+        hosted_error = None
+
+        # API work is serialized with the existing scan lock. The slower
+        # verified-ABI/RPC resolver runs after the client is closed so a single
+        # broken external contract cannot block normal OpenSea scans.
+        with self.scan_lock:
+            client = opensea_client.get_api_client(self.api_key)
+            try:
+                if reference.get("kind") == "asset":
+                    try:
+                        nft = opensea_client.get_nft(
+                            client,
+                            reference.get("chain"),
+                            reference.get("contract_address"),
+                            reference.get("identifier"),
+                            self.api_key,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "could not resolve the OpenSea asset metadata; "
+                            "check the OpenSea API key and asset URL"
+                        ) from exc
+                    slug = self._nft_collection_slug(nft)
+                hosted_candidates = []
+                hosted_info = None
+                if slug:
+                    hosted_candidates, hosted_info, hosted_error = (
+                        self._hosted_candidates_for_slug(client, slug)
+                    )
+                if hosted_candidates:
+                    decorated = [
+                        self._decorate_reference_candidate(
+                            candidate, reference, source_url, nft
+                        )
+                        for candidate in hosted_candidates
+                    ]
+                    return {
+                        "reference": reference,
+                        "source_url": source_url,
+                        "slug": slug,
+                        "nft": nft,
+                        "collection": {},
+                        "info": hosted_info or {},
+                        "candidates": decorated,
+                        "route_note": "Resolved from the OpenSea Drops API.",
+                        "hosted_error": hosted_error,
+                    }
+                collection = self._collection_for_reference(
+                    client, reference, slug, nft
+                )
+                # A drop detail can expose the NFT contract even when the
+                # stage list is empty or already ended. Preserve that signal
+                # for the external-route fallback instead of requiring a
+                # second collection response to repeat it.
+                if isinstance(hosted_info, dict):
+                    if not collection.get("name") and hosted_info.get("name"):
+                        collection["name"] = hosted_info["name"]
+                    detail_contract = str(
+                        hosted_info.get("contract_address") or ""
+                    ).strip()
+                    detail_chain = str(
+                        hosted_info.get("chain")
+                        or reference.get("chain")
+                        or ""
+                    ).strip().lower()
+                    if detail_contract and detail_chain and not collection.get("contracts"):
+                        collection["contracts"] = [{
+                            "chain": detail_chain,
+                            "address": detail_contract,
+                        }]
+            finally:
+                client.close()
+
+        if not slug and reference.get("kind") == "asset":
+            slug = self._synthetic_asset_slug(reference)
+        if not collection.get("contracts"):
+            route_note = (
+                "OpenSea returned no supported EVM collection contract for this link. "
+                "It cannot be turned into safe mint calldata."
+            )
+            return {
+                "reference": reference,
+                "source_url": source_url,
+                "slug": slug,
+                "nft": nft,
+                "collection": collection,
+                "info": {},
+                "candidates": [],
+                "route_note": route_note,
+                "hosted_error": hosted_error,
+            }
+
+        try:
+            external_candidate, route_note = external_mint.resolve_collection_mint(
+                collection,
+                slug,
+                self.alchemy_key,
+                self.wallet_address,
+                chain_hint=(reference.get("chain") if reference.get("kind") == "asset" else None),
+            )
+        except Exception as exc:
+            external_candidate = None
+            route_note = (
+                "OpenSea resolved the link, but the verified on-chain mint check "
+                f"could not complete ({type(exc).__name__})."
+            )
+        if external_candidate:
+            candidate = self._decorate_reference_candidate(
+                external_candidate, reference, source_url, nft
+            )
+            candidate["route_note"] = route_note
+            return {
+                "reference": reference,
+                "source_url": source_url,
+                "slug": slug,
+                "nft": nft,
+                "collection": collection,
+                "info": {},
+                "candidates": [candidate],
+                "route_note": route_note,
+                "hosted_error": hosted_error,
+            }
+
+        if reference.get("kind") == "asset":
+            route_note = (
+                f"OpenSea resolved this asset to {slug or 'a collection'}, but no "
+                "active/upcoming OpenSea stage or safe verified mint route was found. "
+                "A marketplace listing is not a mint transaction, so nothing was guessed."
+            )
+        else:
+            route_note = (
+                "OpenSea recognizes this collection, but it exposes no active/upcoming "
+                "mint stage and no safe verified on-chain mint route was found."
+            )
+        return {
+            "reference": reference,
+            "source_url": source_url,
+            "slug": slug,
+            "nft": nft,
+            "collection": collection,
+            "info": {},
+            "candidates": [],
+            "route_note": route_note,
+            "hosted_error": hosted_error,
+        }
+
+    def inspect_drop(self, value):
+        """Return mintable stages for any OpenSea collection, drop, or asset URL.
+
+        An OpenSea URL is an input reference, not proof that a mint exists.
+        Resolution prefers OpenSea's own stage data, then the existing direct
+        SeaDrop and verified-ABI routes. Unknown marketplace links are refused
+        instead of becoming guessed transactions.
+        """
+        context = self._resolve_opensea_reference(value)
+        candidates = context.get("candidates") or []
+        if candidates:
+            return [dict(candidate) for candidate in candidates]
+        raise RuntimeError(context.get("route_note") or "no safe OpenSea mint route was found")
+
+    def refresh_candidate(self, candidate, require_same_terms=True):
+        """Refresh one stage or verified external route before arming/sending."""
+        candidate = dict(candidate or {})
+        if not candidate.get("slug") or not candidate.get("chain"):
+            raise ValueError("candidate data is incomplete; inspect the OpenSea drop again")
+        quantity = validate_quantity(
+            candidate, candidate.get("quantity") or config.MINT_QUANTITY
+        )
+        fresh_stages = self.inspect_drop(
+            candidate.get("opensea_url") or candidate.get("url") or candidate.get("slug")
+        )
+        fresh = next(
+            (dict(item) for item in fresh_stages if same_candidate_stage(candidate, item)),
+            None,
+        )
+        if fresh is None:
             raise RuntimeError(
-                f"OpenSea reports chain '{chain}', but this bot has no configured EVM RPC for it"
-            ) from exc
-        if not candidates:
-            raise RuntimeError("this drop has no upcoming or active mint stage")
-        return [candidate.to_dict() for candidate in candidates]
+                "the selected OpenSea mint stage or verified route changed; "
+                "reopen the OpenSea link and confirm it again"
+            )
+        if fresh.get("is_sold_out") is True:
+            raise RuntimeError("this OpenSea drop sold out; nothing was signed or sent")
+        if require_same_terms:
+            old_route = str(candidate.get("route") or "opensea_drop").strip().lower()
+            new_route = str(fresh.get("route") or "opensea_drop").strip().lower()
+            if old_route != new_route:
+                raise RuntimeError(
+                    "the mint route changed; reopen the OpenSea link and review it again"
+                )
+            if fresh.get("price_wei") != candidate.get("price_wei"):
+                raise RuntimeError(
+                    "the OpenSea mint price changed; reopen the drop and approve the new total"
+                )
+            if fresh.get("access_label") != candidate.get("access_label"):
+                raise RuntimeError(
+                    "the OpenSea eligibility rule changed; reopen the drop and review it again"
+                )
+            old_contract = str(candidate.get("contract_address") or "").lower()
+            new_contract = str(fresh.get("contract_address") or "").lower()
+            if old_contract and new_contract and old_contract != new_contract:
+                raise RuntimeError(
+                    "the OpenSea drop contract changed; reopen the drop and review it again"
+                )
+        fresh["quantity"] = validate_quantity(fresh, quantity)
+        if candidate.get("wallet_ids"):
+            fresh["wallet_ids"] = list(candidate["wallet_ids"])
+        # Asset references and generic ABI bindings are part of the selected
+        # route identity. Preserve them for older API responses that return a
+        # valid stage but omit one of the non-calendar fields.
+        for key in (
+            "source_url", "asset_url", "reference_kind", "token_id",
+            "asset_contract_address", "generic_function_abi",
+            "generic_arg_bindings", "generic_price_function",
+            "generic_start_function",
+        ):
+            if candidate.get(key) is not None and fresh.get(key) is None:
+                fresh[key] = candidate[key]
+        for key in (
+            "description", "image_url", "banner_image_url", "project_url",
+            "twitter_url", "discord_url", "telegram_url", "wiki_url",
+        ):
+            if not fresh.get(key) and candidate.get(key):
+                fresh[key] = candidate[key]
+        return fresh
 
     def enrich_candidate(self, candidate):
         """Lazy-load collection metadata for a Telegram candidate detail card."""
@@ -666,6 +985,7 @@ class DailyMintService:
                 "image_url": str(metadata.get("image_url") or ""),
                 "banner_image_url": str(metadata.get("banner_image_url") or ""),
                 "project_url": str(metadata.get("project_url") or ""),
+                "mint_url": str(metadata.get("mint_url") or ""),
                 "twitter_url": str(
                     metadata.get("twitter_url")
                     or (
@@ -713,89 +1033,196 @@ class DailyMintService:
         return enriched
 
     def research_candidate(self, candidate):
-        """Return a read-only research bundle for a saved mint candidate."""
+        """Return concise official drop info for one saved mint stage."""
         if not isinstance(candidate, dict) or not candidate.get("slug"):
             raise ValueError("candidate data is incomplete; run a fresh scan")
-        research = self.research_collection(
-            candidate.get("slug"),
-            chain_hint=candidate.get("chain"),
+        result = self.research_reference(
+            candidate.get("source_url")
+            or candidate.get("opensea_url")
+            or candidate.get("url")
+            or candidate.get("slug")
         )
-        result = dict(research)
-        result["candidate"] = dict(candidate)
+        matched = next((
+            item for item in result.get("mint_candidates", [])
+            if same_candidate_stage(candidate, item)
+        ), None)
+        if matched:
+            result["candidate"] = dict(matched)
         return result
 
     def research_reference(self, value):
-        """Research a pasted OpenSea collection/drop or NFT asset URL.
-
-        Collection/drop references also include any currently usable mint
-        stages. NFT asset references remain read-only and never become a mint
-        target; the returned collection slug can still be used to inspect its
-        drop stages when OpenSea supplies one.
-        """
+        """Return mint information for any pasted OpenSea URL or slug."""
         reference = opensea_client.parse_opensea_reference(value)
         if reference.get("kind") == "asset":
-            client = opensea_client.get_api_client(self.api_key)
-            try:
-                nft = opensea_client.get_nft(
-                    client,
-                    reference.get("chain"),
-                    reference.get("contract_address"),
-                    reference.get("identifier"),
-                    self.api_key,
-                )
-            finally:
-                client.close()
-            slug = self._nft_collection_slug(nft)
-            if slug:
-                research = self.research_collection(slug, chain_hint=reference.get("chain"))
-                try:
-                    candidates = self.inspect_drop(
-                        f"https://opensea.io/collection/{slug}"
-                    )
-                    route_note = ""
-                except Exception as exc:
-                    candidates = []
-                    route_note = redact_secrets(exc)
-            else:
-                research = self._minimal_asset_research(reference, nft)
-                candidates = []
-                route_note = "This asset has no collection-level mint route."
-            research = dict(research)
-            research.update({
-                "reference": reference,
-                "asset_nft": nft,
-                "mint_candidates": candidates,
-                "mint_route_note": str(route_note or ""),
-            })
-            if slug:
-                try:
-                    research["best_listing"] = self.purchase_preview(slug)
-                except Exception:
-                    research["best_listing"] = None
-            return research
+            return self._research_from_resolved_context(
+                self._resolve_opensea_reference(value)
+            )
+        slug = reference.get("slug")
+        try:
+            return self._drop_research(slug)
+        except RuntimeError:
+            # Collections that are not in the calendar can still be useful if
+            # a live public SeaDrop or a verified simple mint route exists.
+            return self._research_from_resolved_context(
+                self._resolve_opensea_reference(value)
+            )
 
-        slug = str(reference.get("slug") or "").strip()
-        research = self.research_collection(slug)
-        try:
-            candidates = self.inspect_drop(value)
-            route_note = ""
-        except Exception as exc:
-            # A collection can be worth researching even when its drop has no
-            # active/upcoming stage or OpenSea temporarily rejects that route.
-            candidates = []
-            route_note = redact_secrets(exc)
-        research = dict(research)
-        try:
-            best_listing = self.purchase_preview(slug)
-        except Exception:
-            best_listing = None
-        research.update({
-            "reference": reference,
+    def _research_from_resolved_context(self, context):
+        """Build a Telegram-friendly research record from URL resolution."""
+        context = context if isinstance(context, dict) else {}
+        reference = context.get("reference") or {}
+        nft = context.get("nft") if isinstance(context.get("nft"), dict) else {}
+        collection = (
+            context.get("collection")
+            if isinstance(context.get("collection"), dict) else {}
+        )
+        info = context.get("info") if isinstance(context.get("info"), dict) else {}
+        candidates = [
+            dict(item) for item in (context.get("candidates") or [])
+            if isinstance(item, dict)
+        ]
+        slug = str(context.get("slug") or "").strip()
+        chain = str(
+            reference.get("chain")
+            or info.get("chain")
+            or (candidates[0].get("chain") if candidates else "")
+            or ""
+        ).strip().lower()
+        result = {}
+        result.update(dict(info.get("metadata") or {}))
+        for source in (collection, info, nft):
+            for key in (
+                "description", "image_url", "banner_image_url", "project_url",
+                "mint_url", "twitter_url", "discord_url", "telegram_url",
+                "wiki_url", "total_supply", "max_supply",
+            ):
+                if result.get(key) in (None, "") and source.get(key) not in (None, ""):
+                    result[key] = source.get(key)
+        name = str(
+            nft.get("name")
+            or collection.get("name")
+            or info.get("name")
+            or slug
+            or "OpenSea reference"
+        )
+        opensea_url = str(
+            reference.get("url")
+            or info.get("opensea_url")
+            or collection.get("opensea_url")
+            or (f"https://opensea.io/collection/{slug}" if slug else "")
+        )
+        contract = str(
+            reference.get("contract_address")
+            or info.get("contract_address")
+            or (candidates[0].get("contract_address") if candidates else "")
+            or ""
+        )
+        result.update({
+            "slug": slug,
+            "name": name,
+            "chain": chain,
+            "contract_address": contract,
+            "opensea_url": opensea_url,
+            "total_supply": result.get("total_supply"),
+            "max_supply": result.get("max_supply"),
+            "is_minting": info.get("is_minting"),
+            "drop_type": info.get("drop_type") or "",
             "mint_candidates": candidates,
-            "mint_route_note": str(route_note or ""),
-            "best_listing": best_listing,
+            "mint_route_note": (
+                ""
+                if candidates
+                else context.get("route_note")
+                or "No safe mint route is currently exposed for this OpenSea reference."
+            ),
+            "source": (
+                "OpenSea NFT metadata + verified mint route"
+                if reference.get("kind") == "asset"
+                else "OpenSea public metadata + verified mint route"
+            ),
         })
-        return research
+        if reference.get("kind") == "asset":
+            result.update({
+                "token_id": reference.get("identifier"),
+                "asset_url": reference.get("url"),
+                "collection_slug": self._nft_collection_slug(nft),
+            })
+        try:
+            result["is_sold_out"] = (
+                int(result.get("max_supply") or 0) > 0
+                and int(result.get("total_supply") or 0) >= int(result.get("max_supply") or 0)
+            )
+        except (TypeError, ValueError):
+            result["is_sold_out"] = any(
+                item.get("is_sold_out") is True for item in candidates
+            )
+        if len(candidates) == 1:
+            result["candidate"] = dict(candidates[0])
+        return result
+
+    def _drop_research(self, slug):
+        """Load one official Drops record without marketplace/statistics noise."""
+        slug = opensea_client.parse_drop_slug(slug)
+        client = opensea_client.get_api_client(self.api_key)
+        try:
+            try:
+                info = opensea_client.get_drop_info(client, slug, self.api_key)
+            except Exception as exc:
+                raise RuntimeError(
+                    "OpenSea does not expose this collection as a hosted mint."
+                ) from exc
+        finally:
+            client.close()
+        chain = str(info.get("chain") or "").strip().lower()
+        metadata = dict(info.get("metadata") or {})
+        metadata.update({
+            "total_supply": info.get("total_supply", metadata.get("total_supply")),
+            "max_supply": info.get("max_supply", metadata.get("max_supply")),
+            "drop_type": info.get("drop_type") or "",
+            "is_minting": info.get("is_minting"),
+            "details_verified": True,
+        })
+        candidates = []
+        if config.chain_config(chain):
+            candidates = [item.to_dict() for item in discovery.build_drop_candidates(
+                info.get("slug") or slug,
+                info.get("name") or slug,
+                chain,
+                info.get("stages") or [],
+                now=int(time.time()),
+                metadata=metadata,
+                contract_address=info.get("contract_address") or "",
+                opensea_url=info.get("opensea_url") or "",
+            )]
+        result = dict(metadata)
+        result.update({
+            "slug": info.get("slug") or slug,
+            "name": info.get("name") or slug,
+            "chain": chain,
+            "contract_address": info.get("contract_address") or "",
+            "opensea_url": info.get("opensea_url") or f"https://opensea.io/collection/{slug}",
+            "total_supply": info.get("total_supply"),
+            "max_supply": info.get("max_supply"),
+            "is_minting": info.get("is_minting"),
+            "drop_type": info.get("drop_type") or "",
+            "mint_candidates": candidates,
+            "mint_route_note": (
+                "" if candidates
+                else "No active or upcoming stage is currently exposed by OpenSea."
+            ),
+            "source": "OpenSea Drops API",
+        })
+        try:
+            result["is_sold_out"] = (
+                int(result.get("max_supply") or 0) > 0
+                and int(result.get("total_supply") or 0) >= int(result["max_supply"])
+            )
+        except (TypeError, ValueError):
+            result["is_sold_out"] = any(
+                item.get("is_sold_out") is True for item in candidates
+            )
+        if len(candidates) == 1:
+            result["candidate"] = dict(candidates[0])
+        return result
 
     def purchase_preview(self, value):
         """Return the exact cheapest active OpenSea listing without signing."""
@@ -987,6 +1414,7 @@ class DailyMintService:
             "image_url": str(collection.get("image_url") or ""),
             "banner_image_url": str(collection.get("banner_image_url") or ""),
             "project_url": str(collection.get("project_url") or ""),
+            "mint_url": str(collection.get("mint_url") or ""),
             "twitter_username": twitter_username,
             "twitter_url": twitter_url,
             "instagram_username": str(collection.get("instagram_username") or ""),
@@ -1068,8 +1496,17 @@ class DailyMintService:
             return ""
         collection = nft.get("collection")
         if isinstance(collection, dict):
-            collection = collection.get("slug") or collection.get("name")
-        return str(collection or nft.get("collection_slug") or "").strip()
+            collection = (
+                collection.get("slug")
+                or collection.get("collection_slug")
+                or collection.get("collectionSlug")
+            )
+        return str(
+            collection
+            or nft.get("collection_slug")
+            or nft.get("collectionSlug")
+            or ""
+        ).strip()
 
     @staticmethod
     def _minimal_asset_research(reference, nft):
@@ -1091,6 +1528,9 @@ class DailyMintService:
             raise ValueError("schedule data is incomplete; inspect the OpenSea URL again")
         if not self.live_enabled:
             raise RuntimeError("live minting is disabled; set ENABLE_LIVE_MINTS=true first")
+        if candidate.get("is_sold_out") is True:
+            raise RuntimeError("this OpenSea drop is sold out; a schedule was not armed")
+        candidate = self.refresh_candidate(candidate, require_same_terms=True)
         # Resolve aliases now so a typo or removed wallet can never create an
         # apparently armed schedule that has no signer at launch.
         self.selected_wallets(candidate)
@@ -1262,22 +1702,61 @@ class DailyMintService:
             self.schedule_wakeup.clear()
 
     def _run_schedule(self, schedule):
-        candidate = schedule.get("candidate") or {}
+        candidate = dict(schedule.get("candidate") or {})
         try:
+            # OpenSea can reorder stages or move an opening after a schedule is
+            # armed. Refresh by the stable stage UUID at warm-up so the stored
+            # index can never select a different stage and a delayed opening is
+            # automatically re-armed instead of firing stale calldata.
+            candidate = self.refresh_candidate(candidate, require_same_terms=True)
+            run_at = int(candidate.get("start_time") or 0)
+            if run_at <= 0:
+                raise RuntimeError("OpenSea no longer exposes a valid opening time")
+
+            rearmed = False
+            with self.state_lock:
+                stored = self._find_schedule_locked(schedule.get("id"))
+                if not stored or stored.get("status") != "running":
+                    # The user may have cancelled while the OpenSea refresh was
+                    # in flight. Never execute a schedule that is no longer live.
+                    return
+                stored["candidate"] = dict(candidate)
+                stored["run_at"] = run_at
+                stored["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                if run_at - config.WARMUP_LEAD_SECONDS > time.time():
+                    stored["status"] = "armed"
+                    rearmed = True
+                self._save_schedules()
+
+            schedule = dict(schedule)
+            schedule["candidate"] = dict(candidate)
+            schedule["run_at"] = run_at
+            if rearmed:
+                self.notify(
+                    f"SCHEDULE UPDATED: {candidate.get('name', candidate.get('slug', 'mint'))} "
+                    f"now opens at {datetime.fromtimestamp(run_at, timezone.utc).isoformat(timespec='seconds')}."
+                )
+                self.schedule_wakeup.set()
+                return
+
             result = self._execute_candidate(
                 candidate,
                 self._today(),
-                scheduled_at=float(schedule.get("run_at") or 0),
+                scheduled_at=float(run_at),
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {redact_secrets(exc)}"
+            recorded = False
             with self.state_lock:
                 stored = self._find_schedule_locked(schedule.get("id"))
-                if stored:
+                if stored and stored.get("status") == "running":
                     stored["status"] = "failed"
                     stored["error"] = error
                     stored["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     self._save_schedules()
+                    recorded = True
+            if not recorded:
+                return
             self.notify(
                 f"SCHEDULE FAILED: {candidate.get('name', candidate.get('slug', 'mint'))} — {error}"
             )
@@ -1385,11 +1864,14 @@ class DailyMintService:
         if not self.live_enabled:
             raise RuntimeError("live minting is disabled; set ENABLE_LIVE_MINTS=true first")
         candidate = dict(candidate)
+        if candidate.get("is_sold_out") is True:
+            raise RuntimeError("this OpenSea drop is sold out; nothing was signed or sent")
         if quantity is not None:
             candidate["quantity"] = quantity
         candidate["quantity"] = validate_quantity(
             candidate, candidate.get("quantity") or config.MINT_QUANTITY
         )
+        candidate = self.refresh_candidate(candidate, require_same_terms=True)
         return self._execute_candidate(candidate, self._today())
 
     def _engine_for_wallet(self, profile):
@@ -1524,6 +2006,11 @@ class DailyMintService:
         for candidate in candidates:
             if self.stop_event.is_set():
                 return
+            # Broad automatic mode stays free + public. Paid or gated mints
+            # remain fully available through explicit manual scheduling where
+            # the user reviews the exact price/access terms first.
+            if not is_free_public_candidate(candidate) or candidate.get("is_sold_out") is True:
+                continue
             day = self._today()
             key = candidate_key(candidate)
             with self.state_lock:
@@ -1536,13 +2023,27 @@ class DailyMintService:
             if at_limit:
                 self.notify("Daily mint limit reached; remaining candidates were not attempted.")
                 return
-            start = int(candidate.get("start_time") or 0)
-            warm_at = max(0, start - config.WARMUP_LEAD_SECONDS)
-            while warm_at > time.time() and not self.stop_event.is_set():
-                self.stop_event.wait(min(60, max(0.01, warm_at - time.time())))
-            if self.stop_event.is_set():
-                return
             try:
+                while True:
+                    start = int(candidate.get("start_time") or 0)
+                    warm_at = max(0, start - config.WARMUP_LEAD_SECONDS)
+                    while warm_at > time.time() and not self.stop_event.is_set():
+                        self.stop_event.wait(
+                            min(60, max(0.01, warm_at - time.time()))
+                        )
+                    if self.stop_event.is_set():
+                        return
+                    candidate = self.refresh_candidate(
+                        candidate, require_same_terms=True
+                    )
+                    if not is_free_public_candidate(candidate):
+                        raise RuntimeError(
+                            "the automatic candidate is no longer free and public"
+                        )
+                    refreshed_start = int(candidate.get("start_time") or 0)
+                    if refreshed_start - config.WARMUP_LEAD_SECONDS <= time.time():
+                        start = refreshed_start
+                        break
                 day = self._today()
                 result = self._execute_candidate(candidate, day, scheduled_at=start)
                 if callable(self.notify_result):
@@ -1765,12 +2266,43 @@ class DailyMintService:
             temporary.replace(self.schedule_path)
 
 
+def candidate_stage_identity(candidate):
+    """Return OpenSea's stable stage UUID, with a legacy-record fallback."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    stage_id = str(candidate.get("stage_id") or "").strip().lower()
+    if stage_id:
+        return f"uuid:{stage_id}"
+    return "legacy:" + ":".join(str(value) for value in (
+        candidate.get("stage_index", 0),
+        candidate.get("start_time", 0),
+        candidate.get("stage_type", ""),
+    ))
+
+
+def same_candidate_stage(left, right):
+    """Match the same stage/route across refreshed OpenSea response shapes."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if str(left.get("chain") or "").lower() != str(right.get("chain") or "").lower():
+        return False
+    if str(left.get("slug") or "").lower() != str(right.get("slug") or "").lower():
+        return False
+    if str(left.get("route") or "opensea_drop").lower() != str(
+        right.get("route") or "opensea_drop"
+    ).lower():
+        return False
+    left_id = str(left.get("stage_id") or "").strip().lower()
+    right_id = str(right.get("stage_id") or "").strip().lower()
+    if left_id and right_id:
+        return left_id == right_id
+    return candidate_stage_identity(left) == candidate_stage_identity(right)
+
+
 def candidate_key(candidate):
     return ":".join(str(value) for value in (
         candidate["chain"],
         candidate["slug"],
-        candidate.get("stage_index", 0),
-        candidate.get("start_time", 0),
+        candidate_stage_identity(candidate),
         candidate.get("route", "opensea_drop"),
         candidate.get("contract_address", ""),
     ))

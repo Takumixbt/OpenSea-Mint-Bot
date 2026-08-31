@@ -18,7 +18,7 @@ import opensea_direct_executor
 import wallets
 from daily_runner import DailyMintService, quantity_limit, validate_quantity
 from minter import Minter
-from telegram_bot import TelegramBot, explorer_tx_url
+from telegram_bot import TelegramBot, explorer_tx_url, project_token
 
 
 CANDIDATE = {
@@ -79,6 +79,9 @@ class FakeTelegramService:
     def supported_chains(self):
         return ["base"]
 
+    def chain_coverage(self, force_refresh=False):
+        return {"base": 1}, [], 0.0
+
     def candidate_at(self, index):
         if index != 1:
             raise ValueError("candidate number is out of range; run /scan first")
@@ -124,6 +127,19 @@ class FakeTelegramService:
 
     def inspect_drop(self, value):
         return [dict(self.last_candidates[0])]
+
+    def refresh_candidate(self, candidate, require_same_terms=True):
+        fresh = dict(self.last_candidates[0])
+        if require_same_terms and fresh.get("price_wei") != candidate.get("price_wei"):
+            raise RuntimeError("the OpenSea mint price changed")
+        if require_same_terms and fresh.get("access_label") != candidate.get("access_label"):
+            raise RuntimeError("the OpenSea eligibility rule changed")
+        fresh["quantity"] = candidate.get("quantity", 1)
+        return fresh
+
+    def scan_now(self, chain=None):
+        self.last_scan_argument = chain
+        return list(self.last_candidates), []
 
     def funding_snapshot(self, candidate):
         return {
@@ -277,23 +293,90 @@ class TelegramSafetyTests(unittest.TestCase):
         buttons = api.photos[0][1]["reply_markup"]["inline_keyboard"]
         self.assertTrue(any(button.get("url") == "https://basescan.org/tx/0xabc" for row in buttons for button in row))
 
-    def test_scan_flow_requires_one_network_and_has_no_all_chains_button(self):
+    def test_scan_opens_a_network_picker_and_all_scan_is_grouped(self):
         api = FakeAPI()
-        bot = TelegramBot(api, FakeTelegramService(), 123)
+        service = FakeTelegramService()
+        bot = TelegramBot(api, service, 123)
 
-        keyboard = bot.chain_keyboard()
+        keyboard = bot.chain_keyboard({"base": 1})
         callbacks = [
             button.get("callback_data")
             for row in keyboard["inline_keyboard"]
             for button in row
         ]
         self.assertIn("scan:base", callbacks)
-        self.assertNotIn("scan:all", callbacks)
+        self.assertIn("scan:all", callbacks)
 
         bot.start_scan(123)
-        self.assertIn("Which network", api.sent[-1][0][1])
+        self.assertIn("Pick a network", api.sent[-1][0][1])
+        self.assertFalse(hasattr(service, "last_scan_argument"))
+
         bot.start_scan(123, "all")
-        self.assertIn("Choose one network at a time", api.sent[-1][0][1])
+        deadline = time.time() + 2
+        while bot.job_lock.locked() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(service.last_scan_argument)
+        rendered = "\n".join(str(call[0][2]) for call in api.edited if len(call[0]) > 2)
+        self.assertIn("All OpenSea mints today", rendered)
+        self.assertIn("Grouped by network", rendered)
+
+    def test_network_picker_shows_drop_counts_and_hides_empty_networks(self):
+        """A network with no drop must not look like an equally good choice."""
+        api = FakeAPI()
+
+        class Service(FakeTelegramService):
+            def supported_chains(self):
+                return ["base", "ethereum", "zora"]
+
+            def chain_coverage(self, force_refresh=False):
+                return {"ethereum": 7, "base": 2}, [], 0.0
+
+        bot = TelegramBot(api, Service(), 123)
+        bot.show_chain_picker(123)
+        text = api.sent[-1][0][1]
+        keyboard = api.sent[-1][0][2]["inline_keyboard"]
+        labels = [button["text"] for row in keyboard for button in row]
+        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+
+        self.assertIn("9", text)
+        # Busiest network first, each carrying its real count.
+        self.assertTrue(any("Ethereum" in label and "7" in label for label in labels))
+        self.assertTrue(any("Base" in label and "2" in label for label in labels))
+        # Zora has nothing scheduled, so it sits behind the overflow button.
+        self.assertNotIn("scan:zora", callbacks)
+        self.assertIn("chains:all", callbacks)
+        self.assertIn("chains:refresh", callbacks)
+
+    def test_network_picker_says_empty_calendar_is_not_a_failed_scan(self):
+        api = FakeAPI()
+
+        class Service(FakeTelegramService):
+            def chain_coverage(self, force_refresh=False):
+                return {}, [], 0.0
+
+        bot = TelegramBot(api, Service(), 123)
+        bot.show_chain_picker(123)
+        text = api.sent[-1][0][1]
+        self.assertIn("no drops scheduled", text.lower())
+        self.assertIn("not a failed scan", text.lower())
+
+    def test_network_picker_lists_every_network_when_counts_are_unavailable(self):
+        """Losing the counts must not hide the networks themselves."""
+        api = FakeAPI()
+
+        class Service(FakeTelegramService):
+            def supported_chains(self):
+                return ["base", "ethereum"]
+
+            def chain_coverage(self, force_refresh=False):
+                raise RuntimeError("opensea down")
+
+        bot = TelegramBot(api, Service(), 123)
+        bot.show_chain_picker(123)
+        keyboard = api.sent[-1][0][2]["inline_keyboard"]
+        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+        self.assertIn("scan:base", callbacks)
+        self.assertIn("scan:ethereum", callbacks)
 
     def test_scan_results_rescan_only_the_selected_network(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
@@ -320,8 +403,9 @@ class TelegramSafetyTests(unittest.TestCase):
             "data": callback,
         })
         self.assertIn("Demo &amp; Drop", api.edited[-1][0][2])
-        candidate_callback = api.edited[-1][0][3]["inline_keyboard"][0][0]["callback_data"]
-        self.assertTrue(candidate_callback.startswith("candidate:1:"))
+        project_actions = api.edited[-1][0][3]["inline_keyboard"][0]
+        self.assertTrue(project_actions[0]["callback_data"].startswith("project:mint:"))
+        self.assertTrue(project_actions[1]["callback_data"].startswith("project:schedule:"))
 
         with self.assertRaisesRegex(ValueError, "stale"):
             bot._candidate_from_ref("candidate:1:0000000000")
@@ -360,7 +444,7 @@ class TelegramSafetyTests(unittest.TestCase):
         text = bot.render_candidates(service.last_candidates, [])
         keyboard = bot.candidates_keyboard()
 
-        self.assertIn("1 projects · 2 mint options", text)
+        self.assertIn("1 collections · 2 mint options", text)
         self.assertIn("1 live", text)
         self.assertIn("1 opens", text)
         project_buttons = [
@@ -371,6 +455,67 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertTrue(project_buttons[0][0]["callback_data"].startswith("project:"))
         group = bot._project_from_ref(project_buttons[0][0]["callback_data"].split(":", 1)[1])
         self.assertEqual(len(group["options"]), 2)
+
+    def test_all_scan_drills_into_one_chain_without_mixing_projects(self):
+        service = FakeTelegramService()
+        service.supported_chains = lambda: ["base", "ethereum"]
+        service.last_candidates = [
+            dict(CANDIDATE, name="Base Drop", slug="base-drop"),
+            dict(CANDIDATE, name="Ethereum Drop", slug="ethereum-drop", chain="ethereum", chain_id=1),
+        ]
+        bot = TelegramBot(FakeAPI(), service, 123)
+        bot.last_scan_chain = "all"
+
+        summary = bot.render_chain_summary(service.last_candidates, [])
+        self.assertIn("Base", summary)
+        self.assertIn("Ethereum", summary)
+        self.assertNotIn("Choose a mint window", summary)
+
+        keyboard = bot.chain_summary_keyboard(service.last_candidates)
+        callbacks = [
+            button.get("callback_data")
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("candidates:chain:base:page:0", callbacks)
+        self.assertIn("candidates:chain:ethereum:page:0", callbacks)
+
+        chain_keyboard = bot.candidates_keyboard(
+            service.last_candidates,
+            scan_chain="base",
+        )
+        project_callback = chain_keyboard["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(project_callback.startswith("project:"))
+        bot.handle_callback({
+            "id": "callback-chain",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": project_callback,
+        })
+        self.assertIn("Base Drop", bot.api.edited[-1][0][2])
+        self.assertNotIn("Ethereum Drop", bot.api.edited[-1][0][2])
+
+    def test_project_action_buttons_skip_the_extra_stage_action_screen(self):
+        api = FakeAPI()
+        service = FakeTelegramService()
+        bot = TelegramBot(api, service, 123)
+        bot.show_project(123, project_token(CANDIDATE))
+        project_markup = api.sent[-1][0][2]
+        mint_callback = project_markup["inline_keyboard"][0][0]["callback_data"]
+        schedule_callback = project_markup["inline_keyboard"][0][1]["callback_data"]
+
+        bot.handle_callback({
+            "id": "callback-mint-action",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": mint_callback,
+        })
+        self.assertIn("Confirm mint now", api.edited[-1][0][2])
+
+        bot.handle_callback({
+            "id": "callback-schedule-action",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": schedule_callback,
+        })
+        self.assertIn("Schedule preview", api.edited[-1][0][2])
 
     def test_schedule_preview_shows_mint_details_and_uses_short_callback_tokens(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
@@ -474,7 +619,7 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertIn('<a href="https://basescan.org/address/0x0000000000000000000000000000000000000001">🔗 Contract</a>', text)
         self.assertIn('<a href="https://opensea.io/collection/demo-drop">Demo &amp; Drop</a>', text)
 
-    def test_research_report_embeds_social_and_wallet_links(self):
+    def test_mint_info_omits_marketplace_and_wallet_attribution_noise(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         owner = "0x0000000000000000000000000000000000000001"
         research = {
@@ -490,21 +635,13 @@ class TelegramSafetyTests(unittest.TestCase):
         }
         text = bot.render_research(research)
 
-        self.assertIn('<a href="https://x.com/demo">X</a>', text)
-        self.assertIn("Attributed owner", text)
-        self.assertIn(
-            f'<a href="https://basescan.org/address/{owner}">',
-            text,
-        )
-        self.assertIn(f'<a href="https://opensea.io/{owner}">OpenSea profile</a>', text)
-        self.assertIn(
-            f'<a href="https://intel.arkm.com/explorer/address/{owner}">Arkham</a>',
-            text,
-        )
-        self.assertIn(f"<code>{owner}</code>", text)
-        self.assertIn("not verified developer", text.lower())
+        self.assertIn("<b>ℹ️ OpenSea mint info</b>", text)
+        self.assertIn("<b>Network:</b> Base", text)
+        self.assertNotIn("twitter", text.lower())
+        self.assertNotIn("Attributed owner", text)
+        self.assertNotIn("All-time volume", text)
 
-    def test_wallet_attribution_shows_profile_name_and_full_address(self):
+    def test_mint_info_does_not_show_unrelated_owner_profiles(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         owner = "0x32d4e1e8b75754e1ff391577836c98f38d3f577b"
         text = bot.render_research({
@@ -519,12 +656,10 @@ class TelegramSafetyTests(unittest.TestCase):
             },
         })
 
-        self.assertIn("<b>Attributed owner:</b>", text)
-        self.assertIn("Thinkingcats_dev", text)
-        self.assertIn(f"<code>{owner}</code>", text)
-        self.assertIn(f'href="https://opensea.io/{owner}"', text)
-        self.assertIn(f'href="https://intel.arkm.com/explorer/address/{owner}"', text)
-        self.assertNotIn("0x32d4e1e8b75754e…", text)
+        self.assertIn("<b>Network:</b> Robinhood", text)
+        self.assertNotIn("Attributed owner", text)
+        self.assertNotIn("Thinkingcats_dev", text)
+        self.assertNotIn(owner, text)
 
     def test_research_report_hides_empty_metrics_and_duplicate_editor(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
@@ -551,9 +686,9 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertNotIn("Floor:", text)
         self.assertNotIn("24h", text)
         self.assertNotIn("OpenSea editor", text)
-        self.assertEqual(text.count("Attributed owner"), 1)
+        self.assertNotIn("Attributed owner", text)
 
-    def test_research_report_formats_currency_counts_and_recent_nfts(self):
+    def test_mint_info_keeps_supply_but_omits_trading_metrics_and_recent_nfts(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         text = bot.render_research({
             "name": "Thinking Catss",
@@ -576,15 +711,13 @@ class TelegramSafetyTests(unittest.TestCase):
         })
 
         self.assertIn("<b>Supply:</b> 10,000", text)
-        self.assertIn("<b>Floor:</b> 0.0019 ETH", text)
-        self.assertIn("<b>All-time volume:</b> 7.03 ETH", text)
-        self.assertIn("<b>All-time sales:</b> 16,480", text)
-        self.assertIn("<b>Owners:</b> 1,390", text)
-        self.assertIn("<b>24h volume:</b> 7.03 ETH", text)
-        self.assertIn("hmmmm #9998", text)
-        self.assertNotIn("𝕏 X", text)
+        self.assertNotIn("<b>Floor:</b>", text)
+        self.assertNotIn("All-time", text)
+        self.assertNotIn("<b>Owners:</b>", text)
+        self.assertNotIn("24h", text)
+        self.assertNotIn("hmmmm #9998", text)
 
-    def test_research_report_prefers_live_mint_progress_and_marks_stale_owners(self):
+    def test_mint_info_prefers_live_mint_progress(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
         text = bot.render_research({
             "name": "War Paint",
@@ -595,11 +728,9 @@ class TelegramSafetyTests(unittest.TestCase):
             "discord_url": "https://discord.gg/example",
         })
 
-        self.assertIn("<b>Mint progress:</b> 5 / 135 minted", text)
-        self.assertIn("<b>Owners:</b> Indexing…", text)
-        self.assertIn('<a href="https://x.com/OrangeHare_io">X</a>', text)
-        self.assertIn('<a href="https://discord.gg/example">Discord</a>', text)
-        self.assertNotIn("𝕏", text)
+        self.assertIn("<b>Supply:</b> 5 / 135 minted", text)
+        self.assertNotIn("<b>Owners:</b>", text)
+        self.assertNotIn("OrangeHare", text)
 
     def test_research_report_preserves_legitimate_zero_supply(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
@@ -610,8 +741,72 @@ class TelegramSafetyTests(unittest.TestCase):
             "stats_total": {"num_owners": 0},
         })
 
-        self.assertIn("<b>Mint progress:</b> 0 / 135 minted", text)
-        self.assertIn("<b>Owners:</b> 0", text)
+        self.assertIn("<b>Supply:</b> 0 / 135 minted", text)
+        self.assertNotIn("<b>Owners:</b>", text)
+
+    def test_research_report_uses_compact_minting_status_without_raw_route_diagnostics(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        raw_note = (
+            "This collection uses a custom external mint. verified ABI unavailable; "
+            "use NFT info to inspect it or buy an active OpenSea listing."
+        )
+        text = bot.render_research({
+            "name": "Unavailable Route",
+            "opensea_url": "https://opensea.io/collection/unavailable-route",
+            "project_url": "https://example.com/project",
+            "mint_route_note": raw_note,
+        })
+
+        self.assertIn("<b>Mint stages</b>", text)
+        self.assertIn("no live or upcoming mint stage", text.lower())
+        self.assertNotIn("<b>Mint route:</b>", text)
+        self.assertNotIn(raw_note, text)
+
+    def test_research_candidate_shows_verified_method_and_nonduplicate_links(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        candidate = dict(
+            CANDIDATE,
+            route="opensea_drop",
+            route_label="OpenSea drop transaction",
+            project_url="https://example.com/project",
+        )
+        research = {
+            "name": candidate["name"],
+            "opensea_url": candidate["url"],
+            "project_url": candidate["project_url"],
+            "candidate": candidate,
+            "mint_candidates": [candidate],
+        }
+        text = bot.render_research(research)
+        keyboard = bot.research_keyboard("token", research)
+        buttons = [
+            button
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+
+        self.assertIn("<b>Mint stages</b>", text)
+        self.assertIn("<b>Public</b>", text)
+        self.assertIn("Free · Public", text)
+        self.assertFalse(any(button.get("callback_data") == "research:view:token" for button in buttons))
+        self.assertTrue(any(button.get("text") == "🌊 OpenSea drop page" for button in buttons))
+        self.assertFalse(any(button.get("text") == "🌐 Project site" for button in buttons))
+
+    def test_project_screen_labels_collection_and_drop_page(self):
+        api = FakeAPI()
+        service = FakeTelegramService()
+        service.last_candidates = [dict(
+            CANDIDATE,
+            project_url="https://example.com/project",
+        )]
+        bot = TelegramBot(api, service, 123)
+        bot.show_project(123, project_token(service.last_candidates[0]))
+        payload = api.sent[-1][0][1] if api.sent else api.edited[-1][0][1]
+
+        self.assertIn("<b>🎨 Project</b>", payload)
+        self.assertIn("Mint windows today", payload)
+        self.assertIn("Mint method", payload)
+        self.assertNotIn("mint option(s) today", payload)
 
     def test_public_drop_info_reads_live_supply_and_schedule(self):
         payload = {
@@ -674,6 +869,30 @@ class TelegramSafetyTests(unittest.TestCase):
             from PIL import Image
             with Image.open(path) as image:
                 self.assertEqual(image.size, (1200, 675))
+
+    def test_mint_card_uses_actual_asset_artwork_when_available(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artwork_path = Path(temp_dir) / "actual-nft.png"
+            Image.new("RGB", (900, 900), (236, 28, 36)).save(artwork_path)
+            missing_background = Path(temp_dir) / "missing-background.jpg"
+            with patch.dict(os.environ, {"NFT_CARD_BACKGROUND": ""}), patch.object(
+                nft_card, "PERSISTENT_BACKGROUND", missing_background
+            ):
+                path = nft_card.build_mint_card(
+                    dict(CANDIDATE, quantity=1),
+                    {"asset_nft": {"image_url": str(artwork_path)}},
+                    output_dir=temp_dir,
+                )
+
+            with Image.open(path) as image:
+                # The artwork panel is the large right-hand visual, not the
+                # old 142px collection-logo thumbnail.
+                red, green, blue = image.convert("RGB").getpixel((900, 250))
+                self.assertGreater(red, 150)
+                self.assertLess(green, 100)
+                self.assertLess(blue, 100)
 
     def test_mint_receipt_card_generates_with_custom_controls(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
@@ -774,10 +993,15 @@ class DailyRunnerSafetyTests(unittest.TestCase):
 
                 first = threading.Thread(target=attempt)
                 second = threading.Thread(target=attempt)
-                first.start()
-                second.start()
-                first.join()
-                second.join()
+                with patch.object(
+                    service,
+                    "refresh_candidate",
+                    side_effect=lambda candidate, require_same_terms=True: dict(candidate),
+                ):
+                    first.start()
+                    second.start()
+                    first.join()
+                    second.join()
 
                 self.assertEqual(sorted(outcomes), ["RuntimeError", "sent"])
                 self.assertEqual(service.engine.calls, 1)
@@ -802,7 +1026,11 @@ class DailyRunnerSafetyTests(unittest.TestCase):
                     start_time=int(time.time()) + 3600,
                     end_time=int(time.time()) + 7200,
                 )
-                with patch.dict(os.environ, {"ENABLE_LIVE_MINTS": "true"}):
+                with patch.dict(
+                    os.environ, {"ENABLE_LIVE_MINTS": "true"}
+                ), patch.object(
+                    service, "refresh_candidate", return_value=dict(candidate)
+                ):
                     schedule = service.add_schedule(candidate)
                 self.assertEqual(schedule["status"], "armed")
                 self.assertEqual(service.schedules()[0]["id"], schedule["id"])
@@ -840,8 +1068,11 @@ class DailyRunnerSafetyTests(unittest.TestCase):
                     is_free=False,
                 )
                 with patch.dict(os.environ, {"ENABLE_LIVE_MINTS": "true"}):
-                    with self.assertRaisesRegex(RuntimeError, "exceeds"):
-                        service.add_schedule(paid)
+                    with patch.object(
+                        service, "refresh_candidate", return_value=dict(paid)
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+                            service.add_schedule(paid)
                 self.assertEqual(service.schedules(), [])
                 service.shutdown()
         finally:
@@ -849,6 +1080,116 @@ class DailyRunnerSafetyTests(unittest.TestCase):
 
 
 class DiscoverySafetyTests(unittest.TestCase):
+    def test_blank_monitored_chains_falls_back_to_every_evm_network(self):
+        with patch.dict(os.environ, {"MONITORED_CHAINS": ""}, clear=False):
+            chains = config.monitored_chain_slugs()
+        self.assertEqual(chains, list(config.CHAIN_CONFIGS))
+        self.assertEqual(len(chains), 27)
+        self.assertTrue({"avalanche", "shape", "somnia", "b3", "gunzilla"} <= set(chains))
+
+    def test_stage_uuid_survives_calendar_detail_reordering(self):
+        calendar = dict(
+            CANDIDATE,
+            stage_id="078fafd9371241a682ea1022732a5213",
+            stage_index=0,
+            start_time=100,
+        )
+        detail = dict(
+            calendar,
+            stage_index=4,
+            start_time=200,
+        )
+        self.assertTrue(daily_runner.same_candidate_stage(calendar, detail))
+        self.assertEqual(
+            daily_runner.candidate_key(calendar),
+            daily_runner.candidate_key(detail),
+        )
+
+    def test_verified_external_route_refresh_ignores_clock_only_start_change(self):
+        candidate = dict(
+            CANDIDATE,
+            slug="external-drop",
+            route="generic_contract",
+            stage_id="verified:publicMint(uint256)",
+            stage_type="verified_contract",
+            start_time=100,
+            contract_address="0x0000000000000000000000000000000000000001",
+        )
+        fresh = dict(candidate, start_time=101)
+        self.assertTrue(daily_runner.same_candidate_stage(candidate, fresh))
+        service = object.__new__(DailyMintService)
+        service.inspect_drop = lambda value: [fresh]
+        refreshed = service.refresh_candidate(candidate)
+        self.assertEqual(refreshed["start_time"], 101)
+
+    def test_refresh_rejects_a_contract_change_for_the_same_stage_uuid(self):
+        candidate = dict(
+            CANDIDATE,
+            stage_id="stable-stage",
+            contract_address="0x0000000000000000000000000000000000000001",
+        )
+        service = object.__new__(DailyMintService)
+        service.inspect_drop = lambda value: [dict(
+            candidate,
+            contract_address="0x0000000000000000000000000000000000000002",
+        )]
+        with self.assertRaisesRegex(RuntimeError, "contract changed"):
+            service.refresh_candidate(candidate)
+
+    def test_multichain_scan_walks_each_global_feed_once(self):
+        now = int(time.time())
+        calls = []
+        cards = [
+            {
+                "collection_slug": "avalanche-drop",
+                "collection_name": "Avalanche Drop",
+                "chain": "avalanche",
+                "active_stage": {
+                    "uuid": "avax-stage", "stage_type": "public_sale",
+                    "start_time": now + 60, "end_time": now + 3600,
+                    "price": "0",
+                },
+            },
+            {
+                "collection_slug": "shape-drop",
+                "collection_name": "Shape Drop",
+                "chain": "shape",
+                "active_stage": {
+                    "uuid": "shape-stage", "stage_type": "public_sale",
+                    "start_time": now + 60, "end_time": now + 3600,
+                    "price": "0",
+                },
+            },
+        ]
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            calls.append((chain, drop_type, cursor))
+            return (cards if drop_type == "upcoming" else []), None
+
+        def drop_info(client, slug, api_key, include_metadata=False):
+            card = next(item for item in cards if item["collection_slug"] == slug)
+            return {
+                "slug": slug,
+                "name": card["collection_name"],
+                "chain": card["chain"],
+                "metadata": {},
+                "stages": discovery._calendar_stages(card),
+            }
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
+        ):
+            candidates, errors = discovery.discover_mints(
+                object(), "key", ["avalanche", "shape"], 24, today_only=True
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), len(config.DISCOVERY_DROP_TYPES))
+        self.assertTrue(all(chain == "" for chain, _, _ in calls))
+        self.assertEqual({item.chain for item in candidates}, {"avalanche", "shape"})
+
     def test_high_resolution_wait_does_not_fire_early(self):
         from mint_engine import MintEngine
 
@@ -953,6 +1294,227 @@ class DiscoverySafetyTests(unittest.TestCase):
         )._encode_transaction_data()
         self.assertTrue(str(data).startswith("0x"))
         self.assertGreater(len(data), 10)
+
+    def test_external_resolver_accepts_public_seadrop_outside_calendar(self):
+        contract = "0x0000000000000000000000000000000000000042"
+        stage = {
+            "mint_price_wei": 0,
+            "start_time": int(time.time()) + 60,
+            "end_time": 0,
+            "max_per_wallet": 3,
+            "fee_bps": 0,
+            "restrict_fee_recipients": False,
+        }
+        with patch.object(
+            opensea_direct_executor,
+            "inspect_public_stage",
+            return_value=stage,
+        ) as inspect:
+            candidate, note = external_mint.resolve_collection_mint(
+                {
+                    "name": "Calendarless Drop",
+                    "opensea_url": "https://opensea.io/collection/calendarless-drop",
+                    "contracts": [{"chain": "base", "address": contract}],
+                },
+                "calendarless-drop",
+                "test-key",
+                "0x0000000000000000000000000000000000000001",
+            )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["route"], "opensea_drop")
+        self.assertEqual(candidate["price_wei"], 0)
+        self.assertEqual(candidate["max_per_wallet"], 3)
+        self.assertTrue(candidate["is_public"])
+        self.assertIn("SeaDrop", note)
+        inspect.assert_called_once()
+
+    def test_asset_url_resolves_to_the_hosted_collection_stage(self):
+        original_root = daily_runner.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daily_runner.ROOT = Path(temp_dir)
+                service = DailyMintService(
+                    "alchemy",
+                    "private",
+                    "0x0000000000000000000000000000000000000001",
+                    "opensea",
+                )
+                asset_url = (
+                    "https://opensea.io/assets/base/"
+                    "0x0000000000000000000000000000000000000042/7"
+                )
+                stage = {
+                    "stageIndex": 0,
+                    "uuid": "asset-stage",
+                    "stageType": "public_sale",
+                    "label": "Public",
+                    "startTime": int(time.time()) + 60,
+                    "endTime": int(time.time()) + 3600,
+                    "price": "0",
+                }
+                with patch.object(
+                    opensea_client,
+                    "get_nft",
+                    return_value={
+                        "name": "Token Seven",
+                        "collection": {"slug": "asset-drop"},
+                    },
+                ), patch.object(
+                    opensea_client,
+                    "get_drop_info",
+                    return_value={
+                        "slug": "asset-drop",
+                        "name": "Asset Drop",
+                        "chain": "base",
+                        "metadata": {},
+                        "stages": [stage],
+                    },
+                ):
+                    candidates = service.inspect_drop(asset_url)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["slug"], "asset-drop")
+                self.assertEqual(candidates[0]["source_url"], asset_url)
+                self.assertEqual(candidates[0]["asset_url"], asset_url)
+                self.assertEqual(candidates[0]["token_id"], "7")
+                self.assertEqual(candidates[0]["opensea_url"], asset_url)
+                service.shutdown()
+        finally:
+            daily_runner.ROOT = original_root
+
+    def test_asset_url_falls_back_to_a_verified_external_route(self):
+        original_root = daily_runner.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daily_runner.ROOT = Path(temp_dir)
+                service = DailyMintService(
+                    "alchemy",
+                    "private",
+                    "0x0000000000000000000000000000000000000001",
+                    "opensea",
+                )
+                asset_url = (
+                    "https://opensea.io/item/base/"
+                    "0x0000000000000000000000000000000000000042/7"
+                )
+                route = dict(
+                    CANDIDATE,
+                    slug="asset-drop",
+                    name="Asset Drop",
+                    route="generic_contract",
+                    route_label="Verified contract",
+                    contract_address="0x0000000000000000000000000000000000000042",
+                    start_time=int(time.time()) + 60,
+                    price_wei=0,
+                )
+                with patch.object(
+                    opensea_client,
+                    "get_nft",
+                    return_value={
+                        "name": "Token Seven",
+                        "collection": {"slug": "asset-drop"},
+                    },
+                ), patch.object(
+                    opensea_client,
+                    "get_drop_info",
+                    side_effect=RuntimeError("not in calendar"),
+                ), patch.object(
+                    opensea_client,
+                    "list_drops",
+                    return_value=([], None),
+                ), patch.object(
+                    opensea_client,
+                    "get_collection_details",
+                    return_value={
+                        "name": "Asset Drop",
+                        "contracts": [{
+                            "chain": "base",
+                            "address": route["contract_address"],
+                        }],
+                    },
+                ), patch.object(
+                    external_mint,
+                    "resolve_collection_mint",
+                    return_value=(route, "verified route"),
+                ) as resolve:
+                    candidates = service.inspect_drop(asset_url)
+                self.assertEqual(candidates[0]["route"], "generic_contract")
+                self.assertEqual(candidates[0]["source_url"], asset_url)
+                self.assertEqual(candidates[0]["token_id"], "7")
+                resolve.assert_called_once()
+                service.shutdown()
+        finally:
+            daily_runner.ROOT = original_root
+
+    def test_schedule_rearms_when_opensea_moves_the_same_stage_later(self):
+        original_root = daily_runner.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daily_runner.ROOT = Path(temp_dir)
+                service = DailyMintService(
+                    "alchemy",
+                    "private",
+                    "0x0000000000000000000000000000000000000001",
+                    "opensea",
+                )
+                original_start = int(time.time()) + 5
+                moved_start = int(time.time()) + config.WARMUP_LEAD_SECONDS + 60
+                candidate = dict(
+                    CANDIDATE,
+                    stage_id="stable-stage-uuid",
+                    start_time=original_start,
+                    end_time=moved_start + 3600,
+                )
+                schedule = {
+                    "id": "sch_test",
+                    "status": "running",
+                    "mode": "live",
+                    "run_at": original_start,
+                    "candidate": candidate,
+                }
+                with service.state_lock:
+                    service._schedules = [dict(schedule)]
+                fresh = dict(candidate, stage_index=7, start_time=moved_start)
+                with patch.object(
+                    service, "refresh_candidate", return_value=fresh
+                ), patch.object(
+                    service, "_execute_candidate"
+                ) as execute, patch.object(service, "notify"):
+                    service._run_schedule(dict(schedule))
+
+                saved = service.schedules()[0]
+                self.assertEqual(saved["status"], "armed")
+                self.assertEqual(saved["run_at"], moved_start)
+                self.assertEqual(saved["candidate"]["stage_index"], 7)
+                execute.assert_not_called()
+                service.shutdown()
+        finally:
+            daily_runner.ROOT = original_root
+
+    def test_sold_out_drop_cannot_be_scheduled_or_minted(self):
+        original_root = daily_runner.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daily_runner.ROOT = Path(temp_dir)
+                service = DailyMintService(
+                    "alchemy",
+                    "private",
+                    "0x0000000000000000000000000000000000000001",
+                    "opensea",
+                )
+                sold_out = dict(
+                    CANDIDATE,
+                    is_sold_out=True,
+                    start_time=int(time.time()) + 60,
+                    end_time=int(time.time()) + 3600,
+                )
+                with patch.dict(os.environ, {"ENABLE_LIVE_MINTS": "true"}):
+                    with self.assertRaisesRegex(RuntimeError, "sold out"):
+                        service.add_schedule(sold_out)
+                    with self.assertRaisesRegex(RuntimeError, "sold out"):
+                        service.mint_candidate(sold_out)
+                service.shutdown()
+        finally:
+            daily_runner.ROOT = original_root
 
     def test_optional_rpc_blast_endpoints_are_chain_specific(self):
         with patch.dict(
@@ -1088,6 +1650,12 @@ class DiscoverySafetyTests(unittest.TestCase):
             ),
             "example",
         )
+        self.assertEqual(
+            discovery.opensea_client.parse_drop_slug(
+                "https://opensea.io/collection/example/overview"
+            ),
+            "example",
+        )
         with self.assertRaisesRegex(ValueError, "individual NFT asset"):
             discovery.opensea_client.parse_drop_slug(
                 "https://opensea.io/assets/ethereum/0xabc/1"
@@ -1185,8 +1753,11 @@ class DiscoverySafetyTests(unittest.TestCase):
             return_value=(cards, None),
         ), patch.object(
             discovery.opensea_client,
-            "get_drop_schedule",
-            side_effect=lambda client, slug, api_key: schedules[slug],
+            "get_drop_info",
+            side_effect=lambda client, slug, api_key, include_metadata=False: {
+                "slug": slug, "name": schedules[slug][0], "chain": "base",
+                "metadata": {}, "stages": schedules[slug][1],
+            },
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1223,8 +1794,11 @@ class DiscoverySafetyTests(unittest.TestCase):
             return_value=(cards, None),
         ), patch.object(
             discovery.opensea_client,
-            "get_drop_schedule",
-            side_effect=lambda client, slug, api_key: schedules[slug],
+            "get_drop_info",
+            side_effect=lambda client, slug, api_key, include_metadata=False: {
+                "slug": slug, "name": schedules[slug][0], "chain": "base",
+                "metadata": {}, "stages": schedules[slug][1],
+            },
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1245,15 +1819,15 @@ class DiscoverySafetyTests(unittest.TestCase):
         now = int(time.time())
         cards_by_type = {
             "upcoming": [
-                {"collectionSlug": "shared", "collectionName": "Shared"},
-                {"collectionSlug": "upcoming-only", "collectionName": "Upcoming"},
+                {"collectionSlug": "shared", "collectionName": "Shared", "is_minting": True},
+                {"collectionSlug": "upcoming-only", "collectionName": "Upcoming", "is_minting": True},
             ],
             "recently_minted": [
-                {"collectionSlug": "shared", "collectionName": "Shared"},
-                {"collectionSlug": "recent-only", "collectionName": "Recent"},
+                {"collectionSlug": "shared", "collectionName": "Shared", "is_minting": True},
+                {"collectionSlug": "recent-only", "collectionName": "Recent", "is_minting": True},
             ],
             "featured": [
-                {"collectionSlug": "featured-only", "collectionName": "Featured"},
+                {"collectionSlug": "featured-only", "collectionName": "Featured", "is_minting": True},
             ],
         }
         schedules = {
@@ -1274,8 +1848,11 @@ class DiscoverySafetyTests(unittest.TestCase):
             discovery.opensea_client, "list_drops", side_effect=list_feed
         ), patch.object(
             discovery.opensea_client,
-            "get_drop_schedule",
-            side_effect=lambda client, slug, api_key: schedules[slug],
+            "get_drop_info",
+            side_effect=lambda client, slug, api_key, include_metadata=False: {
+                "slug": slug, "name": schedules[slug][0], "chain": "base",
+                "metadata": {}, "stages": schedules[slug][1],
+            },
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1289,6 +1866,171 @@ class DiscoverySafetyTests(unittest.TestCase):
             ["featured-only", "recent-only", "shared", "upcoming-only"],
         )
 
+    def test_today_scan_keeps_a_forward_window_late_in_the_day(self):
+        """A scan at 23:00 must not collapse to a few minutes of look-ahead.
+
+        Pinning the horizon to local midnight made an evening /scan return
+        almost nothing, which read as a broken scan rather than a narrow
+        window. A stage opening in six hours has to stay visible.
+        """
+        now = int(time.time())
+        opens_in_six_hours = now + 6 * 60 * 60
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            if drop_type != "upcoming":
+                return ([], None)
+            return ([{
+                "collectionSlug": "late-drop",
+                "chain": "base",
+                "is_minting": True,
+            }], None)
+
+        def drop_info(client, slug, api_key, include_metadata=False):
+            return {
+                "slug": slug,
+                "name": slug,
+                "chain": "base",
+                "metadata": {},
+                "stages": [{
+                    "stageIndex": 0,
+                    "startTime": opens_in_six_hours,
+                    "endTime": opens_in_six_hours + 3600,
+                    "label": "Public",
+                    "price": "0",
+                }],
+            }
+
+        # Pretend the configured day ends in one minute.
+        def day_bounds(timestamp=None):
+            return now - 82800, now + 60, "today"
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
+        ), patch.object(config, "discovery_day_bounds", day_bounds), patch.object(
+            config, "DISCOVERY_MIN_WINDOW_HOURS", 12
+        ):
+            candidates, errors = discovery.discover_mints(
+                object(), "key", ["base"], 24, today_only=True
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual([item.slug for item in candidates], ["late-drop"])
+
+    def test_drop_calendar_is_read_once_and_reused_across_networks(self):
+        """Scanning a second network must not repeat the whole cursor walk."""
+        now = int(time.time())
+        feed_calls = []
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            feed_calls.append(drop_type)
+            if drop_type != "featured":
+                return ([], None)
+            return ([
+                {"collectionSlug": "on-base", "chain": "base", "is_minting": True},
+                {"collectionSlug": "on-eth", "chain": "ethereum", "is_minting": True},
+            ], None)
+
+        def drop_info(client, slug, api_key, include_metadata=False):
+            return {
+                "slug": slug,
+                "name": slug,
+                "chain": "base" if slug == "on-base" else "ethereum",
+                "metadata": {},
+                "stages": [{
+                    "stageIndex": 0,
+                    "startTime": now + 60,
+                    "endTime": now + 3600,
+                    "label": "Public",
+                    "price": "0",
+                }],
+            }
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
+        ):
+            base, _ = discovery.discover_mints(object(), "key", ["base"], 24)
+            after_first = len(feed_calls)
+            ethereum, _ = discovery.discover_mints(object(), "key", ["ethereum"], 24)
+
+        self.assertEqual([item.slug for item in base], ["on-base"])
+        self.assertEqual([item.slug for item in ethereum], ["on-eth"])
+        # The second network reused the cached calendar.
+        self.assertEqual(len(feed_calls), after_first)
+
+    def test_drop_detail_chain_wins_over_a_mislabelled_calendar_card(self):
+        """A calendar/detail chain disagreement must not silently drop a mint."""
+        now = int(time.time())
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            if drop_type != "featured":
+                return ([], None)
+            return ([{
+                "collectionSlug": "moved",
+                "chain": "ethereum",
+                "is_minting": True,
+            }], None)
+
+        def drop_info(client, slug, api_key, include_metadata=False):
+            return {
+                "slug": slug,
+                "name": slug,
+                # The authoritative record says Base, not Ethereum.
+                "chain": "base",
+                "metadata": {},
+                "stages": [{
+                    "stageIndex": 0,
+                    "startTime": now + 60,
+                    "endTime": now + 3600,
+                    "label": "Public",
+                    "price": "0",
+                }],
+            }
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
+        ):
+            candidates, _ = discovery.discover_mints(
+                object(), "key", ["base", "ethereum"], 24
+            )
+
+        self.assertEqual([item.slug for item in candidates], ["moved"])
+        self.assertEqual(candidates[0].chain, "base")
+
+    def test_chain_coverage_counts_drops_without_expanding_them(self):
+        details = []
+
+        def list_feed(client, api_key, chain, drop_type, limit, cursor):
+            if drop_type != "featured":
+                return ([], None)
+            return ([
+                {"collectionSlug": "a", "chain": "base", "is_minting": True},
+                {"collectionSlug": "b", "chain": "base", "is_minting": True},
+                {"collectionSlug": "c", "chain": "ethereum", "is_minting": True},
+            ], None)
+
+        def drop_info(client, slug, api_key, include_metadata=False):
+            details.append(slug)
+            raise AssertionError("coverage must not expand drop details")
+
+        with patch.object(
+            discovery.opensea_client, "list_drops", side_effect=list_feed
+        ), patch.object(
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
+        ):
+            counts, errors, _age = discovery.chain_coverage(
+                object(), "key", ["base", "ethereum"], 24
+            )
+
+        self.assertEqual(counts, {"base": 2, "ethereum": 1})
+        self.assertEqual(errors, [])
+        self.assertEqual(details, [])
+
     def test_discovery_exhausts_every_cursor_in_each_drop_feed(self):
         now = int(time.time())
         calls = []
@@ -1296,24 +2038,30 @@ class DiscoverySafetyTests(unittest.TestCase):
         def list_feed(client, api_key, chain, drop_type, limit, cursor):
             calls.append((drop_type, cursor))
             if drop_type == "recently_minted" and cursor is None:
-                return ([{"collectionSlug": "first-page"}], "page-2")
+                return ([{"collectionSlug": "first-page", "is_minting": True}], "page-2")
             if drop_type == "recently_minted" and cursor == "page-2":
-                return ([{"collectionSlug": "second-page"}], None)
+                return ([{"collectionSlug": "second-page", "is_minting": True}], None)
             return ([], None)
 
-        def schedule(client, slug, api_key):
-            return slug, [{
-                "stageIndex": 0,
-                "startTime": now + 60,
-                "endTime": now + 3600,
-                "label": "Public",
-                "price": "0",
-            }]
+        def drop_info(client, slug, api_key, include_metadata=False):
+            return {
+                "slug": slug,
+                "name": slug,
+                "chain": "base",
+                "metadata": {},
+                "stages": [{
+                    "stageIndex": 0,
+                    "startTime": now + 60,
+                    "endTime": now + 3600,
+                    "label": "Public",
+                    "price": "0",
+                }],
+            }
 
         with patch.object(
             discovery.opensea_client, "list_drops", side_effect=list_feed
         ), patch.object(
-            discovery.opensea_client, "get_drop_schedule", side_effect=schedule
+            discovery.opensea_client, "get_drop_info", side_effect=drop_info
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 0
         ):
@@ -1354,10 +2102,8 @@ class DiscoverySafetyTests(unittest.TestCase):
             discovery.opensea_client, "list_drops", return_value=([card], None)
         ), patch.object(
             discovery.opensea_client,
-            "get_drop_schedule",
+            "get_drop_info",
             side_effect=RuntimeError("OpenSea detail backend unavailable"),
-        ), patch.object(
-            discovery.opensea_client, "get_public_drop_schedule", return_value=[]
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1365,15 +2111,23 @@ class DiscoverySafetyTests(unittest.TestCase):
                 object(), "key", ["base"], 24, today_only=True
             )
 
-        self.assertEqual(errors, [])
+        self.assertEqual(
+            errors,
+            ["1 relevant drop detail record(s) used compact fallback"],
+        )
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].slug, "calendar-mint")
         self.assertEqual(candidates[0].opensea_url, card["opensea_url"])
         self.assertEqual(candidates[0].contract_address, card["contract_address"])
 
-    def test_public_page_stage_fallback_adds_later_same_day_stage(self):
-        day_start, _, _ = config.discovery_day_bounds()
-        first = max(day_start + 60, int(time.time()) + 60)
+    def test_official_drop_detail_adds_later_same_day_stage(self):
+        day_start, horizon, _ = config.discovery_day_bounds()
+        # Keep this fixture inside today's configured window even when the
+        # suite is run close to midnight in the local timezone.
+        first = min(
+            max(day_start + 60, int(time.time()) + 60),
+            horizon - 3600,
+        )
         later = first + 3600
         card = {
             "collection_slug": "two-stage",
@@ -1399,7 +2153,12 @@ class DiscoverySafetyTests(unittest.TestCase):
         with patch.object(
             discovery.opensea_client, "list_drops", return_value=([card], None)
         ), patch.object(
-            discovery.opensea_client, "get_public_drop_schedule", return_value=full_stages
+            discovery.opensea_client,
+            "get_drop_info",
+            return_value={
+                "slug": "two-stage", "name": "Two Stage", "chain": "ethereum",
+                "metadata": {}, "stages": full_stages,
+            },
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1432,8 +2191,11 @@ class DiscoverySafetyTests(unittest.TestCase):
             discovery.opensea_client, "list_drops", return_value=(cards, None)
         ), patch.object(
             discovery.opensea_client,
-            "get_drop_schedule",
-            return_value=("Yesterday", stages),
+            "get_drop_info",
+            return_value={
+                "slug": "yesterday", "name": "Yesterday", "chain": "base",
+                "metadata": {}, "stages": stages,
+            },
         ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ):
@@ -1444,36 +2206,18 @@ class DiscoverySafetyTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual([item.slug for item in candidates], ["yesterday"])
 
-    def test_chain_scan_finds_today_drop_omitted_from_calendar(self):
-        day_start, _, _ = config.discovery_day_bounds()
+    def test_ranked_collections_are_never_mixed_into_drop_discovery(self):
         ranked = [{
             "collection": "thinking-catss",
             "name": "Thinking Catss",
             "description": "10,000 thinking cats",
             "opensea_url": "https://opensea.io/collection/thinking-catss",
         }]
-        drop = {
-            "slug": "thinking-catss",
-            "name": "Thinking Catss",
-            "chain": "robinhood",
-            "contract_address": "0x65d8b5d6a86a24ce21ac09af95bed55fd8b76995",
-            "opensea_url": "https://opensea.io/collection/thinking-catss",
-            "stages": [{
-                "stageIndex": 0,
-                "startTime": day_start + 60,
-                "endTime": day_start + 80000,
-                "label": "Public stage",
-                "stageType": "public_sale",
-                "price": "100000000000000",
-            }],
-        }
         with patch.object(
             discovery.opensea_client, "list_drops", return_value=([], None)
         ), patch.object(
             discovery.opensea_client, "list_top_collections", return_value=ranked
-        ), patch.object(
-            discovery.opensea_client, "get_drop_info", return_value=drop
-        ), patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
+        ) as ranked_call, patch.object(config, "DISCOVERY_REQUEST_DELAY_SECONDS", 0), patch.object(
             config, "DISCOVERY_MAX_PAGES_PER_CHAIN", 1
         ), patch.object(config, "DISCOVERY_RANKED_FALLBACK_WORKERS", 1):
             candidates, errors = discovery.discover_mints(
@@ -1486,8 +2230,8 @@ class DiscoverySafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(errors, [])
-        self.assertEqual([item.slug for item in candidates], ["thinking-catss"])
-        self.assertEqual(candidates[0].price_display, "Paid · 0.0001 ETH")
+        self.assertEqual(candidates, [])
+        ranked_call.assert_not_called()
 
     def test_ranked_secondary_collection_without_drop_is_silently_ignored(self):
         ranked = [{"collection": "secondary-only", "name": "Secondary Only"}]
