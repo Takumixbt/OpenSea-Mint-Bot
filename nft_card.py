@@ -91,7 +91,7 @@ def build_mint_card(candidate, research=None, output_dir=None):
     research = dict(research or {})
     accent = _parse_color(os.getenv("NFT_CARD_ACCENT_COLOR", AMBER), AMBER)
 
-    image = _background()
+    image = _background(candidate, research)
     receipt_status = str(candidate.get("receipt_status") or "").strip().lower()
     artwork = _load_image(_nft_image_source(candidate, research))
     if artwork is None:
@@ -118,18 +118,41 @@ def build_mint_card(candidate, research=None, output_dir=None):
 # Background and frame
 # ---------------------------------------------------------------------------
 
-def _background():
-    """Return the card ground: a custom image if installed, else the palette."""
+def _background(candidate=None, research=None):
+    """Return the card ground.
+
+    An operator-installed background wins, because it is an explicit choice.
+    Otherwise the collection's own banner (or logo) becomes the ground, so a
+    card looks like the project it belongs to instead of looking generic.
+    """
+    candidate = candidate if isinstance(candidate, dict) else {}
+    research = research if isinstance(research, dict) else {}
+
     source = os.getenv("NFT_CARD_BACKGROUND", "").strip()
     if not source and PERSISTENT_BACKGROUND.is_file():
         source = str(PERSISTENT_BACKGROUND)
     custom = _load_image(source) if source else None
+    veil_alpha = 208
+
+    if custom is None:
+        for key in ("banner_image_url", "image_url"):
+            candidate_source = str(
+                research.get(key) or candidate.get(key) or ""
+            ).strip()
+            custom = _load_image(candidate_source)
+            if custom is not None:
+                # A logo is small and busy; blur it harder than a wide banner
+                # so it reads as texture rather than a stretched icon.
+                veil_alpha = 214 if key == "banner_image_url" else 224
+                break
+
     if custom is not None:
-        base = _cover(custom.convert("RGB"), CARD_WIDTH, CARD_HEIGHT).convert("RGBA")
-        # A custom photo must not fight the type, so sit it behind a heavy
-        # moss veil rather than using it at full strength.
-        veil = Image.new("RGBA", base.size, MOSS_DEEP + (208,))
-        return Image.alpha_composite(base, veil)
+        base = _cover(custom.convert("RGB"), CARD_WIDTH, CARD_HEIGHT)
+        base = base.filter(ImageFilter.GaussianBlur(9)).convert("RGBA")
+        # The ground must never fight the type, so sit it behind a heavy moss
+        # veil rather than using it at full strength.
+        veil = Image.new("RGBA", base.size, MOSS_DEEP + (veil_alpha,))
+        return _add_glow(Image.alpha_composite(base, veil))
 
     base = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT))
     draw = ImageDraw.Draw(base)
@@ -142,18 +165,18 @@ def _background():
                 for channel in range(3)
             ),
         )
-    return _add_grain(base).convert("RGBA")
+    return _add_glow(base.convert("RGBA"))
 
 
-def _add_grain(image):
-    """Add a faint vignette so flat gradients do not band on Telegram's JPEG."""
-    glow = Image.new("L", (CARD_WIDTH, CARD_HEIGHT), 0)
-    ImageDraw.Draw(glow).ellipse(
+def _add_glow(image):
+    """Add a faint top-light so flat grounds do not band on Telegram's JPEG."""
+    mask = Image.new("L", (CARD_WIDTH, CARD_HEIGHT), 0)
+    ImageDraw.Draw(mask).ellipse(
         (-260, -420, CARD_WIDTH + 260, CARD_HEIGHT + 120), fill=58
     )
-    glow = glow.filter(ImageFilter.GaussianBlur(150))
-    warm = Image.new("RGB", image.size, (96, 132, 84))
-    return Image.composite(warm, image, glow.point(lambda value: value // 3))
+    mask = mask.filter(ImageFilter.GaussianBlur(150)).point(lambda v: v // 3)
+    warm = Image.new("RGBA", image.size, (96, 132, 84, 255))
+    return Image.composite(warm, image, mask)
 
 
 def _soft_rect(image, box, radius, fill=None, outline=None, width=1):

@@ -30,6 +30,7 @@ from daily_runner import (
     same_candidate_stage,
     validate_quantity,
 )
+from chain_picker_card import build_picker_card
 from nft_card import (
     PERSISTENT_BACKGROUND,
     build_mint_card,
@@ -305,6 +306,19 @@ class TelegramAPI:
             payload["parse_mode"] = parse_mode
         return self.call("editMessageText", payload)
 
+    def delete_message(self, chat_id, message_id):
+        """Remove one message, ignoring the usual "already gone" rejections."""
+        try:
+            return self.call(
+                "deleteMessage",
+                {"chat_id": chat_id, "message_id": message_id},
+                timeout=15,
+            )
+        except RuntimeError:
+            # Telegram refuses to delete a message that is missing or older
+            # than 48 hours. Neither is worth surfacing to the operator.
+            return None
+
     def answer_callback(self, callback_query_id, text=None, show_alert=False):
         payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
         if text:
@@ -331,6 +345,9 @@ class TelegramBot:
         self.quantity_choices = {}
         self.wallet_choices = {}
         self.last_scan_chain = None
+        # The newest picture-based screen per chat, so refreshing one replaces
+        # it instead of stacking a new image on every tap.
+        self.photo_screens = {}
         self.offset = None
 
     # ------------------------------------------------------------------
@@ -2533,12 +2550,28 @@ class TelegramBot:
                 coverage = None
                 errors = [f"calendar unavailable ({type(exc).__name__})"]
                 age = None
-        self._present(
-            chat_id,
-            self.scan_picker_text(coverage, errors, age),
-            self.chain_keyboard(coverage, show_empty=show_empty),
-            message_id,
-        )
+
+        keyboard = self.chain_keyboard(coverage, show_empty=show_empty)
+        caption = self.scan_picker_text(coverage, errors, age)
+
+        # The overflow view is a long button grid; an image of the busy
+        # networks would only repeat what the caption already says.
+        if coverage is not None and not show_empty:
+            path = None
+            try:
+                path = build_picker_card(
+                    coverage, len(self.service.supported_chains())
+                )
+                self._present_photo(chat_id, path, caption, keyboard, message_id)
+                return
+            except Exception:
+                # Never let picker artwork stand between the operator and the
+                # ability to scan.
+                pass
+            finally:
+                self._discard(path)
+
+        self._present(chat_id, caption, keyboard, message_id)
 
     @staticmethod
     def _candidates_for_chain(candidates, chain):
@@ -3539,6 +3572,41 @@ class TelegramBot:
 
     def _send(self, chat_id, text, keyboard=None):
         return self.api.send_message(chat_id, text, keyboard, HTML_MODE)
+
+    @staticmethod
+    def _discard(path):
+        """Delete a rendered temporary image, if one was produced."""
+        if not path:
+            return
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+
+    def _present_photo(self, chat_id, path, caption, keyboard, message_id=None):
+        """Show an image screen, replacing whatever screen it supersedes.
+
+        A text message cannot be edited into a photo, so the previous screen is
+        removed and a new one sent. Tracking the last image per chat keeps a
+        repeated refresh from filling the chat with near-identical pictures.
+        """
+        key = int(chat_id)
+        for stale in (message_id, self.photo_screens.get(key)):
+            if stale:
+                self.api.delete_message(chat_id, stale)
+        result = self.api.send_photo(
+            chat_id,
+            path,
+            caption=caption,
+            reply_markup=keyboard,
+            parse_mode=HTML_MODE,
+        )
+        sent_id = (result or {}).get("message_id")
+        if sent_id:
+            self.photo_screens[key] = sent_id
+        else:
+            self.photo_screens.pop(key, None)
+        return result
 
     def _present(self, chat_id, text, keyboard=None, message_id=None):
         keyboard = keyboard if keyboard is not None else self.home_keyboard()

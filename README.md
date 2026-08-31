@@ -64,6 +64,22 @@ falls back only to the existing direct SeaDrop or verified simple-contract
 resolver. Marketplace listings, custom proof flows, and guessed calldata are
 still rejected.
 
+## Network logos
+
+`/scan` opens a network picker rendered as an image, because a Telegram inline
+button can only carry text and emoji, never a logo. The artwork lives in
+`assets/chains/` and is committed, so drawing the picker never touches the
+network and still works when the upstream CDN is down. Two networks have no
+published logo and fall back to a lettered disc in their own colour.
+
+Refresh or extend the set with:
+
+```powershell
+python scripts/fetch_chain_logos.py
+```
+
+The logos are third-party trademarks included only to identify each network.
+
 ## Requirements
 
 - Python 3.11 or newer

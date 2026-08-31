@@ -44,6 +44,7 @@ class FakeAPI:
         self.sent = []
         self.edited = []
         self.photos = []
+        self.deleted = []
 
     def send_message(self, *args, **kwargs):
         self.sent.append((args, kwargs))
@@ -59,6 +60,10 @@ class FakeAPI:
     def send_photo(self, *args, **kwargs):
         self.photos.append((args, kwargs))
         return {"message_id": 100}
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
     def download_file(self, file_id, destination):
         from PIL import Image
@@ -293,6 +298,19 @@ class TelegramSafetyTests(unittest.TestCase):
         buttons = api.photos[0][1]["reply_markup"]["inline_keyboard"]
         self.assertTrue(any(button.get("url") == "https://basescan.org/tx/0xabc" for row in buttons for button in row))
 
+    @staticmethod
+    def _picker_screen(api):
+        """Return (caption, keyboard) for whichever way the picker rendered."""
+        if api.photos:
+            args, kwargs = api.photos[-1]
+            caption = kwargs.get("caption") or (args[2] if len(args) > 2 else "")
+            keyboard = kwargs.get("reply_markup") or (
+                args[3] if len(args) > 3 else {}
+            )
+            return caption, keyboard
+        args, _kwargs = api.sent[-1]
+        return args[1], args[2]
+
     def test_scan_opens_a_network_picker_and_all_scan_is_grouped(self):
         api = FakeAPI()
         service = FakeTelegramService()
@@ -308,7 +326,8 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertIn("scan:all", callbacks)
 
         bot.start_scan(123)
-        self.assertIn("Pick a network", api.sent[-1][0][1])
+        caption, _keyboard = self._picker_screen(api)
+        self.assertIn("Pick a network", caption)
         self.assertFalse(hasattr(service, "last_scan_argument"))
 
         bot.start_scan(123, "all")
@@ -333,10 +352,13 @@ class TelegramSafetyTests(unittest.TestCase):
 
         bot = TelegramBot(api, Service(), 123)
         bot.show_chain_picker(123)
-        text = api.sent[-1][0][1]
-        keyboard = api.sent[-1][0][2]["inline_keyboard"]
+        text, markup = self._picker_screen(api)
+        keyboard = markup["inline_keyboard"]
         labels = [button["text"] for row in keyboard for button in row]
         callbacks = [button.get("callback_data") for row in keyboard for button in row]
+
+        # The picker is an image, because a Telegram button cannot show a logo.
+        self.assertEqual(len(api.photos), 1)
 
         self.assertIn("9", text)
         # Busiest network first, each carrying its real count.
@@ -356,7 +378,7 @@ class TelegramSafetyTests(unittest.TestCase):
 
         bot = TelegramBot(api, Service(), 123)
         bot.show_chain_picker(123)
-        text = api.sent[-1][0][1]
+        text, _markup = self._picker_screen(api)
         self.assertIn("no drops scheduled", text.lower())
         self.assertIn("not a failed scan", text.lower())
 
@@ -373,10 +395,15 @@ class TelegramSafetyTests(unittest.TestCase):
 
         bot = TelegramBot(api, Service(), 123)
         bot.show_chain_picker(123)
-        keyboard = api.sent[-1][0][2]["inline_keyboard"]
-        callbacks = [button.get("callback_data") for row in keyboard for button in row]
+        _text, markup = self._picker_screen(api)
+        callbacks = [
+            button.get("callback_data")
+            for row in markup["inline_keyboard"] for button in row
+        ]
         self.assertIn("scan:base", callbacks)
         self.assertIn("scan:ethereum", callbacks)
+        # Counts are unavailable, so there is nothing to draw: text fallback.
+        self.assertEqual(api.photos, [])
 
     def test_scan_results_rescan_only_the_selected_network(self):
         bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
