@@ -36,6 +36,45 @@ CREAM_DIM = (176, 178, 152, 255)
 AMBER = "#E0A458"
 FROG = (122, 168, 87, 255)
 
+# One colour per network, matching the glyphs used in the Telegram picker.
+# Unlisted networks fall back to the card accent.
+CHAIN_COLORS = {
+    "ethereum": (108, 113, 235),
+    "base": (0, 82, 255),
+    "optimism": (255, 4, 32),
+    "arbitrum": (18, 170, 255),
+    "polygon": (130, 71, 229),
+    "avalanche": (232, 65, 66),
+    "zora": (255, 122, 0),
+    "blast": (252, 252, 3),
+    "shape": (72, 200, 255),
+    "robinhood": (204, 255, 0),
+    "abstract": (0, 209, 128),
+    "monad": (131, 110, 249),
+    "megaeth": (255, 214, 0),
+    "hyperevm": (80, 213, 180),
+    "ape_chain": (0, 84, 250),
+    "bera_chain": (208, 116, 42),
+    "ink": (117, 137, 255),
+    "sei": (156, 28, 40),
+    "soneium": (140, 140, 140),
+    "ronin": (0, 130, 255),
+    "unichain": (255, 0, 122),
+    "flow": (0, 239, 139),
+    "somnia": (255, 149, 0),
+    "b3": (255, 122, 60),
+    "gunzilla": (196, 158, 73),
+    "animechain": (255, 105, 180),
+    "stablechain": (0, 200, 120),
+}
+
+
+def chain_color(chain, fallback):
+    """Return the network's brand colour, or the card accent."""
+    value = CHAIN_COLORS.get(str(chain or "").strip().lower())
+    return (value + (255,)) if value else fallback
+
+
 STATUS_COLORS = {
     "confirmed": (122, 168, 87, 255),
     "sent": (224, 164, 88, 255),
@@ -242,11 +281,28 @@ def _draw_identity(image, candidate, research, accent):
         draw.text((66, y), line, font=_font(43, bold=True), fill=CREAM)
         y += 50
 
-    chain = str(candidate.get("chain") or "unknown").replace("_", " ").replace("-", " ").title()
+    raw_chain = str(candidate.get("chain") or "unknown")
+    chain = raw_chain.replace("_", " ").replace("-", " ").title()
+    badge = chain_color(raw_chain, accent)
+
+    # A filled chip in the network's own colour, so the chain is identifiable
+    # before the label is read.
+    font = _font(19, bold=True)
+    label_width = _text_width(draw, chain, font)
+    top = y + 4
+    height = 34
+    right = 66 + label_width + 46
+    _soft_rect(image, (66, top, right, top + height), height // 2,
+               fill=_alpha(badge, 58))
+    draw.rounded_rectangle((66, top, right, top + height),
+                           radius=height // 2, outline=badge, width=2)
+    draw.ellipse((84, top + 12, 94, top + 22), fill=badge)
+    draw.text((104, top + 7), chain, font=font, fill=CREAM)
+
     stage = str(candidate.get("stage_label") or "Stage unknown")
     _soft_text(
-        image, (68, y + 6), _clip(f"{chain}  \u00b7  {stage}", 46),
-        _font(21), _alpha(CREAM_DIM, 240),
+        image, (right + 16, top + 8), _clip(stage, 24),
+        _font(19), _alpha(CREAM_DIM, 235),
     )
 
 

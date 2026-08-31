@@ -3441,22 +3441,101 @@ class TelegramBot:
     def error_card(self, message):
         return f"⚠️ <b>Notice</b>\n\n{esc(message)}"
 
+    # Ordered most specific first. Each entry maps a substring of the raw
+    # error to (title, explanation, retry_action).
+    ERROR_PATTERNS = (
+        (
+            ("cannot reach the blockchain", "rpc chain mismatch",
+             "no configured rpc"),
+            "\u26d3\ufe0f Network unreachable",
+            "The RPC endpoint for that chain did not answer.",
+            "Check ALCHEMY_API_KEY and the network overrides in .env.",
+        ),
+        (
+            ("network error", "connecterror", "timeout", "timed out",
+             "connection", "getaddrinfo"),
+            "\U0001f4e1 Network hiccup",
+            "The request to OpenSea did not get through. This is almost always "
+            "temporary.",
+            "Try again in a moment.",
+        ),
+        (
+            ("429", "rate limit", "too many requests"),
+            "\u23f3 Rate limited",
+            "OpenSea is throttling requests right now.",
+            "Wait a minute, then try again.",
+        ),
+        (
+            ("401", "403", "api key", "authentication"),
+            "\U0001f511 API key rejected",
+            "OpenSea refused the API key.",
+            "Check OPENSEA_API_KEY in .env, then restart the bot.",
+        ),
+        (
+            ("no active/upcoming mint stage", "exposes no", "no supported evm",
+             "no hosted stage", "not expose this collection"),
+            "\u26aa No mint available",
+            "OpenSea knows this collection, but it has no live or upcoming "
+            "mint stage, and no safe on-chain mint route could be verified.",
+            "It may be sold out, finished, or sold only on the secondary "
+            "market.",
+        ),
+        (
+            ("invalid", "must point to opensea.io", "paste a supported",
+             "cannot be empty", "invalid token id", "invalid contract"),
+            "\U0001f517 Link not recognised",
+            "That does not look like a supported OpenSea collection, drop, "
+            "item, or asset link.",
+            "Copy the URL straight from the collection page in your browser.",
+        ),
+        (
+            ("hard cap", "price cap", "above the configured"),
+            "\U0001f6d1 Blocked by your price cap",
+            "This mint costs more than the cap you configured, so nothing was "
+            "signed or sent.",
+            "Raise the cap under More \u2192 Maximum mint price if you want "
+            "to allow it.",
+        ),
+        (
+            ("balance is below", "no native coin", "insufficient"),
+            "\U0001f4b8 Not enough gas",
+            "The wallet cannot cover the mint value plus its gas envelope.",
+            "Top the wallet up, then try again.",
+        ),
+    )
+
+    def _explain_error(self, exc, safe_message):
+        """Return ``(title, body)`` in plain language for a raw exception."""
+        haystack = f"{type(exc).__name__} {safe_message}".lower()
+        for needles, title, explanation, action in self.ERROR_PATTERNS:
+            if any(needle in haystack for needle in needles):
+                return title, f"{explanation}\n\n{action}"
+        # Anything unclassified still shows the real message, because hiding it
+        # would leave the operator with nothing to act on.
+        return (
+            "\u26a0\ufe0f Something went wrong",
+            f"{safe_message}\n\nIf this keeps happening, check the bot log.",
+        )
+
     def _send_error(self, chat_id, exc, message_id=None):
         safe_message = redact_secrets(exc)
         if "stale" in safe_message.lower() or "expired candidate" in safe_message.lower():
             self._present(
                 chat_id,
-                "🔄 <b>Candidate list refreshed</b>\n\n"
-                "That button belongs to an older scan. Review the current candidates before taking action.",
+                "\U0001f504 <b>Candidate list refreshed</b>\n\n"
+                "That button belongs to an older scan. Review the current "
+                "candidates before taking action.",
                 self.candidates_keyboard(),
                 message_id,
             )
             return
-        text = (
-            "⚠️ <b>Action failed</b>\n\n"
-            f"<code>{esc(type(exc).__name__)}</code>: {esc(safe_message)}"
+        title, body = self._explain_error(exc, safe_message)
+        self._present(
+            chat_id,
+            f"<b>{title}</b>\n\n{esc(body)}",
+            self.home_keyboard(),
+            message_id,
         )
-        self._present(chat_id, text, self.home_keyboard(), message_id)
 
     def _send(self, chat_id, text, keyboard=None):
         return self.api.send_message(chat_id, text, keyboard, HTML_MODE)
