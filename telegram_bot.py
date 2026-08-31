@@ -3129,6 +3129,14 @@ class TelegramBot:
     def render_research(self, research):
         """Render only actionable facts from OpenSea's hosted-drop record."""
         research = dict(research or {})
+        if research.get("known_to_opensea") is False:
+            return (
+                "\u26a0\ufe0f <b>Not found on OpenSea</b>\n\n"
+                f"OpenSea has no collection, drop, or item for "
+                f"<code>{esc(research.get('slug') or 'that reference')}</code>.\n\n"
+                "Check the spelling, or copy the URL straight from the "
+                "collection page in your browser."
+            )
         candidates = [
             dict(item) for item in (research.get("mint_candidates") or [])
             if isinstance(item, dict)

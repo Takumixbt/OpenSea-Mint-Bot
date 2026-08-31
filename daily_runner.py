@@ -525,7 +525,10 @@ class DailyMintService:
                     self.api_key,
                     chains,
                     config.DISCOVERY_WINDOW_HOURS,
-                    today_only=True,
+                    # A rolling window, not "the rest of today". Anchoring to
+                    # midnight hid drops that open a few hours later purely
+                    # because of the clock.
+                    today_only=False,
                     # The official three drop feeds are the canonical mint
                     # catalogue. Trending/top collections are trading data and
                     # must never leak into /scan as false mint results.
@@ -580,58 +583,14 @@ class DailyMintService:
             detail_error = exc
             # A transient detail outage should not make a known calendar drop
             # impossible to arm. The compact Drops feed is still a bounded,
-            # official OpenSea source and contains enough stage data to show a
-            # candidate while the final transaction is fetched later.
-            for drop_type in config.DISCOVERY_DROP_TYPES:
-                cursor = None
-                seen_cursors = set()
-                page_count = 0
-                try:
-                    while True:
-                        page_count += 1
-                        cards, next_cursor = opensea_client.list_drops(
-                            client,
-                            self.api_key,
-                            "",
-                            drop_type,
-                            config.DISCOVERY_LIMIT_PER_CHAIN,
-                            cursor,
-                        )
-                        card = next((
-                            row for row in cards
-                            if str(discovery._drop_slug(row) or "").lower() == slug.lower()
-                        ), None)
-                        if card:
-                            stages = discovery._calendar_stages(card)
-                            chain = str(card.get("chain") or "").strip().lower()
-                            if stages and chain:
-                                metadata = discovery._calendar_metadata(card)
-                                metadata.update({
-                                    "drop_type": card.get("drop_type") or "",
-                                    "is_minting": card.get("is_minting"),
-                                    "details_verified": False,
-                                })
-                                info = {
-                                    "slug": slug,
-                                    "name": discovery._drop_name(card, slug),
-                                    "chain": chain,
-                                    "contract_address": card.get("contract_address") or "",
-                                    "opensea_url": card.get("opensea_url") or f"https://opensea.io/collection/{slug}",
-                                    "metadata": metadata,
-                                    "stages": stages,
-                                }
-                                break
-                        if not next_cursor or str(next_cursor) in seen_cursors:
-                            break
-                        page_limit = int(config.DISCOVERY_MAX_PAGES_PER_CHAIN or 0)
-                        if page_limit > 0 and page_count >= page_limit:
-                            break
-                        seen_cursors.add(str(next_cursor))
-                        cursor = next_cursor
-                except Exception as fallback_error:
-                    detail_error = fallback_error
-                if info:
-                    break
+            # official OpenSea source and carries enough stage data to show a
+            # candidate while the final transaction is fetched later. It is
+            # read from the cached calendar, never by re-walking every cursor.
+            try:
+                card = discovery.find_calendar_card(client, self.api_key, slug)
+                info = discovery.calendar_card_to_info(card, slug)
+            except Exception as fallback_error:
+                detail_error = fallback_error
 
         if not isinstance(info, dict):
             return [], None, detail_error
@@ -1139,6 +1098,12 @@ class DailyMintService:
                 if reference.get("kind") == "asset"
                 else "OpenSea public metadata + verified mint route"
             ),
+            # Whether OpenSea returned any record at all for this reference. A
+            # mistyped slug otherwise produced a card titled with the typo,
+            # which looks like a real collection that merely has no mint.
+            "known_to_opensea": bool(
+                nft or collection or info or candidates or contract
+            ),
         })
         if reference.get("kind") == "asset":
             result.update({
@@ -1310,20 +1275,43 @@ class DailyMintService:
         with self.scan_lock:
             client = opensea_client.get_api_client(self.api_key)
             try:
-                collection = opensea_client.get_collection_details(client, slug, self.api_key)
-                stats = self._optional_research_call(
-                    opensea_client.get_collection_stats, client, slug
-                )
-                floors = self._optional_research_call(
-                    opensea_client.get_collection_floor_prices, client, slug
-                )
-                nfts_payload = self._optional_research_call(
-                    opensea_client.get_collection_nfts, client, slug, limit=3
-                )
-                try:
-                    public_drop = opensea_client.get_public_drop_info(client, slug)
-                except Exception:
-                    public_drop = {}
+                # These reads are independent of one another, so issue them
+                # together rather than paying the sum of their latencies.
+                def _public_drop():
+                    try:
+                        return opensea_client.get_public_drop_info(client, slug)
+                    except Exception:
+                        return {}
+
+                with ThreadPoolExecutor(
+                    max_workers=5, thread_name_prefix="opensea-research"
+                ) as pool:
+                    collection_future = pool.submit(
+                        opensea_client.get_collection_details,
+                        client, slug, self.api_key,
+                    )
+                    stats_future = pool.submit(
+                        self._optional_research_call,
+                        opensea_client.get_collection_stats, client, slug,
+                    )
+                    floors_future = pool.submit(
+                        self._optional_research_call,
+                        opensea_client.get_collection_floor_prices, client, slug,
+                    )
+                    nfts_future = pool.submit(
+                        self._optional_research_call,
+                        opensea_client.get_collection_nfts, client, slug, limit=3,
+                    )
+                    drop_future = pool.submit(_public_drop)
+
+                    # The collection read is the only one whose failure is
+                    # fatal, so let it raise exactly as it did before.
+                    collection = collection_future.result()
+                    stats = stats_future.result()
+                    floors = floors_future.result()
+                    nfts_payload = nfts_future.result()
+                    public_drop = drop_future.result()
+
                 profiles = {}
                 identifiers = []
                 owner = collection.get("owner") if isinstance(collection, dict) else None
@@ -1337,13 +1325,26 @@ class DailyMintService:
                             self._account_identifier(item) for item in editors
                         ) if identifier
                     )
-                for identifier in identifiers[:3]:
-                    try:
-                        profiles[identifier] = opensea_client.get_account_profile(
+                wanted = identifiers[:3]
+                if wanted:
+                    def _profile(identifier):
+                        return opensea_client.get_account_profile(
                             client, identifier, self.api_key
                         )
-                    except Exception:
-                        continue
+
+                    with ThreadPoolExecutor(
+                        max_workers=len(wanted), thread_name_prefix="opensea-profile"
+                    ) as pool:
+                        futures = {
+                            pool.submit(_profile, identifier): identifier
+                            for identifier in wanted
+                        }
+                        for future in as_completed(futures):
+                            identifier = futures[future]
+                            try:
+                                profiles[identifier] = future.result()
+                            except Exception:
+                                continue
             finally:
                 client.close()
 

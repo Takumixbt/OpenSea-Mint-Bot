@@ -348,10 +348,20 @@ MONITORED_CHAINS = "all"
 # Discovery requests this many OpenSea drops per API page. The Telegram route
 # lists live stages plus stages opening today, including free, paid, and
 # restricted entries.
-DISCOVERY_WINDOW_HOURS = 24
-# A "today" scan still keeps at least this many hours of forward view. Pinning
-# the horizon to local midnight made an evening /scan return almost nothing,
-# which reads as a broken scan rather than a narrow window.
+# How far ahead /scan looks, as a rolling window from right now. This is not
+# anchored to midnight: a drop opening in four hours is equally interesting at
+# 09:00 and at 23:00. Widen it with DISCOVERY_WINDOW_HOURS in .env; OpenSea
+# publishes few drops more than a couple of days out, so 24 covers most of the
+# catalogue and 72 covers nearly all of it.
+try:
+    DISCOVERY_WINDOW_HOURS = float(os.getenv("DISCOVERY_WINDOW_HOURS", "24"))
+except (TypeError, ValueError):
+    raise ValueError("DISCOVERY_WINDOW_HOURS must be a number of hours")
+if not 1 <= DISCOVERY_WINDOW_HOURS <= 24 * 90:
+    raise ValueError("DISCOVERY_WINDOW_HOURS must be between 1 and 2160")
+
+# Floor applied when a caller still asks for a day-anchored scan, so an
+# evening scan cannot collapse to a few minutes of look-ahead.
 DISCOVERY_MIN_WINDOW_HOURS = 12
 # The global /drops cursor already covers every network, so the merged calendar
 # is cached for this long and filtered locally. Scanning a second network then

@@ -499,6 +499,53 @@ def invalidate_calendar():
         _CALENDAR_CACHE.update({"cards": None, "errors": [], "fetched_at": 0.0})
 
 
+def find_calendar_card(client, api_key, slug, chain=None):
+    """Return the merged calendar card for one slug, or None.
+
+    Reads the cached calendar rather than re-walking every feed cursor.
+    """
+    slug = str(slug or "").strip().lower()
+    if not slug:
+        return None
+    cards, _errors, _age = load_calendar(client, api_key)
+    if chain:
+        chain = str(chain).strip().lower()
+        return cards.get((chain, slug))
+    # The calendar is keyed by (chain, slug); a slug is unique across chains in
+    # practice, so fall back to the first chain that carries it.
+    for (card_chain, card_slug), card in cards.items():
+        if card_slug == slug:
+            return card
+    return None
+
+
+def calendar_card_to_info(card, slug):
+    """Shape a compact calendar card like a ``get_drop_info`` result."""
+    if not isinstance(card, dict):
+        return None
+    stages = _calendar_stages(card)
+    chain = str(card.get("chain") or "").strip().lower()
+    if not stages or not chain:
+        return None
+    metadata = _calendar_metadata(card)
+    metadata.update({
+        "drop_type": card.get("drop_type") or "",
+        "is_minting": card.get("is_minting"),
+        "details_verified": False,
+    })
+    return {
+        "slug": slug,
+        "name": _drop_name(card, slug),
+        "chain": chain,
+        "contract_address": card.get("contract_address") or "",
+        "opensea_url": (
+            card.get("opensea_url") or f"https://opensea.io/collection/{slug}"
+        ),
+        "metadata": metadata,
+        "stages": stages,
+    }
+
+
 def chain_coverage(client, api_key, chain_slugs=None, window_hours=None, force=False):
     """Return ``{chain: card_count}`` for networks with drops in the window.
 
