@@ -21,6 +21,10 @@ import config
 
 POA_CHAIN_IDS = {137}
 
+# The warm-up connectivity check retries on this schedule. It runs inside the
+# warm-up lead, never after the mint opens.
+WARMUP_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0)
+
 
 class Minter:
     def __init__(self, rpc_url, private_key, address, chain_id, rpc_urls=None):
@@ -57,9 +61,7 @@ class Minter:
         wallet's next transaction number ("nonce") so we don't wait on it at
         fire time.
         """
-        if not self.w3.is_connected():
-            raise RuntimeError("Cannot reach the blockchain. Check ALCHEMY_API_KEY in .env.")
-        live_chain_id = self.w3.eth.chain_id
+        live_chain_id = self._connect_with_retry()
         if live_chain_id != self.chain_id:
             raise RuntimeError(
                 f"Chain mismatch: config.py's TARGET_CHAIN_ID is {self.chain_id} but "
@@ -109,16 +111,39 @@ class Minter:
         self._warmed_at = time.monotonic()
         return live_chain_id, self._cached_nonce
 
+    def _connect_with_retry(self):
+        """Confirm the RPC is reachable, tolerating a transient blip.
+
+        Reading the chain id both proves connectivity and opens the connection
+        pool. This runs inside the warm-up lead, well before the opening, so
+        the retries can never delay a broadcast.
+        """
+        last_error = None
+        for attempt, pause in enumerate(WARMUP_RETRY_DELAYS_SECONDS, 1):
+            try:
+                return int(self.w3.eth.chain_id)
+            except Exception as exc:
+                last_error = exc
+                if attempt < len(WARMUP_RETRY_DELAYS_SECONDS):
+                    time.sleep(pause)
+        raise RuntimeError(
+            "Cannot reach the blockchain after "
+            f"{len(WARMUP_RETRY_DELAYS_SECONDS)} attempts "
+            f"({type(last_error).__name__}). Check ALCHEMY_API_KEY and the "
+            "network in .env."
+        ) from last_error
+
     def refresh_nonce(self):
         self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
         return self._cached_nonce
 
-    def refresh_submission_state(self, max_age_seconds=2.0):
-        """Refresh nonce and fee data immediately before the signing boundary.
+    def refresh_submission_state(self, max_age_seconds=10.0):
+        """Refresh nonce and fee data before the signing boundary.
 
-        A mint that is executed the moment it is warmed up would otherwise
-        repeat the same three RPC round trips microseconds apart, so a warm-up
-        newer than ``max_age_seconds`` is reused as-is.
+        Warm-up already read the nonce and fees, and it runs inside the same
+        warm-up lead as this call, so re-reading them a few seconds later costs
+        three RPC round trips - about three seconds on a slow chain - and
+        changes nothing. A warm-up newer than ``max_age_seconds`` is reused.
         """
         if (
             self._warmed_at is not None

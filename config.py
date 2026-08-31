@@ -82,10 +82,28 @@ TARGET_CHAIN_ID = 8453  # Base
 # to get close. A slow, polite poll - we are just watching the clock here.
 SCHEDULE_POLL_SECONDS = 5
 
-# How many seconds BEFORE the mint opens to start "warming up": opening the
-# network connections, pre-fetching the wallet's transaction number, and
-# confirming the chain id, so none of that slow work happens during the race.
-WARMUP_LEAD_SECONDS = 10
+# How many seconds BEFORE the mint opens to start "warming up": re-reading the
+# drop, opening the network connections, pre-fetching the wallet's transaction
+# number and fees, reading the SeaDrop stage, and signing, so none of that slow
+# work happens during the race.
+#
+# This has to be longer than the preparation actually takes, or the
+# transaction is signed after the opening and the mint is late. Measured on
+# Base from a home connection the full sequence took about 13 seconds; on a
+# VPS near the RPC provider it is closer to 1-2. The default leaves room for
+# the slow case because arming early costs nothing: execute() waits for the
+# exact opening instant before it broadcasts.
+#
+# The trade-off of a longer lead is that gas fees are read that much earlier.
+# The fee formula already carries 2x base-fee headroom and MAX_FEE_CAP_GWEI
+# still bounds the worst case, so this is safe; lower it only if you are on a
+# fast link and want the freshest possible fee reading.
+try:
+    WARMUP_LEAD_SECONDS = float(os.getenv("WARMUP_LEAD_SECONDS", "30"))
+except (TypeError, ValueError):
+    raise ValueError("WARMUP_LEAD_SECONDS must be a number of seconds")
+if not 1 <= WARMUP_LEAD_SECONDS <= 600:
+    raise ValueError("WARMUP_LEAD_SECONDS must be between 1 and 600")
 
 # How many seconds BEFORE the scheduled opening to leave the warm-up loop.
 # The supported Drops API rejects early requests with HTTP 409, so the first

@@ -354,6 +354,29 @@ class TelegramBot:
                 flush=True,
             )
 
+    def prewarm_calendar(self):
+        """Load the drop calendar in the background so the first scan is warm."""
+        reader = getattr(self.service, "chain_coverage", None)
+        if not callable(reader):
+            return
+
+        def warm():
+            try:
+                counts, _errors, _age = reader()
+                total = sum(counts.values())
+                print(
+                    f"Drop calendar ready: {total} drops across "
+                    f"{len(counts)} network(s).",
+                    flush=True,
+                )
+            except Exception as exc:
+                # Failing to pre-warm is not fatal; the first scan will simply
+                # pay the cold read itself.
+                print(f"Drop calendar prewarm skipped ({type(exc).__name__}).",
+                      flush=True)
+
+        threading.Thread(target=warm, name="calendar-prewarm", daemon=True).start()
+
     def run_forever(self):
         self.api.call("deleteWebhook", {"drop_pending_updates": False}, timeout=15)
         self.api.call(
@@ -361,6 +384,7 @@ class TelegramBot:
             {"commands": self.command_menu()},
             timeout=15,
         )
+        self.prewarm_calendar()
         print("Telegram bot is running. Press Ctrl-C to stop.", flush=True)
         while True:
             try:

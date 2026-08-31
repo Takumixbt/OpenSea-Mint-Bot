@@ -1079,6 +1079,100 @@ class DailyRunnerSafetyTests(unittest.TestCase):
             daily_runner.ROOT = original_root
 
 
+class MinterLaunchTests(unittest.TestCase):
+    """The launch path must survive a blip and must not repeat warm-up reads."""
+
+    def _minter(self, chain_calls):
+        import minter as minter_module
+
+        class FakeEth:
+            def __init__(self):
+                self.reads = []
+
+            @property
+            def chain_id(self):
+                self.reads.append("chain_id")
+                result = chain_calls.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            def get_transaction_count(self, *a, **k):
+                self.reads.append("nonce")
+                return 3
+
+            def get_balance(self, *a, **k):
+                self.reads.append("balance")
+                return 10 ** 18
+
+            def get_block(self, *a, **k):
+                self.reads.append("block")
+                return {"baseFeePerGas": 10 ** 9}
+
+            @property
+            def max_priority_fee(self):
+                self.reads.append("tip")
+                return 10 ** 9
+
+        class FakeW3:
+            def __init__(self, *a, **k):
+                self.eth = FakeEth()
+                self.middleware_onion = type(
+                    "M", (), {"inject": lambda *a, **k: None}
+                )()
+
+            @staticmethod
+            def HTTPProvider(*a, **k):
+                return object()
+
+            @staticmethod
+            def to_checksum_address(value):
+                return "0x" + "1" * 40
+
+            @staticmethod
+            def to_wei(value, unit):
+                return int(float(value) * 10 ** 9)
+
+        with patch.object(minter_module, "Web3", FakeW3), patch.object(
+            minter_module, "WARMUP_RETRY_DELAYS_SECONDS", (0, 0, 0, 0)
+        ):
+            instance = minter_module.Minter(
+                "https://rpc.test", "0x" + "11" * 32, "0x" + "1" * 40, 8453
+            )
+            yield_value = instance
+        return yield_value
+
+    def test_warm_up_survives_a_transient_rpc_blip(self):
+        """One failed connectivity check must not destroy a scheduled mint."""
+        minter = self._minter([
+            ConnectionError("blip"), ConnectionError("blip"), 8453,
+        ])
+        live_chain, nonce = minter.warm_up()
+        self.assertEqual(live_chain, 8453)
+        self.assertEqual(nonce, 3)
+
+    def test_warm_up_gives_up_after_the_retry_budget(self):
+        minter = self._minter([ConnectionError("down")] * 8)
+        with self.assertRaises(RuntimeError) as caught:
+            minter.warm_up()
+        self.assertIn("Cannot reach the blockchain", str(caught.exception))
+
+    def test_submission_state_is_not_re_read_right_after_warm_up(self):
+        """Re-reading nonce and fees seconds later costs time and changes nothing."""
+        minter = self._minter([8453])
+        minter.warm_up()
+        before = list(minter.w3.eth.reads)
+        minter.refresh_submission_state()
+        self.assertEqual(minter.w3.eth.reads, before)
+
+    def test_submission_state_is_re_read_once_the_warm_up_is_stale(self):
+        minter = self._minter([8453])
+        minter.warm_up()
+        before = len(minter.w3.eth.reads)
+        minter.refresh_submission_state(max_age_seconds=0)
+        self.assertGreater(len(minter.w3.eth.reads), before)
+
+
 class DiscoverySafetyTests(unittest.TestCase):
     def test_blank_monitored_chains_falls_back_to_every_evm_network(self):
         with patch.dict(os.environ, {"MONITORED_CHAINS": ""}, clear=False):
