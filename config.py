@@ -75,7 +75,7 @@ TARGET_CHAIN_ID = 8453  # Base
 
 
 # ---------------------------------------------------------------------------
-# TIMING (mirrors the approach in the article the bot is based on)
+# TIMING
 # ---------------------------------------------------------------------------
 
 # How often (in seconds) to re-check the drop's schedule while we wait for it

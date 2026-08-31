@@ -751,7 +751,7 @@ class TelegramSafetyTests(unittest.TestCase):
             "total_supply": 5,
             "max_supply": 135,
             "stats_total": {"num_owners": 0},
-            "twitter_url": "https://x.com/OrangeHare_io",
+            "twitter_url": "https://x.com/example",
             "discord_url": "https://discord.gg/example",
         })
 
