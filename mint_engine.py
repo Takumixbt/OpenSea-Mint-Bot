@@ -48,7 +48,8 @@ class MintEngine:
         # back to the existing OpenSea route below.
         def warm_rpc():
             live_chain, nonce = minter.warm_up()
-            return live_chain, nonce, minter.native_balance()
+            # warm_up() already primed the balance; reuse that read.
+            return live_chain, nonce, minter.native_balance(max_age_seconds=5.0)
 
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mint-warmup") as pool:
             rpc_future = pool.submit(warm_rpc)
@@ -91,6 +92,10 @@ class MintEngine:
                 float(calldata.get("start_time") or 0),
             )
             request_started_at = time.time()
+            # Warm-up is captured early for latency, then nonce/fees are
+            # refreshed at the signing boundary so a wallet-side pending tx or
+            # fee spike cannot make the prepared transaction stale.
+            minter.refresh_submission_state()
             signed, summary = minter.build_transaction(
                 calldata["to"],
                 calldata["data"],
@@ -112,6 +117,9 @@ class MintEngine:
                         self.opensea_api_key,
                     )
                 launch_at = float(scheduled_at or 0)
+                # Nonce and fees do not depend on the calldata, so refresh them
+                # while still waiting rather than after the opening.
+                minter.refresh_submission_state()
                 if launch_at > time.time():
                     self._wait_until(launch_at)
                 request_started_at = time.time()
@@ -130,6 +138,9 @@ class MintEngine:
                 calldata["data"],
                 calldata["value"],
                 approved_value_wei=self._approved_value(candidate, quantity),
+                # Reuse the warm-up balance rather than paying for a round trip
+                # between the opening and the broadcast.
+                balance_max_age_seconds=float(config.WARMUP_LEAD_SECONDS) + 5.0,
             )
 
         # Direct SeaDrop signs before the opening; the fallback signs after

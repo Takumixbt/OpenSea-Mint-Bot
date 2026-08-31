@@ -11,6 +11,7 @@ The private key is used only to sign, in memory. It is never printed or saved.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -42,6 +43,12 @@ class Minter:
         self._cached_gas_fees = None
         self.last_receipt = None
         self.last_broadcast_count = 0
+        # Providers for the extra broadcast endpoints, built during warm-up so
+        # no connection setup happens on the launch path.
+        self._providers = {self.rpc_url: self.w3}
+        self._warmed_at = None
+        self._cached_balance = None
+        self._balance_read_at = None
 
     def warm_up(self):
         """
@@ -63,11 +70,13 @@ class Minter:
             # Never blast a transaction at an endpoint that reports a
             # different chain. A wrong-chain raw transaction cannot spend
             # funds, but filtering it keeps the launch path predictable.
-            def endpoint_chain_id(url):
+            def endpoint_provider(url):
                 provider = Web3(
                     Web3.HTTPProvider(url, request_kwargs={"timeout": 8})
                 )
-                return int(provider.eth.chain_id)
+                # Reading the chain id both validates the endpoint and opens
+                # its TLS connection, so the pool is hot before launch.
+                return provider, int(provider.eth.chain_id)
 
             verified = {self.rpc_url}
             with ThreadPoolExecutor(
@@ -75,16 +84,18 @@ class Minter:
                 thread_name_prefix="rpc-check",
             ) as pool:
                 futures = {
-                    pool.submit(endpoint_chain_id, url): url
+                    pool.submit(endpoint_provider, url): url
                     for url in self.rpc_urls[1:]
                 }
                 for future in as_completed(futures):
                     url = futures[future]
                     try:
-                        if future.result() == int(self.chain_id):
-                            verified.add(url)
+                        provider, endpoint_chain = future.result()
                     except Exception:
                         continue
+                    if endpoint_chain == int(self.chain_id):
+                        verified.add(url)
+                        self._providers[url] = provider
             # Preserve the configured order after concurrent verification.
             self.rpc_urls = [url for url in self.rpc_urls if url in verified]
         # "pending" so that if this wallet somehow has a transaction already
@@ -94,15 +105,51 @@ class Minter:
         # Fetch fee data during warm-up so the critical path needs only gas
         # estimation and the final balance guard after calldata arrives.
         self._cached_gas_fees = self._gas_fees(refresh=True)
+        self.native_balance()
+        self._warmed_at = time.monotonic()
         return live_chain_id, self._cached_nonce
 
     def refresh_nonce(self):
         self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
         return self._cached_nonce
 
-    def native_balance(self):
-        """Return the wallet's native-coin balance without signing anything."""
-        return self.w3.eth.get_balance(self.address)
+    def refresh_submission_state(self, max_age_seconds=2.0):
+        """Refresh nonce and fee data immediately before the signing boundary.
+
+        A mint that is executed the moment it is warmed up would otherwise
+        repeat the same three RPC round trips microseconds apart, so a warm-up
+        newer than ``max_age_seconds`` is reused as-is.
+        """
+        if (
+            self._warmed_at is not None
+            and self._cached_nonce is not None
+            and self._cached_gas_fees is not None
+            and time.monotonic() - self._warmed_at <= float(max_age_seconds)
+        ):
+            return self._cached_nonce, self._cached_gas_fees
+        self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
+        self._cached_gas_fees = self._gas_fees(refresh=True)
+        self._warmed_at = time.monotonic()
+        return self._cached_nonce, self._cached_gas_fees
+
+    def native_balance(self, max_age_seconds=0.0):
+        """Return the wallet's native-coin balance without signing anything.
+
+        ``max_age_seconds`` lets the launch path reuse a balance read taken
+        during warm-up instead of paying for a round trip after the opening.
+        The value is only ever used to refuse an underfunded transaction, so a
+        few seconds of staleness cannot authorize a larger spend.
+        """
+        if (
+            max_age_seconds
+            and self._cached_balance is not None
+            and self._balance_read_at is not None
+            and time.monotonic() - self._balance_read_at <= float(max_age_seconds)
+        ):
+            return self._cached_balance
+        self._cached_balance = self.w3.eth.get_balance(self.address)
+        self._balance_read_at = time.monotonic()
+        return self._cached_balance
 
     def funding_preview(self, mint_value_wei=0):
         """Return a read-only funding envelope; never build, sign, or send."""
@@ -168,6 +215,7 @@ class Minter:
         approved_value_wei=None,
         max_value_wei=None,
         value_label="mint",
+        balance_max_age_seconds=0.0,
     ):
         """
         Build the signed-but-not-yet-sent transaction from OpenSea's calldata.
@@ -189,6 +237,18 @@ class Minter:
                 f"chain's coin, above the configured hard cap of {cap_wei} wei. "
                 "Nothing was signed or sent."
             )
+        if not Web3.is_address(to):
+            raise RuntimeError("the mint route returned an invalid transaction target; nothing was signed")
+        if isinstance(data, bytes):
+            data = Web3.to_hex(data)
+        if (
+            not isinstance(data, str)
+            or not data.startswith("0x")
+            or len(data) < 6
+            or len(data[2:]) % 2
+            or any(char not in "0123456789abcdefABCDEF" for char in data[2:])
+        ):
+            raise RuntimeError("the mint route returned invalid calldata; nothing was signed")
         if self._cached_nonce is None:
             self._cached_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
 
@@ -221,7 +281,7 @@ class Minter:
         # mint value and this transaction's worst-case gas envelope. This is a
         # read-only balance check; no transaction exists yet.
         required_balance = tx["value"] + tx["gas"] * tx["maxFeePerGas"]
-        available_balance = self.native_balance()
+        available_balance = self.native_balance(balance_max_age_seconds)
         if available_balance < required_balance:
             required_native = self.w3.from_wei(required_balance, "ether")
             available_native = self.w3.from_wei(available_balance, "ether")
@@ -261,9 +321,12 @@ class Minter:
             raw = signed_tx.rawTransaction
 
         def send_one(url):
-            provider = self.w3 if url == self.rpc_url else Web3(
-                Web3.HTTPProvider(url, request_kwargs={"timeout": 8})
-            )
+            # Warm-up already opened these connections. Building a provider
+            # here would put a TLS handshake inside the launch window.
+            provider = self._providers.get(url)
+            if provider is None:
+                provider = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 8}))
+                self._providers[url] = provider
             return Web3.to_hex(provider.eth.send_raw_transaction(raw))
 
         if len(self.rpc_urls) == 1:
