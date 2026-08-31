@@ -1,128 +1,363 @@
-"""Generate a compact Telegram image card for an NFT mint preview.
+"""Generate the Telegram image card for a mint preview or a mint receipt.
 
-The card is intentionally a summary. Telegram buttons and the HTML caption
-carry the clickable links because pixels inside a JPEG cannot be made into
-reliable embedded links.
+The card is a summary, not a link surface: Telegram buttons and the HTML
+caption carry every clickable link, because pixels inside a JPEG cannot.
+
+Layout is deliberately artwork-first. The NFT being minted is the largest
+element on the card, because that is the thing the operator actually wants to
+see. Everything else - status, price, access, supply - sits in a single left
+rail so the card stays readable on a phone.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import io
 import os
+import time
 from pathlib import Path
 import tempfile
 import uuid
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-DEFAULT_ACCENT = "#63E6BE"
 PERSISTENT_BACKGROUND = Path(__file__).resolve().parent / "state" / "nft-card-background.jpg"
+
+# Warm swamp palette. Deep moss ground, cream type, amber accent: readable at
+# Telegram's preview size and in both light and dark chat themes.
+INK = (18, 26, 21, 255)
+MOSS_DEEP = (24, 38, 30)
+MOSS = (47, 79, 53)
+CREAM = (239, 230, 208, 255)
+CREAM_DIM = (176, 178, 152, 255)
+AMBER = "#E0A458"
+FROG = (122, 168, 87, 255)
+
+STATUS_COLORS = {
+    "confirmed": (122, 168, 87, 255),
+    "sent": (224, 164, 88, 255),
+    "reverted": (198, 88, 74, 255),
+    "free": (122, 168, 87, 255),
+    "paid": (224, 164, 88, 255),
+    "unknown": (176, 178, 152, 255),
+}
 
 
 def build_mint_card(candidate, research=None, output_dir=None):
     """Create a JPEG summary card and return its temporary path."""
     candidate = dict(candidate or {})
     research = dict(research or {})
-    background_source = os.getenv("NFT_CARD_BACKGROUND", "").strip()
-    if not background_source and PERSISTENT_BACKGROUND.is_file():
-        background_source = str(PERSISTENT_BACKGROUND)
-    background = _load_image(background_source) if background_source else None
-    if background is None:
-        background = _gradient_background()
-    background = _cover(background.convert("RGB"), CARD_WIDTH, CARD_HEIGHT)
+    accent = _parse_color(os.getenv("NFT_CARD_ACCENT_COLOR", AMBER), AMBER)
 
-    image = background.convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (6, 10, 20, 145))
-    image = Image.alpha_composite(image, overlay)
-    draw = ImageDraw.Draw(image)
-
-    accent = _parse_color(os.getenv("NFT_CARD_ACCENT_COLOR", DEFAULT_ACCENT), DEFAULT_ACCENT)
-    white = (245, 248, 252, 255)
-    muted = (185, 198, 215, 255)
-    panel = (9, 17, 31, 205)
-    panel_light = (18, 30, 49, 190)
-
-    draw.rounded_rectangle((38, 34, CARD_WIDTH - 38, CARD_HEIGHT - 34), radius=30,
-                           fill=(5, 11, 22, 105), outline=accent, width=2)
-    draw.rounded_rectangle((64, 60, CARD_WIDTH - 64, 148), radius=22,
-                           fill=panel)
+    image = _background()
     receipt_status = str(candidate.get("receipt_status") or "").strip().lower()
-    header = "NFT MINT P&L" if receipt_status else "NFT MINT CARD"
-    draw.text((92, 79), header, font=_font(24, bold=True), fill=accent)
-    brand = os.getenv("NFT_CARD_BRAND_NAME", "NFT Mint Bot").strip() or "NFT Mint Bot"
-    brand_width = _text_width(draw, brand, _font(23, bold=True))
-    draw.text((CARD_WIDTH - 92 - brand_width, 82), brand,
-              font=_font(23, bold=True), fill=muted)
+    artwork = _load_image(_nft_image_source(candidate, research))
+    if artwork is None:
+        artwork = _load_image(
+            str(research.get("image_url") or candidate.get("image_url") or "")
+        )
 
-    name = str(candidate.get("name") or research.get("name") or candidate.get("slug") or "NFT mint")
-    draw.text((92, 176), _clip(name, 40), font=_font(40, bold=True), fill=white)
-    chain = str(candidate.get("chain") or "unknown").replace("_", " ").replace("-", " ").title()
-    stage = str(candidate.get("stage_label") or "Stage unknown")
-    draw.text((94, 228), f"{chain}  ·  {stage}", font=_font(23), fill=muted)
-
-    # A small collection image is useful when the user has not supplied a
-    # custom background. It is also kept optional so a broken CDN cannot block
-    # card generation.
-    image_url = research.get("image_url") or candidate.get("image_url")
-    logo = _load_image(str(image_url or ""))
-    if logo is not None:
-        logo = ImageOps.fit(logo.convert("RGB"), (142, 142), method=_resample())
-        logo_mask = Image.new("L", (142, 142), 0)
-        ImageDraw.Draw(logo_mask).rounded_rectangle((0, 0, 141, 141), radius=24, fill=255)
-        logo_rgba = logo.convert("RGBA")
-        image.paste(logo_rgba, (CARD_WIDTH - 92 - 142, 180), logo_mask)
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((CARD_WIDTH - 92 - 142, 180, CARD_WIDTH - 92, 322),
-                               radius=24, outline=accent, width=2)
-
-    draw.rounded_rectangle((84, 292, 610, 590), radius=24, fill=panel)
-    draw.rounded_rectangle((638, 292, CARD_WIDTH - 84, 590), radius=24, fill=panel_light)
-
-    if receipt_status:
-        left_fields = [
-            ("STATUS", _receipt_status(candidate)),
-            ("MINT VALUE", str(candidate.get("mint_value_display") or candidate.get("price_display") or "Unknown")),
-            ("GAS ENVELOPE", str(candidate.get("gas_display") or "Unknown")),
-            ("QUANTITY", str(candidate.get("quantity") or 1)),
-            ("MINTED", _time(candidate.get("minted_at"))),
-        ]
-    else:
-        left_fields = [
-            ("STATUS", _status(candidate)),
-            ("PRICE", str(candidate.get("price_display") or "Price unknown")),
-            ("ACCESS", str(candidate.get("access_label") or "Unknown")),
-            ("QUANTITY", str(candidate.get("quantity") or 1)),
-            ("OPENS", _time(candidate.get("start_time"))),
-        ]
-    if receipt_status:
-        right_fields = [
-            ("TOTAL SPENT", str(candidate.get("spent_display") or "Unknown")),
-            ("FLOOR VALUE", str(candidate.get("floor_value_display") or "Unavailable")),
-            ("EST. P&L", str(candidate.get("pnl_display") or "Unavailable")),
-            ("FLOOR", _floor(research)),
-            ("CONTRACT", _short_address(research.get("contract_address") or candidate.get("contract_address"))),
-        ]
-    else:
-        right_fields = [
-            ("SUPPLY", _supply(candidate, research)),
-            ("FLOOR", _floor(research)),
-            ("24H VOLUME", _volume(research)),
-            ("OWNERS", _owners(research)),
-            ("CONTRACT", _short_address(research.get("contract_address") or candidate.get("contract_address"))),
-        ]
-    _draw_fields(draw, left_fields, 112, 312, 53, accent, white, muted)
-    _draw_fields(draw, right_fields, 666, 312, 53, accent, white, muted)
+    _draw_frame(image, accent)
+    _draw_header(image, candidate, research, accent, receipt_status)
+    art_box = _draw_artwork(image, artwork, accent)
+    _draw_identity(image, candidate, research, accent)
+    _draw_rail(image, candidate, research, accent, receipt_status)
+    _draw_footer(image, candidate, research, accent)
+    _draw_mascot(image, receipt_status, candidate, art_box)
 
     output_root = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"opensea-mint-card-{uuid.uuid4().hex[:12]}.jpg"
-    image.convert("RGB").save(output_path, format="JPEG", quality=91, optimize=True)
+    image.convert("RGB").save(output_path, format="JPEG", quality=92, optimize=True)
     return output_path
 
+
+# ---------------------------------------------------------------------------
+# Background and frame
+# ---------------------------------------------------------------------------
+
+def _background():
+    """Return the card ground: a custom image if installed, else the palette."""
+    source = os.getenv("NFT_CARD_BACKGROUND", "").strip()
+    if not source and PERSISTENT_BACKGROUND.is_file():
+        source = str(PERSISTENT_BACKGROUND)
+    custom = _load_image(source) if source else None
+    if custom is not None:
+        base = _cover(custom.convert("RGB"), CARD_WIDTH, CARD_HEIGHT).convert("RGBA")
+        # A custom photo must not fight the type, so sit it behind a heavy
+        # moss veil rather than using it at full strength.
+        veil = Image.new("RGBA", base.size, MOSS_DEEP + (208,))
+        return Image.alpha_composite(base, veil)
+
+    base = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT))
+    draw = ImageDraw.Draw(base)
+    for y in range(CARD_HEIGHT):
+        mix = y / max(1, CARD_HEIGHT - 1)
+        draw.line(
+            (0, y, CARD_WIDTH, y),
+            fill=tuple(
+                int(MOSS_DEEP[channel] + (MOSS[channel] - MOSS_DEEP[channel]) * mix)
+                for channel in range(3)
+            ),
+        )
+    return _add_grain(base).convert("RGBA")
+
+
+def _add_grain(image):
+    """Add a faint vignette so flat gradients do not band on Telegram's JPEG."""
+    glow = Image.new("L", (CARD_WIDTH, CARD_HEIGHT), 0)
+    ImageDraw.Draw(glow).ellipse(
+        (-260, -420, CARD_WIDTH + 260, CARD_HEIGHT + 120), fill=58
+    )
+    glow = glow.filter(ImageFilter.GaussianBlur(150))
+    warm = Image.new("RGB", image.size, (96, 132, 84))
+    return Image.composite(warm, image, glow.point(lambda value: value // 3))
+
+
+def _soft_rect(image, box, radius, fill=None, outline=None, width=1):
+    """Blend a translucent rounded rectangle onto the card.
+
+    ImageDraw sets pixels rather than compositing them, so a translucent fill
+    drawn directly would survive as an opaque block once the card is flattened
+    to JPEG. Drawing onto a scratch layer and alpha-compositing keeps the
+    transparency real.
+    """
+    layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        box, radius=radius, fill=fill, outline=outline, width=width
+    )
+    image.alpha_composite(layer)
+
+
+def _soft_line(image, box, fill, width=1):
+    """Blend a translucent hairline onto the card."""
+    layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).line(box, fill=fill, width=width)
+    image.alpha_composite(layer)
+
+
+def _draw_frame(image, accent):
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (26, 26, CARD_WIDTH - 26, CARD_HEIGHT - 26),
+        radius=34, outline=accent, width=3,
+    )
+    _soft_rect(
+        image, (36, 36, CARD_WIDTH - 36, CARD_HEIGHT - 36),
+        27, outline=_alpha(CREAM, 46), width=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Header, artwork, identity
+# ---------------------------------------------------------------------------
+
+def _draw_header(image, candidate, research, accent, receipt_status):
+    draw = ImageDraw.Draw(image)
+    status_text, status_key = _status(candidate, receipt_status)
+    color = STATUS_COLORS.get(status_key, STATUS_COLORS["unknown"])
+
+    font = _font(21, bold=True)
+    pill_top, pill_height, pad_x = 60, 44, 22
+    width = _text_width(draw, status_text, font) + pad_x * 2 + 24
+    _soft_rect(
+        image, (64, pill_top, 64 + width, pill_top + pill_height),
+        pill_height // 2, fill=_alpha(color, 52),
+    )
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (64, pill_top, 64 + width, pill_top + pill_height),
+        radius=pill_height // 2, outline=color, width=2,
+    )
+    draw.ellipse(
+        (64 + pad_x - 4, pill_top + 17, 64 + pad_x + 6, pill_top + 27), fill=color
+    )
+    draw.text((64 + pad_x + 18, pill_top + 11), status_text, font=font, fill=CREAM)
+
+    brand = os.getenv("NFT_CARD_BRAND_NAME", "").strip() or "MINT BOT"
+    brand_font = _font(19, bold=True)
+    brand_width = _text_width(draw, brand, brand_font)
+    _soft_text(
+        image, (CARD_WIDTH - 64 - brand_width, pill_top + 14),
+        brand, brand_font, _alpha(CREAM, 130),
+    )
+
+
+def _soft_text(image, position, text, font, fill):
+    """Blend translucent text so faint labels do not flatten to solid."""
+    layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text(position, text, font=font, fill=fill)
+    image.alpha_composite(layer)
+
+
+def _draw_artwork(image, artwork, accent):
+    """Place the NFT art as the hero element and return its box."""
+    box = (700, 132, CARD_WIDTH - 64, CARD_HEIGHT - 96)
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    draw = ImageDraw.Draw(image)
+
+    if artwork is None:
+        _soft_rect(image, box, 26, fill=_alpha(INK, 130),
+                   outline=_alpha(CREAM, 52), width=2)
+        label = "ARTWORK UNAVAILABLE"
+        font = _font(19, bold=True)
+        _soft_text(
+            image,
+            (left + (width - _text_width(draw, label, font)) // 2, top + height // 2 - 10),
+            label, font, _alpha(CREAM, 120),
+        )
+        return box
+
+    # A soft drop shadow lifts the art off the ground without a hard border.
+    shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (left + 8, top + 14, right + 8, bottom + 14), radius=26, fill=(0, 0, 0, 120)
+    )
+    image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(18)))
+
+    fitted = ImageOps.fit(artwork.convert("RGB"), (width, height), method=_resample())
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=26, fill=255)
+    image.paste(fitted.convert("RGBA"), (left, top), mask)
+
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(box, radius=26, outline=accent, width=3)
+    return box
+
+
+def _draw_identity(image, candidate, research, accent):
+    draw = ImageDraw.Draw(image)
+    name = str(
+        candidate.get("name") or research.get("name") or candidate.get("slug") or "NFT mint"
+    )
+    # Two lines of a large face beats one clipped line: collection names are
+    # long and the name is the first thing read.
+    lines = _wrap(draw, name, _font(43, bold=True), 560, max_lines=2)
+    y = 140
+    for line in lines:
+        draw.text((66, y), line, font=_font(43, bold=True), fill=CREAM)
+        y += 50
+
+    chain = str(candidate.get("chain") or "unknown").replace("_", " ").replace("-", " ").title()
+    stage = str(candidate.get("stage_label") or "Stage unknown")
+    _soft_text(
+        image, (68, y + 6), _clip(f"{chain}  \u00b7  {stage}", 46),
+        _font(21), _alpha(CREAM_DIM, 240),
+    )
+
+
+def _draw_rail(image, candidate, research, accent, receipt_status):
+    """One left-hand column of label/value pairs, ordered by what matters."""
+    if receipt_status:
+        fields = [
+            ("PAID", str(candidate.get("mint_value_display")
+                         or candidate.get("price_display") or "Unknown")),
+            ("NETWORK FEE", str(candidate.get("gas_display") or "Unknown")),
+            ("QUANTITY", str(candidate.get("quantity") or 1)),
+            ("EST. P&L", str(candidate.get("pnl_display") or "Unavailable")),
+        ]
+    else:
+        fields = [
+            ("PRICE", str(candidate.get("price_display") or "Price unknown")),
+            ("ACCESS", str(candidate.get("access_label") or "Unknown")),
+            ("QUANTITY", str(candidate.get("quantity") or 1)),
+            _timing_field(candidate),
+        ]
+
+    top, row_height = 296, 68
+    bottom = top + row_height * len(fields)
+    _soft_rect(image, (56, top - 20, 648, bottom + 6), 22, fill=_alpha(INK, 128))
+
+    draw = ImageDraw.Draw(image)
+    label_font, value_font = _font(15, bold=True), _font(26, bold=True)
+    y = top
+    for index, (label, value) in enumerate(fields):
+        draw.text((84, y), label, font=label_font, fill=accent)
+        draw.text((84, y + 23), _clip(value, 29), font=value_font, fill=CREAM)
+        if index < len(fields) - 1:
+            # The rule belongs at the row boundary. Sitting it just under the
+            # value made every value look underlined.
+            rule_y = y + row_height - 8
+            _soft_line(image, (84, rule_y, 620, rule_y), _alpha(CREAM, 30), width=1)
+        y += row_height
+
+
+def _draw_footer(image, candidate, research, accent):
+    supply = _supply(candidate, research)
+    contract = _short_address(
+        research.get("contract_address") or candidate.get("contract_address")
+    )
+    parts = []
+    if supply != "Unknown":
+        parts.append(f"Supply {supply}")
+    floor = _floor(research)
+    if floor != "Unknown":
+        parts.append(f"Floor {floor}")
+    if contract != "Unknown":
+        parts.append(contract)
+    if not parts:
+        return
+    _soft_text(
+        image, (66, CARD_HEIGHT - 92),
+        _clip("  \u00b7  ".join(parts), 52), _font(19), _alpha(CREAM_DIM, 210),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mascot
+# ---------------------------------------------------------------------------
+
+def _draw_mascot(image, receipt_status, candidate, art_box):
+    """Draw the frog badge whose expression follows the mint outcome.
+
+    It is drawn from primitives rather than shipped as an asset so the repo
+    stays dependency-free and the badge always matches the palette.
+    """
+    _status_text, key = _status(candidate, receipt_status)
+    size = 84
+    # Overlap the artwork's top-left corner so the badge belongs to the art
+    # rather than floating in the gap between the two columns.
+    left = art_box[0] - size // 2
+    top = art_box[1] - size // 3
+
+    badge = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(badge)
+    body = STATUS_COLORS.get(key, FROG)
+
+    draw.ellipse((4, 10, size - 4, size - 4), fill=body)
+    # Eyes sit on top of the head like a frog's, which is what makes the
+    # silhouette read as apu rather than as a generic circle.
+    for eye_x in (18, size - 46):
+        draw.ellipse((eye_x, 2, eye_x + 28, 30), fill=body)
+        draw.ellipse((eye_x + 7, 9, eye_x + 21, 23), fill=(250, 250, 245, 255))
+        draw.ellipse((eye_x + 12, 13, eye_x + 20, 21), fill=(20, 24, 20, 255))
+
+    mouth_y = size - 32
+    if key in {"confirmed", "free"}:
+        draw.arc((22, mouth_y - 18, size - 22, mouth_y + 10), 15, 165,
+                 fill=(20, 30, 22, 255), width=4)
+    elif key == "reverted":
+        draw.arc((22, mouth_y - 2, size - 22, mouth_y + 26), 195, 345,
+                 fill=(20, 30, 22, 255), width=4)
+    else:
+        draw.line((26, mouth_y + 2, size - 26, mouth_y + 2),
+                  fill=(20, 30, 22, 255), width=4)
+
+    ring = Image.new("RGBA", (size + 16, size + 16), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse(
+        (0, 0, size + 15, size + 15), fill=MOSS_DEEP + (255,), outline=body, width=3
+    )
+    ring.alpha_composite(badge, (8, 8))
+    image.alpha_composite(ring, (int(left) - 8, int(top) - 8))
+
+
+# ---------------------------------------------------------------------------
+# Background installation (unchanged public API)
+# ---------------------------------------------------------------------------
 
 def install_card_background(source):
     """Validate and persist a custom background from a local path or URL."""
@@ -147,14 +382,62 @@ def clear_card_background():
         return False
 
 
-def _draw_fields(draw, fields, x, y, row_height, accent, white, muted):
-    label_font = _font(16, bold=True)
-    value_font = _font(23, bold=True)
-    for label, value in fields:
-        draw.text((x, y), label, font=label_font, fill=accent)
-        value = _clip(str(value or "—"), 27)
-        draw.text((x, y + 25), value, font=value_font, fill=white)
-        y += row_height
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+def _status(candidate, receipt_status=None):
+    """Return ``(display_text, palette_key)`` for the card's status pill."""
+    receipt_status = str(
+        receipt_status if receipt_status is not None
+        else candidate.get("receipt_status") or ""
+    ).strip().lower()
+    if receipt_status:
+        return {
+            "confirmed": ("MINTED", "confirmed"),
+            "sent": ("BROADCAST", "sent"),
+            "reverted": ("REVERTED", "reverted"),
+        }.get(receipt_status, (receipt_status.upper(), "unknown"))
+    try:
+        if int(candidate.get("price_wei")) == 0:
+            return "FREE MINT", "free"
+    except (TypeError, ValueError):
+        pass
+    if str(candidate.get("price_display") or "").strip():
+        return "PAID MINT", "paid"
+    return "CHECK PRICE", "unknown"
+
+
+def _nft_image_source(candidate, research):
+    """Find an explicit NFT image without mistaking a collection logo for one."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    research = research if isinstance(research, dict) else {}
+
+    def image_from(item):
+        if not isinstance(item, dict):
+            return ""
+        for key in (
+            "image_original_url", "image_url", "display_image_url",
+            "image_preview_url", "image", "imageUrl",
+            "nft_image_url", "token_image_url", "asset_image_url",
+        ):
+            value = str(item.get(key) or "").strip()
+            if value.startswith(("https://", "http://")) or Path(value).is_file():
+                return value
+        return ""
+
+    source = image_from(research.get("asset_nft"))
+    if source:
+        return source
+    for sample in research.get("sample_nfts") or []:
+        source = image_from(sample)
+        if source:
+            return source
+    for key in ("nft_image_url", "token_image_url", "asset_image_url"):
+        source = image_from({key: candidate.get(key)})
+        if source:
+            return source
+    return ""
 
 
 def _load_image(source):
@@ -178,26 +461,16 @@ def _load_image(source):
         return None
 
 
-def _gradient_background():
-    image = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT))
-    draw = ImageDraw.Draw(image)
-    for y in range(CARD_HEIGHT):
-        mix = y / max(1, CARD_HEIGHT - 1)
-        color = (
-            int(8 + 22 * mix),
-            int(30 - 12 * mix),
-            int(70 - 32 * mix),
-        )
-        draw.line((0, y, CARD_WIDTH, y), fill=color)
-    return image
-
-
 def _cover(image, width, height):
     return ImageOps.fit(image, (width, height), method=_resample(), centering=(0.5, 0.5))
 
 
 def _resample():
     return getattr(Image, "Resampling", Image).LANCZOS
+
+
+def _alpha(color, value):
+    return tuple(color[:3]) + (int(value),)
 
 
 def _font(size, bold=False):
@@ -210,6 +483,8 @@ def _font(size, bold=False):
     candidates.extend([
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
         else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ])
     for candidate in candidates:
         try:
@@ -226,33 +501,43 @@ def _parse_color(value, fallback):
             return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4)) + (255,)
         except ValueError:
             pass
-    return _parse_color(fallback, "63E6BE") if fallback != value else (99, 230, 190, 255)
+    return _parse_color(fallback, "E0A458") if fallback != value else (224, 164, 88, 255)
 
 
-def _status(candidate):
+def _timing_field(candidate):
+    """Return the timing row, phrased for whether the stage is open yet.
+
+    Showing "OPENS" beside a timestamp that has already passed reads as though
+    the mint were still pending, so a live stage reports its closing time.
+    """
+    now = time.time()
+    start = _epoch(candidate.get("start_time"))
+    end = _epoch(candidate.get("end_time"))
+    if start is not None and start > now:
+        return "OPENS", _time(start)
+    if start is not None:
+        if end is None:
+            return "STATUS", "Live now"
+        if end >= now:
+            return "LIVE UNTIL", _time(end)
+        return "CLOSED", _time(end)
+    return "OPENS", "Unknown"
+
+
+def _epoch(value):
     try:
-        if int(candidate.get("price_wei")) == 0:
-            return "FREE MINT"
+        value = int(value)
     except (TypeError, ValueError):
-        pass
-    price = str(candidate.get("price_display") or "").strip()
-    return "PAID MINT" if price else "CHECK PRICE"
-
-
-def _receipt_status(candidate):
-    status = str(candidate.get("receipt_status") or "").lower()
-    return {
-        "confirmed": "CONFIRMED",
-        "reverted": "REVERTED",
-        "sent": "SENT / PENDING",
-    }.get(status, status.upper() or "UNKNOWN")
+        return None
+    return value if value > 0 else None
 
 
 def _time(value):
     try:
-        return datetime.fromtimestamp(int(value)).strftime("%d %b · %H:%M")
+        moment = datetime.fromtimestamp(int(value), timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         return "Unknown"
+    return moment.strftime("%d %b %H:%M UTC")
 
 
 def _supply(candidate, research):
@@ -265,10 +550,13 @@ def _floor(research):
     latest = research.get("latest_floor") or {}
     if not isinstance(latest, dict):
         latest = {}
-    # OpenSea's floor history rows contain ``floor_price`` in some versions
-    # and ``usd_price``/``symbol`` in others. Keep the card honest when only
-    # USD data is available.
-    amount = latest.get("token_unit") or latest.get("floor_price") or latest.get("price") or latest.get("usd_price")
+    # OpenSea's floor history rows carry ``floor_price`` in some versions and
+    # ``usd_price``/``symbol`` in others. Keep the card honest when only USD
+    # data is available.
+    amount = (
+        latest.get("token_unit") or latest.get("floor_price")
+        or latest.get("price") or latest.get("usd_price")
+    )
     unit = latest.get("symbol") or ("USD" if latest.get("usd_price") is not None else "")
     if amount is not None:
         return f"{amount} {unit or 'USD'}"
@@ -278,32 +566,45 @@ def _floor(research):
     return "Unknown"
 
 
-def _volume(research):
-    one_day = research.get("stats_one_day") or {}
-    if not isinstance(one_day, dict):
-        return "Unknown"
-    amount = one_day.get("volume")
-    symbol = one_day.get("volume_symbol") or one_day.get("symbol") or ""
-    return f"{amount} {symbol}".strip() if amount is not None else "Unknown"
-
-
-def _owners(research):
-    stats = research.get("stats_total") or {}
-    if not isinstance(stats, dict):
-        return "Unknown"
-    return str(stats.get("num_owners") or "Unknown")
-
-
 def _short_address(value):
     value = str(value or "").strip()
     if len(value) >= 12 and value.startswith("0x"):
-        return f"{value[:6]}…{value[-4:]}"
+        return f"{value[:6]}\u2026{value[-4:]}"
     return value or "Unknown"
 
 
 def _clip(value, length):
     text = " ".join(str(value or "").split())
-    return text if len(text) <= length else text[:length - 1].rstrip() + "…"
+    return text if len(text) <= length else text[:length - 1].rstrip() + "\u2026"
+
+
+def _wrap(draw, value, font, max_width, max_lines=2):
+    """Wrap to a pixel width so long collection names never overrun the rail."""
+    words = " ".join(str(value or "").split()).split(" ")
+    lines, current, truncated = [], "", False
+    for index, word in enumerate(words):
+        trial = f"{current} {word}".strip()
+        if current and _text_width(draw, trial, font) > max_width:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines:
+                # Words remain but there is no room for them, so the final
+                # line has to show that the name was cut rather than imply
+                # the collection is called something it is not.
+                truncated = index < len(words)
+                current = ""
+                break
+        else:
+            current = trial
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if not lines:
+        return [""]
+    if truncated:
+        lines[-1] = lines[-1].rstrip() + "\u2026"
+    while _text_width(draw, lines[-1], font) > max_width and len(lines[-1]) > 1:
+        lines[-1] = lines[-1][:-2].rstrip() + "\u2026"
+    return lines
 
 
 def _text_width(draw, value, font):
