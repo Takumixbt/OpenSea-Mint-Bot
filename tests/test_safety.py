@@ -1201,6 +1201,14 @@ class MinterLaunchTests(unittest.TestCase):
 
 
 class DiscoverySafetyTests(unittest.TestCase):
+    def setUp(self):
+        # ``unittest`` does not load tests/conftest.py, so explicitly clear the
+        # process-wide calendar cache for the CI runner used by this project.
+        discovery.invalidate_calendar()
+
+    def tearDown(self):
+        discovery.invalidate_calendar()
+
     def test_blank_monitored_chains_falls_back_to_every_evm_network(self):
         with patch.dict(os.environ, {"MONITORED_CHAINS": ""}, clear=False):
             chains = config.monitored_chain_slugs()

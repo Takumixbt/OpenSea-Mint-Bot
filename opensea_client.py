@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import time
@@ -15,6 +16,14 @@ import config
 API_REQUEST_TIMEOUT = 15.0
 FIRE_REQUEST_TIMEOUT = 3.0
 MAX_429_BACKOFF_SECONDS = 10.0
+READ_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.5)
+OPEN_SEA_CHAIN_ALIASES = {
+    "eth": "ethereum",
+    "mainnet": "ethereum",
+    "matic": "polygon",
+    "arb": "arbitrum",
+    "op": "optimism",
+}
 
 
 def _api_key_missing(api_key):
@@ -31,6 +40,12 @@ def get_api_client(api_key):
         headers={"user-agent": config.USER_AGENT},
         timeout=API_REQUEST_TIMEOUT,
         follow_redirects=True,
+        http2=True,
+        limits=httpx.Limits(
+            max_connections=32,
+            max_keepalive_connections=16,
+            keepalive_expiry=30,
+        ),
     )
 
 
@@ -61,24 +76,46 @@ def _response_message(response):
 
 
 def _get_json(client, endpoint, api_key, params=None):
-    try:
-        response = client.get(
-            endpoint,
-            headers=_api_headers(api_key),
-            params=params,
-            timeout=API_REQUEST_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"OpenSea API network error ({type(exc).__name__}).") from exc
+    response = None
+    last_network_error = None
+    for attempt, fallback_delay in enumerate(READ_RETRY_DELAYS_SECONDS, 1):
+        try:
+            response = client.get(
+                endpoint,
+                headers=_api_headers(api_key),
+                params=params,
+                timeout=API_REQUEST_TIMEOUT,
+            )
+            last_network_error = None
+        except httpx.HTTPError as exc:
+            last_network_error = exc
+            if attempt < len(READ_RETRY_DELAYS_SECONDS):
+                time.sleep(fallback_delay)
+                continue
+            break
 
-    if response.status_code != 200:
-        detail = _response_message(response)
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"OpenSea API request failed (HTTP {response.status_code}){suffix}")
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError("OpenSea API returned a non-JSON response.") from exc
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise RuntimeError("OpenSea API returned a non-JSON response.") from exc
+        if response.status_code not in {429, 502, 503, 504}:
+            break
+        if attempt >= len(READ_RETRY_DELAYS_SECONDS):
+            break
+        retry_after = response.headers.get("retry-after")
+        try:
+            pause = min(MAX_429_BACKOFF_SECONDS, max(0.0, float(retry_after)))
+        except (TypeError, ValueError):
+            pause = fallback_delay
+        time.sleep(pause)
+
+    if response is None:
+        error_name = type(last_network_error).__name__ if last_network_error else "HTTPError"
+        raise RuntimeError(f"OpenSea API network error ({error_name}).") from last_network_error
+    detail = _response_message(response)
+    suffix = f": {detail}" if detail else ""
+    raise RuntimeError(f"OpenSea API request failed (HTTP {response.status_code}){suffix}")
 
 
 def get_drop_details(client, slug, api_key):
@@ -309,9 +346,11 @@ def get_account_profile(client, identifier, api_key):
 def parse_drop_slug(value):
     """Return a safe collection/drop slug from an OpenSea URL or slug.
 
-    Minting is supported for collection/drop pages, not individual asset URLs.
-    Keeping this parser here makes the Telegram and CLI routes use the same
-    input rules and prevents arbitrary hosts from being sent to the API.
+    This is the legacy collection-only parser used by marketplace endpoints.
+    Mint scheduling should use :func:`parse_opensea_reference` instead so an
+    individual OpenSea asset can first be resolved back to its collection.
+    Keeping the strict parser here prevents an NFT token id from being sent to
+    a collection endpoint by callers that genuinely need a slug.
     """
     raw = str(value or "").strip()
     if not raw:
@@ -328,7 +367,10 @@ def parse_drop_slug(value):
             raise ValueError(
                 "use an OpenSea collection/drop URL, not an individual NFT asset URL"
             )
-        raw = parts[-1]
+        # OpenSea sometimes appends UI tabs such as /overview or /activity.
+        # The collection/drop slug is always the segment immediately after
+        # the route name, never the final decorative path segment.
+        raw = parts[1]
 
     slug = raw.strip("/")
     if not slug or any(char.isspace() for char in slug) or "/" in slug:
@@ -337,10 +379,12 @@ def parse_drop_slug(value):
 
 
 def parse_opensea_reference(value):
-    """Parse a collection/drop URL or NFT asset URL for the research route.
+    """Parse any supported OpenSea collection, drop, item, or asset URL.
 
-    Asset references are read-only research targets. They are deliberately not
-    accepted by ``parse_drop_slug`` or any mint execution path.
+    The returned reference is only an identifier.  It is not proof that a
+    mint exists.  The scheduler still has to resolve the collection/drop
+    metadata and, for non-calendar mints, pass the existing verified route
+    and simulation checks before a transaction can be signed.
     """
     raw = str(value or "").strip()
     if not raw:
@@ -351,8 +395,9 @@ def parse_opensea_reference(value):
     if parsed.netloc.lower() not in {"opensea.io", "www.opensea.io"}:
         raise ValueError("the URL must point to opensea.io")
     parts = [unquote(part) for part in parsed.path.split("/") if part]
-    if len(parts) >= 4 and parts[0].lower() == "assets":
+    if len(parts) >= 4 and parts[0].lower() in {"assets", "asset", "item"}:
         chain = parts[1].strip().lower()
+        chain = OPEN_SEA_CHAIN_ALIASES.get(chain, chain)
         contract = parts[2].strip()
         identifier = parts[3].strip()
         if not re.fullmatch(r"0x[a-fA-F0-9]{40}", contract):
@@ -366,7 +411,13 @@ def parse_opensea_reference(value):
             "identifier": identifier,
             "url": raw,
         }
-    return {"kind": "collection", "slug": parse_drop_slug(raw)}
+    try:
+        slug = parse_drop_slug(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "paste a supported OpenSea collection, drop, item, or asset URL"
+        ) from exc
+    return {"kind": "collection", "slug": slug}
 
 
 def list_drops(client, api_key, chain_slug, drop_type="upcoming", limit=None, cursor=None):
@@ -461,9 +512,34 @@ def _stage_value(stage, *names):
     return None
 
 
+def _http_url(*values):
+    """Return the first explicit HTTP URL without inventing one."""
+    for value in values:
+        text = str(value or "").strip()
+        if text.startswith(("https://", "http://")):
+            return text
+    return ""
+
+
 def get_drop_info(client, slug, api_key, include_metadata=True):
     """Return normalized drop metadata for schedule and inspection screens."""
-    drop = _drop_object(get_drop_details(client, slug, api_key))
+    collection_info = {}
+    if include_metadata:
+        # Drop stages and collection presentation metadata are independent API
+        # reads. Fetch them together so /info is not the sum of two latencies.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="opensea-info") as pool:
+            drop_future = pool.submit(get_drop_details, client, slug, api_key)
+            collection_future = pool.submit(
+                get_collection_details, client, slug, api_key
+            )
+            drop_payload = drop_future.result()
+            try:
+                collection_info = collection_future.result()
+            except Exception:
+                collection_info = {}
+    else:
+        drop_payload = get_drop_details(client, slug, api_key)
+    drop = _drop_object(drop_payload)
     if not drop:
         raise RuntimeError("OpenSea returned no drop stages for this slug.")
     raw_stages = drop.get("stages")
@@ -495,16 +571,6 @@ def get_drop_info(client, slug, api_key, include_metadata=True):
 
     if not normalized:
         raise RuntimeError("OpenSea returned no usable mint stages.")
-    # The drop endpoint provides stages and supply but not always the
-    # collection's long-form description or project links. Metadata is
-    # best-effort here so scheduling still works if this second request fails.
-    if include_metadata:
-        try:
-            collection_info = get_collection_details(client, slug, api_key)
-        except Exception:
-            collection_info = {}
-    else:
-        collection_info = {}
     collection = drop.get("collection")
     collection_name = collection.get("name") if isinstance(collection, dict) else None
     name = (
@@ -521,6 +587,12 @@ def get_drop_info(client, slug, api_key, include_metadata=True):
         or drop.get("opensea_url")
         or f"https://opensea.io/collection/{slug}"
     )
+    mint_url = _http_url(
+        drop.get("mintUrl"), drop.get("mint_url"),
+        drop.get("dropUrl"), drop.get("drop_url"),
+        collection_info.get("mint_url"), collection_info.get("mintUrl"),
+        collection_info.get("drop_url"), collection_info.get("dropUrl"),
+    )
     contract_address = drop.get("contractAddress") or drop.get("contract_address")
     if not contract_address:
         contracts = collection_info.get("contracts")
@@ -529,12 +601,30 @@ def get_drop_info(client, slug, api_key, include_metadata=True):
                 if isinstance(contract, dict) and str(contract.get("chain") or "").lower() == str(drop.get("chain") or "").lower():
                     contract_address = contract.get("address")
                     break
+    total_supply = (
+        drop.get("totalSupply")
+        if drop.get("totalSupply") is not None
+        else drop.get("total_supply")
+    )
+    max_supply = (
+        drop.get("maxSupply")
+        if drop.get("maxSupply") is not None
+        else drop.get("max_supply")
+    )
+    if total_supply is None:
+        total_supply = collection_info.get("total_supply")
+    if max_supply is None:
+        max_supply = collection_info.get("max_supply")
     return {
         "slug": str(drop.get("collectionSlug") or drop.get("collection_slug") or slug),
         "name": str(name),
         "chain": str(drop.get("chain") or "").strip().lower(),
         "contract_address": contract_address,
         "opensea_url": collection_url,
+        "drop_type": str(drop.get("dropType") or drop.get("drop_type") or ""),
+        "is_minting": bool(drop.get("isMinting") or drop.get("is_minting")),
+        "total_supply": total_supply,
+        "max_supply": max_supply,
         "metadata": {
             "description": collection_info.get("description") or "",
             "image_url": collection_info.get("image_url") or drop.get("image_url") or "",
@@ -547,8 +637,12 @@ def get_drop_info(client, slug, api_key, include_metadata=True):
             "discord_url": collection_info.get("discord_url") or "",
             "telegram_url": collection_info.get("telegram_url") or "",
             "wiki_url": collection_info.get("wiki_url") or "",
-            "total_supply": collection_info.get("total_supply") or drop.get("total_supply"),
-            "max_supply": drop.get("max_supply") or collection_info.get("max_supply"),
+            "mint_url": mint_url,
+            "total_supply": total_supply,
+            "max_supply": max_supply,
+            "drop_type": str(drop.get("dropType") or drop.get("drop_type") or ""),
+            "is_minting": bool(drop.get("isMinting") or drop.get("is_minting")),
+            "details_verified": True,
             "contracts": collection_info.get("contracts") or [],
             "opensea_url": collection_url,
         },
@@ -638,10 +732,19 @@ def get_public_drop_schedule(client, slug):
 
 
 def get_mint_calldata(client, slug, stage_index, quantity, address, api_key):
-    """Request ready-to-sign calldata for the first eligible active stage."""
-    del stage_index
+    """Request ready-to-sign calldata for the selected OpenSea stage.
+
+    The current endpoint selects the eligible stage server-side, so the stage
+    index is not sent as an invented request field. We still validate it here
+    so a malformed persisted schedule cannot reach the mint endpoint.
+    """
     if _api_key_missing(api_key):
         return None, "STOP: OPENSEA_API_KEY is missing or still a placeholder."
+    try:
+        if int(stage_index) < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, "STOP: the selected OpenSea mint stage is invalid."
     if not isinstance(quantity, int) or not 1 <= quantity <= 100:
         return None, "STOP: MINT_QUANTITY must be an integer from 1 through 100."
 
@@ -685,11 +788,23 @@ def get_mint_calldata(client, slug, stage_index, quantity, address, api_key):
     transaction = _find_transaction_payload(payload)
     if not transaction or not transaction.get("to") or not transaction.get("data"):
         return None, "STOP: OpenSea returned no usable transaction fields"
+    target = str(transaction.get("to") or "").strip()
+    data = str(transaction.get("data") or "").strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", target):
+        return None, "STOP: OpenSea returned an invalid transaction target"
+    if (
+        not re.fullmatch(r"0x[a-fA-F0-9]+", data)
+        or len(data) < 6
+        or len(data[2:]) % 2
+    ):
+        return None, "STOP: OpenSea returned invalid transaction calldata"
     try:
         value = _to_wei_int(transaction.get("value"))
     except (TypeError, ValueError):
         return None, f"STOP: could not parse the mint value {transaction.get('value')!r}"
-    return {"to": transaction["to"], "data": transaction["data"], "value": value}, None
+    if value < 0:
+        return None, "STOP: OpenSea returned a negative mint value"
+    return {"to": target, "data": data, "value": value}, None
 
 
 def _to_wei_int(value):

@@ -4,7 +4,9 @@ OpenSea's public SeaDrop route is deterministic: the singleton contract stores
 the public price and window, and ``mintPublic`` needs no OpenSea-issued
 signature.  This module only prepares that narrow route.  It never guesses a
 custom contract function, never bypasses an allowlist, and returns ``None``
-when a collection is not a compatible SeaDrop public stage.
+when a collection is not a compatible SeaDrop public stage.  The same planner
+is also used when a collection is linked on OpenSea but omitted from its drop
+calendar.
 
 The caller can then sign the returned transaction before the stage opens.  The
 existing OpenSea and verified-generic routes remain available as fallbacks for
@@ -138,6 +140,40 @@ def _fee_recipient(seadrop, nft_contract, restricted):
     if restricted:
         return None, "SeaDrop restricts fee recipients but returned no allowed recipient"
     return Web3.to_checksum_address(OPENSEA_FEE_RECIPIENT), "OpenSea default fee recipient"
+
+
+def inspect_public_stage(rpc_url, nft_contract):
+    """Read a live/upcoming public SeaDrop stage without building a tx.
+
+    This is used when a collection is on OpenSea but is missing from OpenSea's
+    calendar.  It deliberately returns only the narrow public SeaDrop shape;
+    allowlists, signatures, and project-specific arguments are not inferred.
+    """
+    if not config.DIRECT_PUBLIC_SEADROP:
+        return None
+    nft_contract = _address(nft_contract)
+    if not nft_contract:
+        return None
+    provider = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 12}))
+    if not provider.is_connected():
+        return None
+    seadrop = provider.eth.contract(
+        address=Web3.to_checksum_address(SEADROP_ADDRESS), abi=PUBLIC_ABI
+    )
+    drop = _read_public_drop(seadrop, nft_contract)
+    if not drop:
+        return None
+    now = int(time.time())
+    if drop["end_time"] and now >= drop["end_time"]:
+        return None
+    fee_recipient, fee_source = _fee_recipient(
+        seadrop, nft_contract, drop["restrict_fee_recipients"]
+    )
+    if not fee_recipient:
+        return None
+    drop["fee_recipient"] = fee_recipient
+    drop["fee_source"] = fee_source
+    return drop
 
 
 def _start_matches(candidate, drop):

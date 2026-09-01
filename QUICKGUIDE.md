@@ -26,12 +26,16 @@ MAX_MINT_PRICE_NATIVE=0
 MAX_BUY_PRICE_NATIVE=0
 ```
 
-Use `/start` in Telegram. The bot scans one network at a time. It includes
-paid and restricted OpenSea stages; the price cap only controls execution.
+Use `/start` in Telegram. `/scan` opens a network picker so results stay
+organized by chain. `/scan base` scans Base directly; `/scan all` scans every
+supported network and shows a chain summary before you open a project. Paid and
+restricted stages remain visible; the price cap only controls execution.
 
 Public SeaDrop stages use the faster direct on-chain path automatically when
-their on-chain price and opening time match the scan. Allowlists and custom
-routes keep their required OpenSea/contract checks.
+their on-chain price and opening time match the scan. Hosted allowlist/signature
+stages keep their required OpenSea eligibility checks. `/schedule` also accepts
+an OpenSea item or asset URL and resolves it to the collection before trying a
+hosted, SeaDrop, or verified-contract route.
 
 ## Run on Ubuntu as a VPS service
 
@@ -65,6 +69,6 @@ for the Python VPS route.
 ## Fast direct route
 
 The bot automatically uses `opensea_direct_executor.py` for compatible public
-SeaDrop stages. It runs from Python and Telegram, so Chrome, OpenSea tabs, and
-wallet extensions are not needed. See [DIRECT_EXECUTION.md](DIRECT_EXECUTION.md)
-for the setup and timing details.
+SeaDrop stages exposed by OpenSea's hosted Drops records. It runs from Python
+and Telegram, so Chrome, OpenSea tabs, and wallet extensions are not needed. See
+[DIRECT_EXECUTION.md](DIRECT_EXECUTION.md) for the setup and timing details.

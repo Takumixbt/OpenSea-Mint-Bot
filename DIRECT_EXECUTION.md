@@ -15,9 +15,15 @@ The direct path is used only when all of these are true:
 - the on-chain price and opening time match the saved preview;
 - the requested quantity is within the on-chain wallet limit.
 
-Allowlist/signature stages, custom contracts, and stages whose data changed
-remain on their required verified OpenSea or external-contract route. The bot
-does not bypass an allowlist or guess arbitrary calldata.
+The scheduler accepts an OpenSea collection, drop, item, or NFT asset URL. An
+asset URL is resolved through OpenSea metadata first. If it is not a hosted
+calendar drop, the bot may use this direct route only when the NFT's collection
+contract exposes a live public SeaDrop stage and the on-chain checks pass.
+Marketplace listings and unsupported/custom contract routes are still rejected.
+
+Allowlist/signature stages and stages whose data changed remain on their
+required OpenSea calldata route. The bot does not bypass an allowlist or guess
+arbitrary calldata.
 
 ## Install on a personal computer
 
@@ -69,9 +75,10 @@ python telegram_bot.py
 In Telegram:
 
 1. Send `/start`.
-2. Use `/scan base` (or another supported chain) to find stages, or use
-   `/schedule` and paste one OpenSea collection/drop URL.
-3. Open the stage details, choose the quantity and wallets, and review the
+2. Use `/scan` to choose a network, `/scan all` to scan every supported network
+   with a chain-grouped summary, or `/schedule` and paste any OpenSea
+   collection, drop, item, or asset URL.
+3. Open a project, choose **Mint now** or **Schedule**, then review the
    price, gas estimate, eligibility, links, and route.
 4. Enable live mode in `.env` only after the review is correct. Set a deliberate
    price cap, restart the bot, and use the separate live confirmation control.
@@ -120,8 +127,8 @@ request` error.
 
 Compared with a minimal page-clicking mint script, this project adds:
 
-- Telegram-first discovery and scheduling, with one-chain-at-a-time scans;
-- free, paid, public, restricted, and verified external route handling;
+- Telegram-first all-network discovery and hosted-drop scheduling;
+- free, paid, public, and restricted OpenSea stage handling;
 - quantity selection, multiple configured wallets, and per-wallet checks;
 - hard price, daily mint, daily gas, balance, nonce, and simulation guards;
 - on-chain price/window/quantity validation immediately before signing;
@@ -138,7 +145,7 @@ rules.
 
 - **No direct execution shown:** the stage is probably restricted, custom, not
   SeaDrop-compatible, or its on-chain values no longer match OpenSea. The bot
-  will use the appropriate fallback or stop safely.
+  will use OpenSea's signed calldata route when available or stop safely.
 - **The bot does not start:** run `python status.py`, fix the first blocked item,
   and restart the process.
 - **The schedule did not fire:** confirm the PC/VPS stayed online, the process
