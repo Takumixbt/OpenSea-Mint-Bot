@@ -208,25 +208,6 @@ sudo journalctl -u opensea-mint-bot.service -f
 Enter `.env` on the server. Prefer not to scp a file that contains a private
 key.
 
-## When something looks wrong
-
-**Scan is empty.** The network picker is OpenSea's calendar, not a broken
-request. Most chains have nothing on a given day. If a chain shows a count but
-the scan is empty, the windows are outside `DISCOVERY_WINDOW_HOURS`.
-
-**A collection is on OpenSea but not in scan.** It may be secondary-market only,
-sold out, or unpublished in the Drops feeds. Paste the URL into **info** /
-`/info` instead. If there is still no safe route, the bot is supposed to refuse.
-
-**Wallet row says RPC timeout / no NFT index.** That network has no usable
-Alchemy RPC or OpenSea NFT index. Check `wallet eth` or `wallet base` instead of
-`wallet all` if you only care about those chains.
-
-**Telegram Conflict.** Another process is already polling that token. Stop the
-duplicate.
-
-**The schedule did not fire.** The process was not running, the machine slept,
-the wallet lacked gas, or the price cap was still `0`.
 
 ## Tests
 
