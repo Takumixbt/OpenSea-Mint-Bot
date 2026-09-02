@@ -21,7 +21,7 @@ backups/
 # Daily scanner state and candidate history are local runtime data.
 state/
 
-# Isolated Foundry project used for the OpenSea bot test collection.
+# Isolated Foundry project used for a local test collection, if present.
 test-nft/lib/
 test-nft/out/
 test-nft/cache/
