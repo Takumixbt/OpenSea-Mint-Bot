@@ -1,41 +1,15 @@
-# Never commit real secrets, saved login sessions, or local logs.
+# Never commit secrets, sessions, or local logs.
 .env
 .env.*
 !.env.example
-!test-nft/.env.deploy.example
 session.json
 __pycache__/
 *.pyc
 *.log
-*.key
-*.pem
-*.out
-*.err
 .venv/
 venv/
 .pytest_cache/
-.coverage
-*.sqlite3
-backups/
-
-# Daily scanner state and candidate history are local runtime data.
 state/
-
-# Isolated Foundry project used for a local test collection, if present.
-test-nft/lib/
-test-nft/out/
-test-nft/cache/
-test-nft/broadcast/
-test-nft/upload/
-
-# Foundry belongs to the test-nft sub-project. A `forge install` run from the
-# repository root creates a duplicate 17 MB tree that must never be committed.
-/lib/
-/foundry.lock
-/out/
-/cache/
-
-# Local audit dumps and tool output. Never publish these.
 .audit-RAYmyS/
 x-ray/
 .ruff_cache/

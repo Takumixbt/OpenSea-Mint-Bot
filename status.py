@@ -3,7 +3,6 @@
 Run from this directory:
 
     python status.py
-    python status.py --full-recon
 
 This script never signs, broadcasts, or changes wallet state. It prints only
 health facts; it never prints keys, API tokens, or the wallet address.
@@ -15,7 +14,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib
 import os
-import subprocess
 import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -250,38 +248,9 @@ def check_official_opensea_api():
         add("BLOCKED", "OpenSea Drops API", f"read-only check failed ({type(exc).__name__})")
 
 
-def run_full_recon():
-    import config
-
-    if not config.target_collection_slug():
-        add(
-            "INFO",
-            "One-drop CLI audit",
-            "skipped because no TARGET_COLLECTION_URL is configured; Telegram link lookup is ready",
-        )
-        return
-    print("\n--- OpenSea API audit ---")
-    completed = subprocess.run(
-        [sys.executable, str(ROOT / "recon_check.py")],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.returncode == 0:
-        add("OK", "OpenSea API audit", "no blocking audit items")
-    else:
-        add("BLOCKED", "OpenSea API audit", f"recon_check.py exited {completed.returncode}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only NFT Mint Bot readiness report")
     parser.add_argument("--no-network", action="store_true", help="skip RPC and OpenSea endpoint checks")
-    parser.add_argument("--full-recon", action="store_true", help="also run the OpenSea API audit")
     args = parser.parse_args()
 
     print(f"NFT Mint Bot status — {ROOT}")
@@ -295,8 +264,6 @@ def main() -> int:
         add("INFO", "OpenSea Drops API", "skipped by --no-network")
     else:
         check_official_opensea_api()
-    if args.full_recon:
-        run_full_recon()
 
     blocked = sum(1 for state, _, _ in results if state == "BLOCKED")
     warnings = sum(1 for state, _, _ in results if state == "WARN")
