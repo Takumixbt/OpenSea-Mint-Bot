@@ -1,9 +1,9 @@
 # Direct execution guide
 
 `opensea_direct_executor.py` is the project-owned low-latency executor for
-compatible public SeaDrop stages. The Telegram bot calls it automatically; it
-is not a browser extension and it does not need an OpenSea tab, Chrome, or a
-wallet extension.
+compatible public SeaDrop stages. The Telegram bot and the terminal CLI call it
+automatically; it is not a browser extension and it does not need an OpenSea
+tab, Chrome, or a wallet extension.
 
 ## What it supports
 
@@ -40,9 +40,9 @@ notepad .env
 ```
 
 Fill in `.env` locally with your own values. At minimum, the bot needs an
-Alchemy key, OpenSea API key, wallet private key, matching wallet address, and
-Telegram settings if you want Telegram control. Never paste those values into
-Telegram, a terminal chat, GitHub, or an issue.
+Alchemy key, OpenSea API key, wallet private key, and matching wallet address.
+Add Telegram settings only if you want Telegram control. Never paste those
+values into Telegram, a terminal chat, GitHub, or an issue.
 
 Keep the safe defaults while testing:
 
@@ -58,7 +58,7 @@ MAX_DAILY_GAS_NATIVE=0.05
 Then verify the installation:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 python status.py
 ```
 
@@ -66,13 +66,24 @@ python status.py
 
 ## Start and use it
 
-Start exactly one Telegram controller:
+Start the terminal controller:
+
+```powershell
+python cli.py
+```
+
+Or start exactly one Telegram controller:
 
 ```powershell
 python telegram_bot.py
 ```
 
-In Telegram:
+Do not run two Telegram processes with the same token. The CLI and Telegram
+share the same wallet if both are live at once, so use one controller for live
+sends.
+
+In the CLI, `scan`, `info <OpenSea URL>`, `mint`, and `schedule` cover the same
+flow. In Telegram:
 
 1. Send `/start`.
 2. Use `/scan` to choose a network, `/scan all` to scan every supported network

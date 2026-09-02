@@ -3,3 +3,4 @@ web3==7.16.0
 eth-account==0.13.7
 python-dotenv==1.2.2
 Pillow==12.3.0
+pytest==9.1.1

@@ -1,9 +1,12 @@
 """
-The bot. Run it like this:
+OpenSea mint bot entry point.
 
-    python main.py               (real: actually sends the mint transaction)
+    python main.py                 interactive terminal control
+    python main.py scan base       one-shot CLI command
+    python telegram_bot.py         Telegram control
+    python main.py --confirm-live  legacy fire path using TARGET_COLLECTION_URL
 
-What it does, in order:
+The --confirm-live path, in order:
   1. Read the drop's schedule from OpenSea's documented Drops API.
   2. Find when your chosen stage opens.
   3. Wait, printing a countdown.
@@ -325,6 +328,16 @@ def main():
 
 
 if __name__ == "__main__":
+    # `python main.py` is the operator CLI. The older config.py fire path
+    # remains available when --confirm-live is the only kind of argument.
+    cli_verbs = {
+        "help", "status", "settings", "cap", "networks", "scan", "list", "show",
+        "info", "research", "wallet", "history", "mints", "mint", "schedule",
+        "schedules", "cancel", "buy", "daily", "watch",
+    }
+    if any(arg in cli_verbs for arg in sys.argv[1:]) or "--confirm-live" not in sys.argv:
+        from cli import main as cli_main
+        raise SystemExit(cli_main())
     try:
         main()
     except KeyboardInterrupt:

@@ -176,6 +176,15 @@ class Minter:
         self._balance_read_at = time.monotonic()
         return self._cached_balance
 
+    def peek_balance(self, timeout=6):
+        """One status-only balance read. Does not warm mint RPC pools or retry."""
+        provider = Web3(
+            Web3.HTTPProvider(self.rpc_url, request_kwargs={"timeout": timeout})
+        )
+        if int(self.chain_id) in POA_CHAIN_IDS:
+            provider.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return int(provider.eth.get_balance(self.address))
+
     def funding_preview(self, mint_value_wei=0):
         """Return a read-only funding envelope; never build, sign, or send."""
         live_chain_id, _ = self.warm_up()

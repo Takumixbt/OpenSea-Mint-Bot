@@ -34,3 +34,8 @@ test-nft/upload/
 /foundry.lock
 /out/
 /cache/
+
+# Local audit dumps and tool output. Never publish these.
+.audit-RAYmyS/
+x-ray/
+.ruff_cache/

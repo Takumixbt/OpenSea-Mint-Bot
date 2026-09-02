@@ -26,6 +26,20 @@ from wallets import load_wallet_profiles, select_wallet_profiles
 ROOT = Path(__file__).resolve().parent
 
 
+def _wallet_issue(exc, kind):
+    """Turn RPC/NFT failures into a short status-table note."""
+    text = f"{type(exc).__name__}: {redact_secrets(exc)}".lower()
+    if "timeout" in text or "timed out" in text or "cannot reach" in text:
+        return "RPC timeout" if kind == "balance" else "NFT timeout"
+    if "mismatch" in text:
+        return "RPC mismatch"
+    if "404" in text or "not found" in text or "unsupported" in text:
+        return "no NFT index"
+    if kind == "nfts":
+        return "no NFT index"
+    return "RPC unavailable"
+
+
 def redact_secrets(text):
     """Keep API/RPC/private values out of console and Telegram messages."""
     text = str(text)
@@ -122,6 +136,8 @@ class DailyMintService:
         self.scan_lock = threading.Lock()
         self.state_lock = threading.RLock()
         self.execution_lock = threading.Lock()
+        self._http_lock = threading.Lock()
+        self._http_client = None
         self.worker = None
         self.schedule_worker = None
         self.mode = None
@@ -161,6 +177,35 @@ class DailyMintService:
     def supported_chains(self):
         """Return configured chains that have an EVM signer/RPC mapping."""
         return [slug for slug in self.configured_chains() if config.chain_config(slug)]
+
+    def opensea_http(self):
+        """Reuse one HTTP/2 client so scans skip a TLS handshake on every call."""
+        with self._http_lock:
+            client = self._http_client
+            if client is None or getattr(client, "is_closed", False):
+                client = opensea_client.get_api_client(self.api_key)
+                self._http_client = client
+            return client
+
+    def prewarm_calendar(self, on_done=None):
+        """Load OpenSea's drop calendar in the background so the first scan is warm."""
+        def warm():
+            try:
+                counts, errors, age = self.chain_coverage()
+            except Exception:
+                if on_done:
+                    try:
+                        on_done(None, None, None)
+                    except Exception:
+                        pass
+                return
+            if on_done:
+                try:
+                    on_done(counts, errors, age)
+                except Exception:
+                    pass
+
+        threading.Thread(target=warm, name="calendar-prewarm", daemon=True).start()
 
     def public_wallets(self):
         """Return labels and addresses only; private keys never enter UI state."""
@@ -214,20 +259,29 @@ class DailyMintService:
         })
         return snapshot
 
-    def wallet_snapshot(self, chain_slug=None, max_pages=5, wallet_id="primary"):
+    def wallet_snapshot(self, chain_slug=None, max_pages=5, wallet_id="primary", nft_fallback=None):
         """Read native balances, OpenSea NFT counts, and recent local mint status."""
         profile = select_wallet_profiles(self.wallet_profiles, [wallet_id])[0]
         if chain_slug:
-            chain_slug = str(chain_slug).strip().lower()
-            if not config.chain_config(chain_slug):
+            resolved = config.resolve_chain_slug(chain_slug)
+            if resolved == "all" or str(chain_slug).strip().lower() in {"all", "*"}:
+                chain_slug = None
+                chains = self.supported_chains()
+            elif not resolved or not config.chain_config(resolved):
                 raise ValueError(f"chain '{chain_slug}' has no configured RPC")
-            chains = [chain_slug]
+            else:
+                chain_slug = resolved
+                chains = [chain_slug]
         else:
             chains = self.supported_chains()
         try:
             max_pages = max(1, min(20, int(max_pages)))
         except (TypeError, ValueError):
             max_pages = 5
+        overview = len(chains) > 1
+        if nft_fallback is None:
+            nft_fallback = not overview
+        nft_limit = 50 if overview else 200
 
         def read_chain(slug):
             chain = config.chain_config(slug) or {}
@@ -250,54 +304,50 @@ class DailyMintService:
                     profile.private_key,
                     profile.address,
                     int(chain["chain_id"]),
-                    rpc_urls=config.rpc_urls_for_chain(self.alchemy_key, int(chain["chain_id"])),
                 )
-                live_chain, _ = minter.warm_up()
-                if live_chain != int(chain["chain_id"]):
-                    raise RuntimeError("RPC chain mismatch")
-                entry["balance_wei"] = int(minter.native_balance())
+                entry["balance_wei"] = minter.peek_balance()
             except Exception as exc:
-                entry["errors"].append(f"balance: {type(exc).__name__}: {redact_secrets(exc)}")
+                entry["errors"].append(_wallet_issue(exc, "balance"))
             try:
                 count = 0
                 cursor = None
                 samples = []
                 collections = {}
                 contracts = {}
-                client = opensea_client.get_api_client(self.api_key)
-                try:
-                    for _ in range(max_pages):
-                        nfts, cursor = opensea_client.get_account_nfts(
-                            client, slug, profile.address, self.api_key,
-                            limit=200, cursor=cursor,
-                        )
-                        count += len(nfts)
-                        for nft in nfts:
-                            if not isinstance(nft, dict):
-                                continue
-                            collection = nft.get("collection")
-                            if isinstance(collection, dict):
-                                collection = collection.get("slug")
-                            collection = str(collection or "").strip().lower()
-                            if collection:
-                                collections[collection] = collections.get(collection, 0) + 1
-                            contract = str(nft.get("contract") or "").strip().lower()
-                            if contract:
-                                contracts[contract] = contracts.get(contract, 0) + 1
-                        if len(samples) < 3:
-                            samples.extend(nfts[: 3 - len(samples)])
-                        if not cursor:
-                            break
-                    entry["nft_count"] = count
-                    entry["nft_count_capped"] = bool(cursor)
-                    entry["samples"] = samples
-                    entry["collections"] = collections
-                    entry["contracts"] = contracts
-                    entry["nft_source"] = "OpenSea"
-                finally:
-                    client.close()
+                client = self.opensea_http()
+                for _ in range(max_pages):
+                    nfts, cursor = opensea_client.get_account_nfts(
+                        client, slug, profile.address, self.api_key,
+                        limit=nft_limit, cursor=cursor,
+                    )
+                    count += len(nfts)
+                    for nft in nfts:
+                        if not isinstance(nft, dict):
+                            continue
+                        collection = nft.get("collection")
+                        if isinstance(collection, dict):
+                            collection = collection.get("slug")
+                        collection = str(collection or "").strip().lower()
+                        if collection:
+                            collections[collection] = collections.get(collection, 0) + 1
+                        contract = str(nft.get("contract") or "").strip().lower()
+                        if contract:
+                            contracts[contract] = contracts.get(contract, 0) + 1
+                    if len(samples) < 3:
+                        samples.extend(nfts[: 3 - len(samples)])
+                    if not cursor:
+                        break
+                entry["nft_count"] = count
+                entry["nft_count_capped"] = bool(cursor)
+                entry["samples"] = samples
+                entry["collections"] = collections
+                entry["contracts"] = contracts
+                entry["nft_source"] = "OpenSea"
             except Exception as exc:
-                opensea_error = f"{type(exc).__name__}: {redact_secrets(exc)}"
+                opensea_error = _wallet_issue(exc, "nfts")
+                if not nft_fallback:
+                    entry["errors"].append(opensea_error)
+                    return entry
                 try:
                     rpc_url = config.rpc_url_for_chain(
                         self.alchemy_key, int(chain["chain_id"])
@@ -309,10 +359,10 @@ class DailyMintService:
                         f"{prefix}/nft/v3/{key}/getNFTsForOwner",
                         params={
                             "owner": profile.address,
-                            "withMetadata": "true",
+                            "withMetadata": "false",
                             "pageSize": 100,
                         },
-                        timeout=15.0,
+                        timeout=6.0,
                     )
                     response.raise_for_status()
                     payload = response.json()
@@ -344,17 +394,14 @@ class DailyMintService:
                     entry["notices"].append(
                         "OpenSea NFT index was unavailable; count shown from Alchemy."
                     )
-                except Exception as fallback_exc:
-                    entry["errors"].append(
-                        f"NFTs unavailable: OpenSea {opensea_error}; "
-                        f"Alchemy {type(fallback_exc).__name__}: {redact_secrets(fallback_exc)}"
-                    )
+                except Exception:
+                    entry["errors"].append(opensea_error)
             return entry
 
         results = []
         if chains:
             with ThreadPoolExecutor(
-                max_workers=min(6, len(chains)), thread_name_prefix="wallet-status"
+                max_workers=min(16, len(chains)), thread_name_prefix="wallet-status"
             ) as pool:
                 futures = {pool.submit(read_chain, slug): slug for slug in chains}
                 for future in as_completed(futures):
@@ -518,25 +565,21 @@ class DailyMintService:
             chain_slug = None
             chains = _configured_chains()
         with self.scan_lock:
-            client = opensea_client.get_api_client(self.api_key)
-            try:
-                candidates, errors = discovery.discover_mints(
-                    client,
-                    self.api_key,
-                    chains,
-                    config.DISCOVERY_WINDOW_HOURS,
-                    # A rolling window, not "the rest of today". Anchoring to
-                    # midnight hid drops that open a few hours later purely
-                    # because of the clock.
-                    today_only=False,
-                    # The official three drop feeds are the canonical mint
-                    # catalogue. Trending/top collections are trading data and
-                    # must never leak into /scan as false mint results.
-                    include_ranked_fallback=False,
-                    force_refresh=force_refresh,
-                )
-            finally:
-                client.close()
+            candidates, errors = discovery.discover_mints(
+                self.opensea_http(),
+                self.api_key,
+                chains,
+                config.DISCOVERY_WINDOW_HOURS,
+                # A rolling window, not "the rest of today". Anchoring to
+                # midnight hid drops that open a few hours later purely
+                # because of the clock.
+                today_only=False,
+                # The official three drop feeds are the canonical mint
+                # catalogue. Trending/top collections are trading data and
+                # must never leak into /scan as false mint results.
+                include_ranked_fallback=False,
+                force_refresh=force_refresh,
+            )
         scanned = [candidate.to_dict() for candidate in candidates]
         with self.state_lock:
             if chain_slug:
@@ -558,17 +601,13 @@ class DailyMintService:
         This reads only OpenSea's drop calendar, so the network picker can show
         which networks actually have something without expanding any drop.
         """
-        client = opensea_client.get_api_client(self.api_key)
-        try:
-            return discovery.chain_coverage(
-                client,
-                self.api_key,
-                _configured_chains(),
-                config.DISCOVERY_WINDOW_HOURS,
-                force=force_refresh,
-            )
-        finally:
-            client.close()
+        return discovery.chain_coverage(
+            self.opensea_http(),
+            self.api_key,
+            _configured_chains(),
+            config.DISCOVERY_WINDOW_HOURS,
+            force=force_refresh,
+        )
 
     def _hosted_candidates_for_slug(self, client, slug):
         """Load calendar/detail stages without assuming the detail route works."""
@@ -701,10 +740,10 @@ class DailyMintService:
         hosted_error = None
 
         # API work is serialized with the existing scan lock. The slower
-        # verified-ABI/RPC resolver runs after the client is closed so a single
+        # verified-ABI/RPC resolver runs after the lock is released so a single
         # broken external contract cannot block normal OpenSea scans.
         with self.scan_lock:
-            client = opensea_client.get_api_client(self.api_key)
+            client = self.opensea_http()
             try:
                 if reference.get("kind") == "asset":
                     try:
@@ -769,7 +808,7 @@ class DailyMintService:
                             "address": detail_contract,
                         }]
             finally:
-                client.close()
+                pass  # shared OpenSea HTTP client is closed in shutdown()
 
         if not slug and reference.get("kind") == "asset":
             slug = self._synthetic_asset_slug(reference)
@@ -933,11 +972,9 @@ class DailyMintService:
         with self.state_lock:
             cached = getattr(self, "metadata_cache", {}).get(slug)
         if cached is None:
-            client = opensea_client.get_api_client(self.api_key)
-            try:
-                metadata = opensea_client.get_collection_details(client, slug, self.api_key)
-            finally:
-                client.close()
+            metadata = opensea_client.get_collection_details(
+                self.opensea_http(), slug, self.api_key
+            )
             metadata = metadata if isinstance(metadata, dict) else {}
             metadata = {
                 "description": str(metadata.get("description") or ""),
@@ -1127,16 +1164,12 @@ class DailyMintService:
     def _drop_research(self, slug):
         """Load one official Drops record without marketplace/statistics noise."""
         slug = opensea_client.parse_drop_slug(slug)
-        client = opensea_client.get_api_client(self.api_key)
         try:
-            try:
-                info = opensea_client.get_drop_info(client, slug, self.api_key)
-            except Exception as exc:
-                raise RuntimeError(
-                    "OpenSea does not expose this collection as a hosted mint."
-                ) from exc
-        finally:
-            client.close()
+            info = opensea_client.get_drop_info(self.opensea_http(), slug, self.api_key)
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenSea does not expose this collection as a hosted mint."
+            ) from exc
         chain = str(info.get("chain") or "").strip().lower()
         metadata = dict(info.get("metadata") or {})
         metadata.update({
@@ -1192,13 +1225,9 @@ class DailyMintService:
     def purchase_preview(self, value):
         """Return the exact cheapest active OpenSea listing without signing."""
         slug = opensea_client.parse_drop_slug(value)
-        client = opensea_client.get_api_client(self.api_key)
-        try:
-            return marketplace.best_listing_preview(
-                client, slug, self.api_key, self.wallet_address
-            )
-        finally:
-            client.close()
+        return marketplace.best_listing_preview(
+            self.opensea_http(), slug, self.api_key, self.wallet_address
+        )
 
     def buy_listing(self, preview, wallet_id="primary"):
         """Fulfill one explicitly confirmed listing with one selected wallet."""
@@ -1273,7 +1302,7 @@ class DailyMintService:
                 return dict(cached.get("value") or {})
 
         with self.scan_lock:
-            client = opensea_client.get_api_client(self.api_key)
+            client = self.opensea_http()
             try:
                 # These reads are independent of one another, so issue them
                 # together rather than paying the sum of their latencies.
@@ -1346,7 +1375,7 @@ class DailyMintService:
                             except Exception:
                                 continue
             finally:
-                client.close()
+                pass  # shared OpenSea HTTP client is closed in shutdown()
 
         collection = collection if isinstance(collection, dict) else {}
         public_drop = public_drop if isinstance(public_drop, dict) else {}
@@ -1653,6 +1682,14 @@ class DailyMintService:
         self.stop()
         self.schedule_stop_event.set()
         self.schedule_wakeup.set()
+        with self._http_lock:
+            client = self._http_client
+            self._http_client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _start_schedule_worker_if_needed(self):
         with self.state_lock:

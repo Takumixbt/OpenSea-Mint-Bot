@@ -17,7 +17,7 @@ The bot loads these values from a local `.env`, and `.env` is ignored by Git.
 Use a separate low-value wallet. Start with `ENABLE_LIVE_MINTS=false`,
 `MAX_MINT_PRICE_NATIVE=0`, and `MAX_BUY_PRICE_NATIVE=0`. Enable a paid route
 only after checking the exact collection, chain, quantity, recipient, value,
-and gas in the confirmation screen.
+and gas in the confirmation screen (Telegram tap or CLI `MINT`/`--yes`).
 
 The direct SeaDrop path is limited to public stages whose on-chain price and
 opening time match the saved preview. It does not bypass allowlists or create
@@ -27,11 +27,11 @@ launch.
 
 The direct executor only prepares the narrow public SeaDrop transaction after
 on-chain checks; it does not bypass allowlists, guess arbitrary contract calls,
-or accept private keys through Telegram. Keep the signing wallet and RPC
+or accept private keys through Telegram or the CLI. Keep the signing wallet and RPC
 configuration on the machine running the bot.
 
 ## Reporting a vulnerability
 
-Do not publish an exploitable detail with a private key or live target. Open a
-private security report through the repository's GitHub security contact, or
-contact the repository maintainer privately before disclosure.
+Do not publish an exploitable detail with a private key or live target. Use
+[GitHub private vulnerability reporting](https://github.com/Takumixbt/OpenSea-Mint-Bot/security/advisories/new)
+so the maintainer can fix it before public disclosure.

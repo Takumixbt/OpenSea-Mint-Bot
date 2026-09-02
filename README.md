@@ -1,8 +1,12 @@
 # OpenSea Mint Bot
 
-An open-source, Telegram-controlled bot for discovering OpenSea mints, showing
-concise mint information, and scheduling EVM mints from collection, drop, item,
-or NFT asset links with explicit limits and confirmation steps.
+[![Tests](https://github.com/Takumixbt/OpenSea-Mint-Bot/actions/workflows/tests.yml/badge.svg)](https://github.com/Takumixbt/OpenSea-Mint-Bot/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+An open-source mint bot with Telegram and terminal control. It discovers
+OpenSea mints, shows concise mint information, and schedules EVM mints from
+collection, drop, item, or NFT asset links with explicit limits and
+confirmation steps.
 
 The normal setup runs on your own Windows, macOS, or Linux computer. A VPS is
 optional when the computer must stay online for scheduled mints.
@@ -29,7 +33,8 @@ Scanning and research can run with live mode disabled.
 
 ## What the Python bot does
 
-From Telegram, you can:
+From the terminal (`python cli.py` or `python main.py`) or from Telegram, you
+can:
 
 - open a network picker that shows how many drops each network actually has
   right now, busiest first, so you never scan an empty chain by accident;
@@ -42,9 +47,11 @@ From Telegram, you can:
 - use direct SeaDrop for compatible public stages and OpenSea mint calldata for
   hosted stages that require OpenSea eligibility/signatures;
 - choose quantity and one or more configured wallets;
-- check wallet balances, NFT counts, and mint transaction receipts;
-- configure the mint-card accent color, brand text, and fallback background;
-  cards show the real NFT artwork as the main image whenever OpenSea has it.
+- check wallet balances, NFT counts, and mint transaction receipts.
+
+Telegram also renders mint cards (accent color, brand text, artwork). The CLI
+prints the same facts as text and can stay running with `watch` so schedules
+fire while the process is online.
 
 For compatible public SeaDrop stages, the bot uses a direct on-chain fast path:
 it reads the public price/window from SeaDrop, prepares calldata, signs during
@@ -98,7 +105,7 @@ Open PowerShell and choose a folder for the project. The path below is only an
 example; use any folder you own.
 
 ```powershell
-git clone https://github.com/YOUR_GITHUB_USERNAME/OpenSea-Mint-Bot.git
+git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git
 cd OpenSea-Mint-Bot
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -113,18 +120,24 @@ Fill in `.env` as described below. Do not rename it and do not commit it.
 Then validate the setup:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 python status.py
 ```
 
-Start the Telegram controller:
+Start the terminal controller:
+
+```powershell
+python cli.py
+```
+
+Or start the Telegram controller:
 
 ```powershell
 python telegram_bot.py
 ```
 
-Keep that PowerShell window open while you use the bot. Only one process may
-poll a Telegram token at a time.
+Keep that window open while you use the bot. Schedules only fire while the
+process is alive. Only one process may poll a Telegram token at a time.
 
 ## Configure `.env`
 
@@ -135,6 +148,11 @@ ALCHEMY_API_KEY=your_alchemy_key
 PRIVATE_KEY=0xyour_bot_wallet_private_key
 WALLET_ADDRESS=0xyour_bot_wallet_address
 OPENSEA_API_KEY=your_opensea_key
+```
+
+Telegram is optional. Add these only if you want Telegram control:
+
+```text
 TELEGRAM_BOT_TOKEN=your_botfather_token
 TELEGRAM_ALLOWED_CHAT_ID=your_private_chat_id
 ```
@@ -189,6 +207,32 @@ not create multiple mints because the raw transaction and hash are identical.
 
 Set `DISCOVERY_UTC_OFFSET_HOURS` to the fixed offset you want for the
 midnight-to-midnight scan. For example, West Africa Time is `1`; UTC is `0`.
+
+## Terminal first use
+
+1. Start the process with `python cli.py`.
+2. If `.env` is empty, the setup wizard asks for your Alchemy key, wallet
+   private key (hidden), and OpenSea key. The public address is derived for you.
+3. Use the numbered home menu: scan, paste a link, wallet, schedules, settings,
+   or stay online.
+4. Pick a network, then a mint window. Each step shows latency.
+5. Mint now or schedule. Live sends still need `ENABLE_LIVE_MINTS=true` plus
+   typing `MINT`/`ARM`.
+6. Leave the window open, or choose **Stay online for schedules**, so armed
+   mints can fire.
+
+One-shot examples:
+
+```powershell
+python cli.py scan base
+python cli.py info https://opensea.io/collection/example
+python cli.py mint 1 --qty 1
+python cli.py schedule 1 --yes
+python cli.py watch
+```
+
+`python main.py` opens the same CLI. `python main.py --confirm-live` is the older
+config.py fire path and still requires live mode.
 
 ## Telegram first use
 
@@ -264,7 +308,7 @@ sudo apt install -y git python3 python3-venv
 sudo useradd --system --create-home --shell /usr/sbin/nologin openseabot
 sudo mkdir -p /opt/opensea-mint-bot
 sudo chown openseabot:openseabot /opt/opensea-mint-bot
-sudo -u openseabot git clone https://github.com/YOUR_GITHUB_USERNAME/OpenSea-Mint-Bot.git /opt/opensea-mint-bot
+sudo -u openseabot git clone https://github.com/Takumixbt/OpenSea-Mint-Bot.git /opt/opensea-mint-bot
 sudo -u openseabot python3 -m venv /opt/opensea-mint-bot/.venv
 sudo -u openseabot /opt/opensea-mint-bot/.venv/bin/pip install -r /opt/opensea-mint-bot/requirements.txt
 sudo -u openseabot cp /opt/opensea-mint-bot/.env.example /opt/opensea-mint-bot/.env
@@ -293,27 +337,26 @@ Never run two copies with the same Telegram token. If Telegram reports a
 
 ## Agent setup prompt
 
-You can give the following prompt to a coding agent in a terminal. Replace
-`YOUR_REPOSITORY_URL` with the repository URL you trust. The prompt tells the
-agent to leave live execution off until you personally approve it.
+You can give the following prompt to a coding agent in a terminal. The prompt
+tells the agent to leave live execution off until you personally approve it.
 
 ```text
-Set up OpenSea Mint Bot from YOUR_REPOSITORY_URL on this computer.
+Set up OpenSea Mint Bot from https://github.com/Takumixbt/OpenSea-Mint-Bot.git on this computer.
 
 Rules:
 1. Work only inside a new project folder and never modify unrelated projects.
 2. Clone the repository, create a Python 3.11+ virtual environment, and install
    requirements.txt.
 3. Copy .env.example to .env.
-4. Ask me to enter API keys, wallet values, and the Telegram token locally. Do
-   not ask me to paste private keys, seed phrases, bot tokens, or API keys into
-   chat, logs, Git, or a code file.
+4. Ask me to enter API keys and wallet values locally. Telegram token is
+   optional. Do not ask me to paste private keys, seed phrases, bot tokens, or
+   API keys into chat, logs, Git, or a code file.
 5. Confirm .env is ignored by Git and run a secret scan before any commit.
 6. Keep ENABLE_LIVE_MINTS=false, MAX_MINT_PRICE_NATIVE=0, and
    MAX_BUY_PRICE_NATIVE=0. Do not enable live execution or send a transaction.
-7. Run `python -m unittest discover -s tests -v` and `python status.py`.
-8. Start `python telegram_bot.py` only after the checks pass and tell me to
-   send /start to the bot.
+7. Run `python -m pytest tests -q` and `python status.py`.
+8. Start `python cli.py` after the checks pass. Start `python telegram_bot.py`
+   only if I configured a Telegram token, and then tell me to send /start.
 9. Explain what is still missing if status.py reports a blocked item.
 10. Do not create, modify, or publish any wallet transaction without a separate
     confirmation from me in the terminal session.
@@ -323,9 +366,9 @@ Rules:
 
 The project-owned `opensea_direct_executor.py` is the low-latency on-chain
 executor for compatible public SeaDrop stages. It is integrated into the
-Telegram scheduler and signs a checked transaction during warm-up, so no
-browser, Chrome session, or wallet extension is required. It has its own
-project-owned implementation and naming.
+Telegram scheduler and the terminal CLI. It signs a checked transaction during
+warm-up, so no browser, Chrome session, or wallet extension is required. It has
+its own project-owned implementation and naming.
 
 Read [DIRECT_EXECUTION.md](DIRECT_EXECUTION.md) for the exact setup, Telegram
 flow, VPS service, timing model, supported routes, and the upgrades included
@@ -387,6 +430,7 @@ generated deployment output in a pull request.
 
 ## License and contributions
 
-This project is released under the MIT License. Contributions should preserve
-the confirmation gates, price caps, secret handling, and refusal of unknown
-mint routes.
+This project is released under the MIT License. Maintained by
+[Takumi](https://github.com/Takumixbt). Contributions should preserve the
+confirmation gates, price caps, secret handling, and refusal of unknown mint
+routes.

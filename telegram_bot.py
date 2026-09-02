@@ -373,24 +373,32 @@ class TelegramBot:
 
     def prewarm_calendar(self):
         """Load the drop calendar in the background so the first scan is warm."""
+        def done(counts, errors, age):
+            if counts is None:
+                print("Drop calendar prewarm skipped.", flush=True)
+                return
+            total = sum(counts.values())
+            print(
+                f"Drop calendar ready: {total} drops across "
+                f"{len(counts)} network(s).",
+                flush=True,
+            )
+
+        warmer = getattr(self.service, "prewarm_calendar", None)
+        if callable(warmer):
+            warmer(on_done=done)
+            return
+
         reader = getattr(self.service, "chain_coverage", None)
         if not callable(reader):
             return
 
         def warm():
             try:
-                counts, _errors, _age = reader()
-                total = sum(counts.values())
-                print(
-                    f"Drop calendar ready: {total} drops across "
-                    f"{len(counts)} network(s).",
-                    flush=True,
-                )
-            except Exception as exc:
-                # Failing to pre-warm is not fatal; the first scan will simply
-                # pay the cold read itself.
-                print(f"Drop calendar prewarm skipped ({type(exc).__name__}).",
-                      flush=True)
+                counts, errors, age = reader()
+                done(counts, errors, age)
+            except Exception:
+                done(None, None, None)
 
         threading.Thread(target=warm, name="calendar-prewarm", daemon=True).start()
 
@@ -1869,8 +1877,14 @@ class TelegramBot:
     def start_wallet_status(
         self, chat_id, chain_slug=None, message_id=None, wallet_id="primary"
     ):
-        if chain_slug and chain_slug not in self.service.supported_chains():
-            raise ValueError("choose one of the enabled networks from the wallet screen")
+        if chain_slug:
+            resolved = config.resolve_chain_slug(chain_slug)
+            if resolved == "all":
+                chain_slug = None
+            elif resolved:
+                chain_slug = resolved
+            if chain_slug and chain_slug not in self.service.supported_chains():
+                raise ValueError("choose one of the enabled networks from the wallet screen")
         label = f"Check {pretty_chain(chain_slug)} wallet" if chain_slug else "Check wallet"
         self._background(
             chat_id, label,
@@ -4268,7 +4282,8 @@ class TelegramBot:
             "<code>/settings</code> \u00b7 <code>/stop</code>\n\n"
             "<i>Live transactions need ENABLE_LIVE_MINTS=true plus a confirmation tap. "
             "Automatic mode only ever attempts free public stages. Schedules run only "
-            "while this process is online.</i>"
+            "while this process is online. The same mint engine is also available from "
+            "the terminal with python cli.py.</i>"
         )
 
 

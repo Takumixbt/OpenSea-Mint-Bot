@@ -359,6 +359,64 @@ def chain_label(chain_slug):
     return slug.replace("_", " ").replace("-", " ").title()
 
 
+CHAIN_ALIASES = {
+    "eth": "ethereum",
+    "ether": "ethereum",
+    "ethereum": "ethereum",
+    "mainnet": "ethereum",
+    "base": "base",
+    "op": "optimism",
+    "opt": "optimism",
+    "optimism": "optimism",
+    "arb": "arbitrum",
+    "arbitrum": "arbitrum",
+    "matic": "polygon",
+    "poly": "polygon",
+    "polygon": "polygon",
+    "avax": "avalanche",
+    "avalanche": "avalanche",
+    "ape": "ape_chain",
+    "apechain": "ape_chain",
+    "ape_chain": "ape_chain",
+    "bera": "bera_chain",
+    "berachain": "bera_chain",
+    "bera_chain": "bera_chain",
+    "hyper": "hyperevm",
+    "hyperevm": "hyperevm",
+    "anime": "animechain",
+    "animechain": "animechain",
+    "mega": "megaeth",
+    "megaeth": "megaeth",
+    "stable": "stablechain",
+    "stablechain": "stablechain",
+    "gun": "gunzilla",
+    "gunzilla": "gunzilla",
+    "uni": "unichain",
+    "unichain": "unichain",
+}
+
+
+def resolve_chain_slug(value):
+    """Map ETH, Base, ethereum, etc. to a CHAIN_CONFIGS slug, or ``all``."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    collapsed = raw.replace(" ", "_").replace("-", "_")
+    if collapsed in {"all", "*", "every"}:
+        return "all"
+    if collapsed in CHAIN_CONFIGS:
+        return collapsed
+    if collapsed in CHAIN_ALIASES:
+        return CHAIN_ALIASES[collapsed]
+    for slug, label in CHAIN_DISPLAY_NAMES.items():
+        if label.lower().replace(" ", "_") == collapsed:
+            return slug
+    for slug in CHAIN_CONFIGS:
+        if chain_label(slug).lower().replace(" ", "_") == collapsed:
+            return slug
+    return None
+
+
 # A blank MONITORED_CHAINS value also falls back to this setting. "all" makes
 # /scan cover every OpenSea EVM drop instead of silently omitting newer chains.
 MONITORED_CHAINS = "all"
@@ -404,7 +462,7 @@ DISCOVERY_REQUEST_DELAY_SECONDS = 0.15
 DISCOVERY_UTC_OFFSET_HOURS = "0"
 
 # Daily scheduler defaults. Live mode remains disabled until the operator sets
-# ENABLE_LIVE_MINTS=true and confirms it from the authorized Telegram chat.
+# ENABLE_LIVE_MINTS=true and confirms it from the CLI or the authorized Telegram chat.
 DAILY_SCAN_INTERVAL_SECONDS = 24 * 60 * 60
 MAX_DAILY_MINTS = 5
 MAX_DAILY_GAS_NATIVE = "0.05"
