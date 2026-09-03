@@ -339,6 +339,8 @@ if __name__ == "__main__":
         from cli import main as cli_main
         raise SystemExit(cli_main())
     try:
+        from resolver import install as install_secure_dns
+        install_secure_dns()
         main()
     except KeyboardInterrupt:
         print("\nStopped by you (Ctrl-C).")

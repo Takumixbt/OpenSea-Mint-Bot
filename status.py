@@ -249,6 +249,8 @@ def check_official_opensea_api():
 
 
 def main() -> int:
+    from resolver import install as install_secure_dns
+    install_secure_dns()
     parser = argparse.ArgumentParser(description="Read-only NFT Mint Bot readiness report")
     parser.add_argument("--no-network", action="store_true", help="skip RPC and OpenSea endpoint checks")
     args = parser.parse_args()

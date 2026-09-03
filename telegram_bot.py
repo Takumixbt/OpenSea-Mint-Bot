@@ -4288,6 +4288,8 @@ class TelegramBot:
 
 
 def run_from_env():
+    from resolver import install as install_secure_dns
+    install_secure_dns()
     load_dotenv(ROOT / ".env")
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or "PASTE_" in token.upper() or "YOUR_" in token.upper():

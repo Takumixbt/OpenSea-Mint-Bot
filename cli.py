@@ -1406,6 +1406,8 @@ def repl(operator, parser=None, reader=None):
 
 
 def main(argv=None):
+    from resolver import install as install_secure_dns
+    install_secure_dns()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd == "help":
