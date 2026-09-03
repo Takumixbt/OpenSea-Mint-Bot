@@ -11,6 +11,9 @@ The private key is used only to sign, in memory. It is never printed or saved.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit
+import socket
+import threading
 import time
 
 from web3 import Web3
@@ -20,6 +23,8 @@ import config
 
 
 POA_CHAIN_IDS = {137}
+_DNS_CACHE = {}
+_DNS_LOCK = threading.Lock()
 
 # The warm-up connectivity check retries on this schedule. It runs inside the
 # warm-up lead, never after the mint opens.
@@ -40,6 +45,53 @@ def rpc_error_is_dns(exc):
             "temporary failure in name resolution",
         )
     )
+
+
+def rpc_hostname(url):
+    return (urlsplit(str(url or "")).hostname or "").lower()
+
+
+def hostname_resolves(host, timeout=1.0):
+    """Return whether ``host`` resolves, without waiting on a stuck resolver.
+
+    Some routers fail Alchemy DNS by hanging instead of returning NXDOMAIN.
+    Windows ``getaddrinfo`` has no timeout, so a hung lookup is abandoned.
+    """
+    host = str(host or "").strip().lower()
+    if not host:
+        return False
+    with _DNS_LOCK:
+        cached = _DNS_CACHE.get(host)
+        if cached is not None:
+            return cached
+    result = {"ok": False}
+
+    def lookup():
+        try:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            result["ok"] = True
+        except OSError:
+            result["ok"] = False
+
+    worker = threading.Thread(target=lookup, name="rpc-dns", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    ok = bool(result["ok"]) if not worker.is_alive() else False
+    with _DNS_LOCK:
+        _DNS_CACHE[host] = ok
+    return ok
+
+
+def rpc_url_is_reachable_host(url, timeout=1.0):
+    """Skip Alchemy hostnames that do not resolve in time.
+
+    Other public RPCs are left to the HTTP client; only Alchemy is known to
+    hang this resolver long enough to stall wallet checks.
+    """
+    host = rpc_hostname(url)
+    if not host.endswith("alchemy.com"):
+        return True
+    return hostname_resolves(host, timeout=timeout)
 
 
 class Minter:
@@ -85,7 +137,10 @@ class Minter:
                 f"the RPC actually connected to chain {live_chain_id}. Check "
                 f"CHAIN_CONFIGS in config.py maps TARGET_CHAIN_ID to the right RPC."
             )
-        extras = [url for url in self.rpc_urls if url != self.rpc_url]
+        extras = [
+            url for url in self.rpc_urls
+            if url != self.rpc_url and rpc_url_is_reachable_host(url)
+        ]
         if extras:
             # Never blast a transaction at an endpoint that reports a
             # different chain. A wrong-chain raw transaction cannot spend
@@ -152,6 +207,11 @@ class Minter:
         """
         last_error = None
         for url in self.rpc_urls:
+            if not rpc_url_is_reachable_host(url):
+                last_error = ConnectionError(
+                    f"NameResolutionError: Failed to resolve '{rpc_hostname(url)}'"
+                )
+                continue
             provider = self._providers.get(url) or self._http_provider(url)
             for attempt, pause in enumerate(WARMUP_RETRY_DELAYS_SECONDS, 1):
                 try:
@@ -222,6 +282,11 @@ class Minter:
         """
         last_error = None
         for url in self.rpc_urls:
+            if not rpc_url_is_reachable_host(url):
+                last_error = ConnectionError(
+                    f"NameResolutionError: Failed to resolve '{rpc_hostname(url)}'"
+                )
+                continue
             try:
                 provider = self._http_provider(url, timeout=timeout)
                 balance = int(provider.eth.get_balance(self.address))

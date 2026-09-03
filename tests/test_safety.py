@@ -1234,7 +1234,9 @@ class MinterLaunchTests(unittest.TestCase):
             def to_checksum_address(value):
                 return "0x" + "1" * 40
 
-        with patch.object(minter_module, "Web3", FakeW3):
+        with patch.object(minter_module, "Web3", FakeW3), patch.object(
+            minter_module, "hostname_resolves", return_value=True
+        ):
             instance = minter_module.Minter(
                 "https://eth-mainnet.g.alchemy.com/v2/test-key",
                 "0x" + "11" * 32,
@@ -1247,6 +1249,17 @@ class MinterLaunchTests(unittest.TestCase):
             )
             self.assertEqual(instance.peek_balance(), 42)
             self.assertEqual(instance.last_peek_url, "https://cloudflare-eth.com")
+
+    def test_alchemy_hosts_are_skipped_when_dns_does_not_resolve(self):
+        import minter as minter_module
+
+        self.assertTrue(minter_module.rpc_url_is_reachable_host("https://mainnet.base.org"))
+        with patch.object(minter_module, "hostname_resolves", return_value=False):
+            self.assertFalse(
+                minter_module.rpc_url_is_reachable_host(
+                    "https://eth-mainnet.g.alchemy.com/v2/test-key"
+                )
+            )
 
     def test_submission_state_is_not_re_read_right_after_warm_up(self):
         """Re-reading nonce and fees seconds later costs time and changes nothing."""

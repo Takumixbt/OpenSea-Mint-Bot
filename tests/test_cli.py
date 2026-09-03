@@ -449,6 +449,49 @@ class CliInteractiveTests(unittest.TestCase):
         self.assertEqual(service.wallet_calls[-1]["max_pages"], 1)
         self.assertIn("Loading every network", all_text)
 
+    def test_wallet_all_summarizes_unreachable_networks(self):
+        service = FakeCliService()
+
+        def snapshot(chain_slug=None, max_pages=5, wallet_id="primary", **kwargs):
+            service.wallet_calls.append({
+                "chain": chain_slug,
+                "max_pages": max_pages,
+                "wallet_id": wallet_id,
+            })
+            return {
+                "address": "0x0000000000000000000000000000000000000001",
+                "wallet": {
+                    "id": "primary",
+                    "label": "Primary",
+                    "address": "0x0000000000000000000000000000000000000001",
+                },
+                "chains": [
+                    {
+                        "chain": "ethereum",
+                        "native": "ETH",
+                        "balance_wei": 10 ** 15,
+                        "nft_count": 0,
+                        "errors": [],
+                    },
+                    {
+                        "chain": "optimism",
+                        "native": "ETH",
+                        "balance_wei": None,
+                        "nft_count": 0,
+                        "errors": ["cannot reach RPC (DNS)"],
+                    },
+                ],
+                "recent_mints": [],
+            }
+
+        service.wallet_snapshot = snapshot
+        code, text, _ = run(service, ["wallet", "all"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ethereum", text)
+        self.assertNotIn("cannot reach RPC (DNS)", text)
+        self.assertIn("1 network skipped", text)
+        self.assertIn("Optimism", text)
+
     def test_wallet_eth_alias_maps_to_ethereum(self):
         self.assertEqual(config.resolve_chain_slug("ETH"), "ethereum")
         self.assertEqual(config.resolve_chain_slug("Base"), "base")

@@ -643,6 +643,7 @@ class Operator:
         if chain is None:
             self.emit(dim("  Tip: wallet eth  or  wallet base is much faster."))
         rows = []
+        skipped = []
         for entry in snapshot.get("chains") or []:
             symbol = entry.get("native") or "native"
             balance = wei_to_native(entry.get("balance_wei"), symbol) if entry.get("balance_wei") is not None else "—"
@@ -651,16 +652,31 @@ class Operator:
             note = "; ".join(entry.get("errors") or [])
             if not note and entry.get("rpc_source") == "public":
                 note = "public RPC"
-            rows.append((
+            row = (
                 config.chain_label(entry.get("chain")),
                 balance,
                 nft_text,
                 note or "ok",
-            ))
+            )
+            if chain is None and entry.get("balance_wei") is None:
+                skipped.append(row[0])
+                continue
+            rows.append(row)
         if rows:
             self.emit(format_table(("Network", "Gas", "NFTs", "Note"), rows, max_width=28))
-        notes = " ".join(row[3] for row in rows).lower()
-        if rows and all(entry.get("balance_wei") is None for entry in snapshot.get("chains") or []):
+        if skipped:
+            noun = "network" if len(skipped) == 1 else "networks"
+            self.emit(dim(
+                f"  {len(skipped)} {noun} skipped (RPC DNS): " + ", ".join(skipped)
+            ))
+            self.emit(dim("  Those chains are only needed if you mint on them."))
+        if not rows:
+            self.emit(dim(
+                "  Could not reach an RPC. Check internet/DNS, or set "
+                "MINT_RPC_URL_ETHEREUM / MINT_RPC_URL_BASE in .env."
+            ))
+        elif all(entry.get("balance_wei") is None for entry in snapshot.get("chains") or []):
+            notes = " ".join(row[3] for row in rows).lower()
             if "dns" in notes or "unreachable" in notes:
                 self.emit(dim(
                     "  Could not reach an RPC. Check internet/DNS, or set "
