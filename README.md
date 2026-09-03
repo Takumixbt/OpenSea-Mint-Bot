@@ -218,8 +218,13 @@ the scan is empty, the windows are outside `DISCOVERY_WINDOW_HOURS`.
 sold out, or unpublished in the Drops feeds. Paste the URL into **info** /
 `/info` instead. If there is still no safe route, the bot is supposed to refuse.
 
+**Wallet row says cannot reach RPC (DNS).** Your DNS cannot resolve the RPC
+hostname (Alchemy is a common case). The bot already tries that chain's public
+RPC next. If both fail, set `MINT_RPC_URL_ETHEREUM` or `MINT_RPC_URL_BASE` in
+`.env` to an RPC you can reach, then retry `wallet eth` or `wallet base`.
+
 **Wallet row says RPC timeout / no NFT index.** That network has no usable
-Alchemy RPC or OpenSea NFT index. Check `wallet eth` or `wallet base` instead of
+RPC or OpenSea NFT index. Check `wallet eth` or `wallet base` instead of
 `wallet all` if you only care about those chains.
 
 **Telegram Conflict.** Another process is already polling that token. Stop the

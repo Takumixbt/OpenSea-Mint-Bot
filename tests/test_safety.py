@@ -1109,7 +1109,7 @@ class DailyRunnerSafetyTests(unittest.TestCase):
 class MinterLaunchTests(unittest.TestCase):
     """The launch path must survive a blip and must not repeat warm-up reads."""
 
-    def _minter(self, chain_calls):
+    def _minter(self, chain_calls, rpc_urls=None):
         import minter as minter_module
 
         class FakeEth:
@@ -1160,14 +1160,21 @@ class MinterLaunchTests(unittest.TestCase):
             def to_wei(value, unit):
                 return int(float(value) * 10 ** 9)
 
-        with patch.object(minter_module, "Web3", FakeW3), patch.object(
+        web3_patch = patch.object(minter_module, "Web3", FakeW3)
+        delay_patch = patch.object(
             minter_module, "WARMUP_RETRY_DELAYS_SECONDS", (0, 0, 0, 0)
-        ):
-            instance = minter_module.Minter(
-                "https://rpc.test", "0x" + "11" * 32, "0x" + "1" * 40, 8453
-            )
-            yield_value = instance
-        return yield_value
+        )
+        web3_patch.start()
+        delay_patch.start()
+        self.addCleanup(web3_patch.stop)
+        self.addCleanup(delay_patch.stop)
+        return minter_module.Minter(
+            "https://rpc.test",
+            "0x" + "11" * 32,
+            "0x" + "1" * 40,
+            8453,
+            rpc_urls=rpc_urls,
+        )
 
     def test_warm_up_survives_a_transient_rpc_blip(self):
         """One failed connectivity check must not destroy a scheduled mint."""
@@ -1183,6 +1190,63 @@ class MinterLaunchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             minter.warm_up()
         self.assertIn("Cannot reach the blockchain", str(caught.exception))
+
+    def test_warm_up_falls_back_when_primary_rpc_cannot_resolve(self):
+        dns_error = ConnectionError(
+            "NameResolutionError: Failed to resolve 'eth-mainnet.g.alchemy.com'"
+        )
+        minter = self._minter(
+            [dns_error, 8453],
+            rpc_urls=["https://rpc.test", "https://public.test"],
+        )
+        live_chain, nonce = minter.warm_up()
+        self.assertEqual(live_chain, 8453)
+        self.assertEqual(nonce, 3)
+        self.assertEqual(minter.rpc_url, "https://public.test")
+
+    def test_peek_balance_uses_the_next_rpc_when_primary_dns_fails(self):
+        import minter as minter_module
+
+        class FakeEth:
+            def __init__(self, url):
+                self.url = url
+
+            def get_balance(self, *a, **k):
+                if "alchemy" in str(self.url):
+                    raise ConnectionError("NameResolutionError: getaddrinfo failed")
+                return 42
+
+        class FakeW3:
+            current_url = None
+
+            def __init__(self, *a, **k):
+                self.eth = FakeEth(FakeW3.current_url)
+                self.middleware_onion = type(
+                    "M", (), {"inject": lambda *a, **k: None}
+                )()
+
+            @staticmethod
+            def HTTPProvider(url, **k):
+                FakeW3.current_url = url
+                return object()
+
+            @staticmethod
+            def to_checksum_address(value):
+                return "0x" + "1" * 40
+
+        with patch.object(minter_module, "Web3", FakeW3):
+            instance = minter_module.Minter(
+                "https://eth-mainnet.g.alchemy.com/v2/test-key",
+                "0x" + "11" * 32,
+                "0x" + "1" * 40,
+                1,
+                rpc_urls=[
+                    "https://eth-mainnet.g.alchemy.com/v2/test-key",
+                    "https://cloudflare-eth.com",
+                ],
+            )
+            self.assertEqual(instance.peek_balance(), 42)
+            self.assertEqual(instance.last_peek_url, "https://cloudflare-eth.com")
 
     def test_submission_state_is_not_re_read_right_after_warm_up(self):
         """Re-reading nonce and fees seconds later costs time and changes nothing."""
@@ -1649,6 +1713,7 @@ class DiscoverySafetyTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "MINT_RPC_URL_BASE": "",
                 "MINT_RPC_URLS_BASE": "https://base-one.example, https://base-two.example",
                 "MINT_RPC_URLS": "https://generic.example",
             },
@@ -1656,10 +1721,34 @@ class DiscoverySafetyTests(unittest.TestCase):
         ):
             urls = config.rpc_urls_for_chain("test-key", 8453)
         self.assertEqual(urls[0], config.rpc_url_for_chain("test-key", 8453))
-        self.assertEqual(urls[1:], [
+        self.assertEqual(urls[0], "https://base-mainnet.g.alchemy.com/v2/test-key")
+        self.assertEqual(urls[1], "https://mainnet.base.org")
+        self.assertEqual(urls[2:], [
             "https://base-one.example",
             "https://base-two.example",
         ])
+
+    def test_public_rpc_is_used_when_alchemy_key_is_missing(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MINT_RPC_URL_ETHEREUM": "",
+                "MINT_RPC_URL_BASE": "",
+                "MINT_RPC_URL_STABLECHAIN": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(config.rpc_url_for_chain("", 1), "https://ethereum.publicnode.com")
+            self.assertEqual(config.rpc_url_for_chain("", 8453), "https://mainnet.base.org")
+            with self.assertRaisesRegex(ValueError, "ALCHEMY_API_KEY is required"):
+                config.rpc_url_for_chain("", 988)
+
+    def test_rpc_urls_include_public_fallback_after_alchemy(self):
+        with patch.dict(os.environ, {"MINT_RPC_URL_ETHEREUM": "", "MINT_RPC_URLS": ""}, clear=False):
+            urls = config.rpc_urls_for_chain("test-key", 1)
+        self.assertEqual(urls[0], "https://eth-mainnet.g.alchemy.com/v2/test-key")
+        self.assertEqual(urls[1], "https://ethereum.publicnode.com")
+        self.assertIn("https://cloudflare-eth.com", urls)
 
     def test_wallet_registry_derives_extra_addresses_and_rejects_duplicates(self):
         primary_key = "0x" + "11" * 32

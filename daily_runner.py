@@ -29,8 +29,16 @@ ROOT = Path(__file__).resolve().parent
 def _wallet_issue(exc, kind):
     """Turn RPC/NFT failures into a short status-table note."""
     text = f"{type(exc).__name__}: {redact_secrets(exc)}".lower()
-    if "timeout" in text or "timed out" in text or "cannot reach" in text:
+    if "nameresolution" in text or "getaddrinfo" in text or "nodename nor servname" in text:
+        return "cannot reach RPC (DNS)"
+    if "timeout" in text or "timed out" in text:
         return "RPC timeout" if kind == "balance" else "NFT timeout"
+    if "max retries" in text or "connectionerror" in text or "connection refused" in text:
+        return "RPC unreachable"
+    if "401" in text or "403" in text or "unauthorized" in text or "forbidden" in text:
+        return "Alchemy rejected this network"
+    if "alchemy_api_key is required" in text:
+        return "Alchemy key missing"
     if "mismatch" in text:
         return "RPC mismatch"
     if "404" in text or "not found" in text or "unsupported" in text:
@@ -299,13 +307,20 @@ class DailyMintService:
                 "notices": [],
             }
             try:
+                rpc_urls = config.rpc_urls_for_chain(
+                    self.alchemy_key, int(chain["chain_id"])
+                )
                 minter = Minter(
-                    config.rpc_url_for_chain(self.alchemy_key, int(chain["chain_id"])),
+                    rpc_urls[0],
                     profile.private_key,
                     profile.address,
                     int(chain["chain_id"]),
+                    rpc_urls=rpc_urls,
                 )
                 entry["balance_wei"] = minter.peek_balance()
+                peek_url = str(minter.last_peek_url or "").lower()
+                if peek_url and "alchemy.com" not in peek_url:
+                    entry["rpc_source"] = "public"
             except Exception as exc:
                 entry["errors"].append(_wallet_issue(exc, "balance"))
             try:

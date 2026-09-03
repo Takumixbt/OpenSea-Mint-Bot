@@ -649,6 +649,8 @@ class Operator:
             nfts = entry.get("nft_count")
             nft_text = "—" if nfts is None else str(nfts) + ("+" if entry.get("nft_count_capped") else "")
             note = "; ".join(entry.get("errors") or [])
+            if not note and entry.get("rpc_source") == "public":
+                note = "public RPC"
             rows.append((
                 config.chain_label(entry.get("chain")),
                 balance,
@@ -657,6 +659,13 @@ class Operator:
             ))
         if rows:
             self.emit(format_table(("Network", "Gas", "NFTs", "Note"), rows, max_width=28))
+        notes = " ".join(row[3] for row in rows).lower()
+        if rows and all(entry.get("balance_wei") is None for entry in snapshot.get("chains") or []):
+            if "dns" in notes or "unreachable" in notes:
+                self.emit(dim(
+                    "  Could not reach an RPC. Check internet/DNS, or set "
+                    "MINT_RPC_URL_ETHEREUM / MINT_RPC_URL_BASE in .env."
+                ))
         history = snapshot.get("recent_mints") or []
         if history:
             self.emit("")

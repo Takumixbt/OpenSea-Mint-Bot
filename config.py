@@ -258,42 +258,166 @@ if DIRECT_SEADROP_START_TOLERANCE_SECONDS < 0:
 # OpenSea mainnet chain slugs that can be signed by the configured EVM wallet.
 # The list mirrors OpenSea's current /chains response. Solana and Hyperliquid
 # (the non-EVM exchange chain, distinct from HyperEVM) are intentionally absent.
-# Most routes use Alchemy's universal-key endpoint; the three networks Alchemy
-# does not currently expose use their official public RPC by default. Every
-# network can be overridden with MINT_RPC_URL_<CHAIN> in .env.
+# When ALCHEMY_API_KEY is set, Alchemy is tried first. If that hostname cannot
+# be reached (DNS filters, outages, or a network Alchemy does not expose),
+# the chain's public HTTP RPC is used instead. Override either with
+# MINT_RPC_URL_<CHAIN> in .env.
 CHAIN_CONFIGS = {
-    "ethereum": {"chain_id": 1, "rpc_subdomain": "eth-mainnet", "native": "ETH", "explorer": "https://etherscan.io"},
-    "optimism": {"chain_id": 10, "rpc_subdomain": "opt-mainnet", "native": "ETH", "explorer": "https://optimistic.etherscan.io"},
-    "unichain": {"chain_id": 130, "rpc_subdomain": "unichain-mainnet", "native": "ETH", "explorer": "https://uniscan.xyz"},
-    "polygon": {"chain_id": 137, "rpc_subdomain": "polygon-mainnet", "native": "POL", "explorer": "https://polygonscan.com"},
-    "monad": {"chain_id": 143, "rpc_subdomain": "monad-mainnet", "native": "MON", "explorer": "https://monadscan.com"},
-    "shape": {"chain_id": 360, "rpc_subdomain": "shape-mainnet", "native": "ETH", "explorer": "https://shapescan.xyz"},
-    "flow": {"chain_id": 747, "rpc_subdomain": "flow-mainnet", "native": "FLOW", "explorer": "https://evm.flowscan.io"},
+    "ethereum": {
+        "chain_id": 1,
+        "rpc_subdomain": "eth-mainnet",
+        "rpc_url": (
+            "https://ethereum.publicnode.com",
+            "https://cloudflare-eth.com",
+        ),
+        "native": "ETH",
+        "explorer": "https://etherscan.io",
+    },
+    "optimism": {
+        "chain_id": 10,
+        "rpc_subdomain": "opt-mainnet",
+        "rpc_url": "https://optimism.publicnode.com",
+        "native": "ETH",
+        "explorer": "https://optimistic.etherscan.io",
+    },
+    "unichain": {
+        "chain_id": 130,
+        "rpc_subdomain": "unichain-mainnet",
+        "rpc_url": "https://mainnet.unichain.org",
+        "native": "ETH",
+        "explorer": "https://uniscan.xyz",
+    },
+    "polygon": {
+        "chain_id": 137,
+        "rpc_subdomain": "polygon-mainnet",
+        "rpc_url": "https://polygon-bor-rpc.publicnode.com",
+        "native": "POL",
+        "explorer": "https://polygonscan.com",
+    },
+    "monad": {
+        "chain_id": 143,
+        "rpc_subdomain": "monad-mainnet",
+        "rpc_url": "https://rpc.monad.xyz",
+        "native": "MON",
+        "explorer": "https://monadscan.com",
+    },
+    "shape": {
+        "chain_id": 360,
+        "rpc_subdomain": "shape-mainnet",
+        "rpc_url": "https://mainnet.shape.network",
+        "native": "ETH",
+        "explorer": "https://shapescan.xyz",
+    },
+    "flow": {
+        "chain_id": 747,
+        "rpc_subdomain": "flow-mainnet",
+        "rpc_url": "https://mainnet.evm.nodes.onflow.org",
+        "native": "FLOW",
+        "explorer": "https://evm.flowscan.io",
+    },
     "stablechain": {"chain_id": 988, "rpc_subdomain": "stable-mainnet", "native": "USDT0", "explorer": "https://stablescan.xyz"},
-    "hyperevm": {"chain_id": 999, "rpc_subdomain": "hyperliquid-mainnet", "native": "HYPE", "explorer": "https://hyperevmscan.io"},
-    "sei": {"chain_id": 1329, "rpc_subdomain": "sei-mainnet", "native": "SEI", "explorer": "https://seiscan.io"},
-    "soneium": {"chain_id": 1868, "rpc_subdomain": "soneium-mainnet", "native": "ETH", "explorer": "https://soneium.blockscout.com"},
-    "ronin": {"chain_id": 2020, "rpc_subdomain": "ronin-mainnet", "native": "RON", "explorer": "https://app.roninchain.com"},
-    "abstract": {"chain_id": 2741, "rpc_subdomain": "abstract-mainnet", "native": "ETH", "explorer": "https://abscan.org"},
+    "hyperevm": {
+        "chain_id": 999,
+        "rpc_subdomain": "hyperliquid-mainnet",
+        "rpc_url": "https://rpc.hyperliquid.xyz/evm",
+        "native": "HYPE",
+        "explorer": "https://hyperevmscan.io",
+    },
+    "sei": {
+        "chain_id": 1329,
+        "rpc_subdomain": "sei-mainnet",
+        "rpc_url": "https://evm-rpc.sei-apis.com",
+        "native": "SEI",
+        "explorer": "https://seiscan.io",
+    },
+    "soneium": {
+        "chain_id": 1868,
+        "rpc_subdomain": "soneium-mainnet",
+        "rpc_url": "https://rpc.soneium.org",
+        "native": "ETH",
+        "explorer": "https://soneium.blockscout.com",
+    },
+    "ronin": {
+        "chain_id": 2020,
+        "rpc_subdomain": "ronin-mainnet",
+        "rpc_url": "https://api.roninchain.com/rpc",
+        "native": "RON",
+        "explorer": "https://app.roninchain.com",
+    },
+    "abstract": {
+        "chain_id": 2741,
+        "rpc_subdomain": "abstract-mainnet",
+        "rpc_url": "https://api.mainnet.abs.xyz",
+        "native": "ETH",
+        "explorer": "https://abscan.org",
+    },
     "megaeth": {"chain_id": 4326, "rpc_subdomain": "megaeth-mainnet", "native": "ETH", "explorer": "https://mega.etherscan.io"},
     "robinhood": {"chain_id": 4663, "rpc_subdomain": "robinhood-mainnet", "native": "ETH", "explorer": "https://robinhoodchain.blockscout.com"},
     "somnia": {"chain_id": 5031, "rpc_url": "https://api.infra.mainnet.somnia.network", "native": "SOMI", "explorer": "https://explorer.somnia.network"},
     "b3": {"chain_id": 8333, "rpc_url": "https://mainnet-rpc.b3.fun", "native": "ETH", "explorer": "https://explorer.b3.fun"},
-    "base": {"chain_id": 8453, "rpc_subdomain": "base-mainnet", "native": "ETH", "explorer": "https://basescan.org"},
-    "ape_chain": {"chain_id": 33139, "rpc_subdomain": "apechain-mainnet", "native": "APE", "explorer": "https://apescan.io"},
-    "arbitrum": {"chain_id": 42161, "rpc_subdomain": "arb-mainnet", "native": "ETH", "explorer": "https://arbiscan.io"},
-    "avalanche": {"chain_id": 43114, "rpc_subdomain": "avax-mainnet", "native": "AVAX", "explorer": "https://snowtrace.io"},
+    "base": {
+        "chain_id": 8453,
+        "rpc_subdomain": "base-mainnet",
+        "rpc_url": "https://mainnet.base.org",
+        "native": "ETH",
+        "explorer": "https://basescan.org",
+    },
+    "ape_chain": {
+        "chain_id": 33139,
+        "rpc_subdomain": "apechain-mainnet",
+        "rpc_url": "https://rpc.apechain.com",
+        "native": "APE",
+        "explorer": "https://apescan.io",
+    },
+    "arbitrum": {
+        "chain_id": 42161,
+        "rpc_subdomain": "arb-mainnet",
+        "rpc_url": "https://arbitrum-one.publicnode.com",
+        "native": "ETH",
+        "explorer": "https://arbiscan.io",
+    },
+    "avalanche": {
+        "chain_id": 43114,
+        "rpc_subdomain": "avax-mainnet",
+        "rpc_url": "https://avalanche-c-chain-rpc.publicnode.com",
+        "native": "AVAX",
+        "explorer": "https://snowtrace.io",
+    },
     "gunzilla": {
         "chain_id": 43419,
         "rpc_url": "https://subnets.avax.network/gunzilla/mainnet/rpc",
         "native": "GUN",
         "explorer": "https://gunzscan.io",
     },
-    "ink": {"chain_id": 57073, "rpc_subdomain": "ink-mainnet", "native": "ETH", "explorer": "https://explorer.inkonchain.com"},
+    "ink": {
+        "chain_id": 57073,
+        "rpc_subdomain": "ink-mainnet",
+        "rpc_url": "https://rpc-gel.inkonchain.com",
+        "native": "ETH",
+        "explorer": "https://explorer.inkonchain.com",
+    },
     "animechain": {"chain_id": 69000, "rpc_subdomain": "anime-mainnet", "native": "ANIME", "explorer": "https://explorer.anime.xyz"},
-    "bera_chain": {"chain_id": 80094, "rpc_subdomain": "berachain-mainnet", "native": "BERA", "explorer": "https://berascan.com"},
-    "blast": {"chain_id": 81457, "rpc_subdomain": "blast-mainnet", "native": "ETH", "explorer": "https://blastscan.io"},
-    "zora": {"chain_id": 7777777, "rpc_subdomain": "zora-mainnet", "native": "ETH", "explorer": "https://explorer.zora.energy"},
+    "bera_chain": {
+        "chain_id": 80094,
+        "rpc_subdomain": "berachain-mainnet",
+        "rpc_url": "https://rpc.berachain.com",
+        "native": "BERA",
+        "explorer": "https://berascan.com",
+    },
+    "blast": {
+        "chain_id": 81457,
+        "rpc_subdomain": "blast-mainnet",
+        "rpc_url": "https://rpc.blast.io",
+        "native": "ETH",
+        "explorer": "https://blastscan.io",
+    },
+    "zora": {
+        "chain_id": 7777777,
+        "rpc_subdomain": "zora-mainnet",
+        "rpc_url": "https://rpc.zora.energy",
+        "native": "ETH",
+        "explorer": "https://explorer.zora.energy",
+    },
 }
 
 # Telegram inline buttons render emoji but not images, so each network gets one
@@ -523,6 +647,17 @@ def chain_config(chain_slug):
     return CHAIN_CONFIGS.get((chain_slug or "").strip().lower())
 
 
+def _http_rpc_urls(settings):
+    raw = (settings or {}).get("rpc_url")
+    values = raw if isinstance(raw, (list, tuple)) else [raw]
+    urls = []
+    for value in values:
+        url = str(value or "").strip()
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    return urls
+
+
 def rpc_url_for_chain(alchemy_key, chain_id):
     """Return the configured primary RPC URL for an OpenSea EVM chain."""
     for slug, settings in CHAIN_CONFIGS.items():
@@ -532,34 +667,38 @@ def rpc_url_for_chain(alchemy_key, chain_id):
         if override.startswith(("http://", "https://")):
             return override
         subdomain = str(settings.get("rpc_subdomain") or "").strip()
-        if subdomain:
-            if not str(alchemy_key or "").strip():
-                raise ValueError(f"ALCHEMY_API_KEY is required for {slug}")
+        if subdomain and str(alchemy_key or "").strip():
             return f"https://{subdomain}.g.alchemy.com/v2/{alchemy_key}"
-        public_rpc = str(settings.get("rpc_url") or "").strip()
-        if public_rpc.startswith(("http://", "https://")):
-            return public_rpc
+        public_rpcs = _http_rpc_urls(settings)
+        if public_rpcs:
+            return public_rpcs[0]
+        if subdomain:
+            raise ValueError(f"ALCHEMY_API_KEY is required for {slug}")
         raise ValueError(f"chain ID {chain_id} has no configured RPC endpoint")
     raise ValueError(f"chain ID {chain_id} has no configured RPC mapping")
 
 
 def rpc_urls_for_chain(alchemy_key, chain_id):
-    """Return the primary RPC plus optional broadcast endpoints.
+    """Return the primary RPC plus public and optional broadcast endpoints.
 
-    ``MINT_RPC_URLS_<CHAIN>`` (or the generic ``MINT_RPC_URLS``) may contain
-    comma-separated HTTP(S) endpoints. The chain's primary endpoint remains
-    first for reads and transaction preparation; extra endpoints are used to
+    Alchemy (or ``MINT_RPC_URL_<CHAIN>``) stays first for reads. The chain's
+    public HTTP RPC is appended so wallet checks and mint warm-up still work
+    when Alchemy's hostname cannot be resolved. ``MINT_RPC_URLS_<CHAIN>``
+    (or the generic ``MINT_RPC_URLS``) may add extra HTTP(S) endpoints used to
     fan out an identical signed transaction at launch.
     """
     primary = rpc_url_for_chain(alchemy_key, chain_id)
     slug = chain_slug_for_id(chain_id)
+    settings = chain_config(slug) or {}
+    urls = [primary]
+    for public_rpc in _http_rpc_urls(settings):
+        if public_rpc not in urls:
+            urls.append(public_rpc)
     configured = ""
     if slug:
         configured = os.getenv(f"MINT_RPC_URLS_{slug.upper()}", "").strip()
     if not configured:
         configured = os.getenv("MINT_RPC_URLS", "").strip()
-
-    urls = [primary]
     for value in configured.split(","):
         value = value.strip()
         if not value or value in urls:

@@ -26,6 +26,22 @@ POA_CHAIN_IDS = {137}
 WARMUP_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0)
 
 
+def rpc_error_is_dns(exc):
+    """Return whether an RPC failure is a hostname that never resolved."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        token in text
+        for token in (
+            "nameresolution",
+            "getaddrinfo",
+            "nodename nor servname",
+            "failed to resolve",
+            "name or service not known",
+            "temporary failure in name resolution",
+        )
+    )
+
+
 class Minter:
     def __init__(self, rpc_url, private_key, address, chain_id, rpc_urls=None):
         self.rpc_url = str(rpc_url)
@@ -53,6 +69,7 @@ class Minter:
         self._warmed_at = None
         self._cached_balance = None
         self._balance_read_at = None
+        self.last_peek_url = None
 
     def warm_up(self):
         """
@@ -68,7 +85,8 @@ class Minter:
                 f"the RPC actually connected to chain {live_chain_id}. Check "
                 f"CHAIN_CONFIGS in config.py maps TARGET_CHAIN_ID to the right RPC."
             )
-        if len(self.rpc_urls) > 1:
+        extras = [url for url in self.rpc_urls if url != self.rpc_url]
+        if extras:
             # Never blast a transaction at an endpoint that reports a
             # different chain. A wrong-chain raw transaction cannot spend
             # funds, but filtering it keeps the launch path predictable.
@@ -82,12 +100,12 @@ class Minter:
 
             verified = {self.rpc_url}
             with ThreadPoolExecutor(
-                max_workers=min(8, len(self.rpc_urls) - 1),
+                max_workers=min(8, len(extras)),
                 thread_name_prefix="rpc-check",
             ) as pool:
                 futures = {
                     pool.submit(endpoint_provider, url): url
-                    for url in self.rpc_urls[1:]
+                    for url in extras
                 }
                 for future in as_completed(futures):
                     url = futures[future]
@@ -98,8 +116,10 @@ class Minter:
                     if endpoint_chain == int(self.chain_id):
                         verified.add(url)
                         self._providers[url] = provider
-            # Preserve the configured order after concurrent verification.
-            self.rpc_urls = [url for url in self.rpc_urls if url in verified]
+            # Working endpoint first, then any extra endpoints that matched.
+            self.rpc_urls = [self.rpc_url] + [
+                url for url in extras if url in verified
+            ]
         # "pending" so that if this wallet somehow has a transaction already
         # waiting in the pool, we take the next number after it instead of
         # colliding with it.
@@ -111,26 +131,44 @@ class Minter:
         self._warmed_at = time.monotonic()
         return live_chain_id, self._cached_nonce
 
+    def _http_provider(self, url, timeout=15):
+        provider = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": timeout}))
+        if int(self.chain_id) in POA_CHAIN_IDS:
+            provider.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return provider
+
+    def _adopt_provider(self, url, provider):
+        self.rpc_url = str(url)
+        self.w3 = provider
+        self._providers[self.rpc_url] = provider
+
     def _connect_with_retry(self):
-        """Confirm the RPC is reachable, tolerating a transient blip.
+        """Confirm an RPC is reachable, failing over when the primary cannot resolve.
 
         Reading the chain id both proves connectivity and opens the connection
         pool. This runs inside the warm-up lead, well before the opening, so
-        the retries can never delay a broadcast.
+        the retries can never delay a broadcast. A DNS failure skips immediately
+        to the next configured endpoint instead of waiting out the retry budget.
         """
         last_error = None
-        for attempt, pause in enumerate(WARMUP_RETRY_DELAYS_SECONDS, 1):
-            try:
-                return int(self.w3.eth.chain_id)
-            except Exception as exc:
-                last_error = exc
-                if attempt < len(WARMUP_RETRY_DELAYS_SECONDS):
-                    time.sleep(pause)
+        for url in self.rpc_urls:
+            provider = self._providers.get(url) or self._http_provider(url)
+            for attempt, pause in enumerate(WARMUP_RETRY_DELAYS_SECONDS, 1):
+                try:
+                    live_chain_id = int(provider.eth.chain_id)
+                    self._adopt_provider(url, provider)
+                    return live_chain_id
+                except Exception as exc:
+                    last_error = exc
+                    if rpc_error_is_dns(exc):
+                        break
+                    if attempt < len(WARMUP_RETRY_DELAYS_SECONDS):
+                        time.sleep(pause)
         raise RuntimeError(
             "Cannot reach the blockchain after "
             f"{len(WARMUP_RETRY_DELAYS_SECONDS)} attempts "
-            f"({type(last_error).__name__}). Check ALCHEMY_API_KEY and the "
-            "network in .env."
+            f"({type(last_error).__name__}). Check ALCHEMY_API_KEY, DNS, or "
+            "MINT_RPC_URL_<CHAIN> in .env."
         ) from last_error
 
     def refresh_nonce(self):
@@ -177,13 +215,24 @@ class Minter:
         return self._cached_balance
 
     def peek_balance(self, timeout=6):
-        """One status-only balance read. Does not warm mint RPC pools or retry."""
-        provider = Web3(
-            Web3.HTTPProvider(self.rpc_url, request_kwargs={"timeout": timeout})
-        )
-        if int(self.chain_id) in POA_CHAIN_IDS:
-            provider.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        return int(provider.eth.get_balance(self.address))
+        """One status-only balance read. Does not warm mint RPC pools or retry.
+
+        Tries each configured endpoint once so a DNS failure on Alchemy can
+        still return a balance from the chain's public RPC.
+        """
+        last_error = None
+        for url in self.rpc_urls:
+            try:
+                provider = self._http_provider(url, timeout=timeout)
+                balance = int(provider.eth.get_balance(self.address))
+                self.last_peek_url = url
+                return balance
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no RPC endpoint responded")
 
     def funding_preview(self, mint_value_wei=0):
         """Return a read-only funding envelope; never build, sign, or send."""
