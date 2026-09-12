@@ -13,3 +13,4 @@ state/
 .audit-RAYmyS/
 x-ray/
 .ruff_cache/
+/test-nft/

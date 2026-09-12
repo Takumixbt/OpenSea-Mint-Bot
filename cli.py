@@ -101,29 +101,36 @@ def white(text):
     return _paint(text, "97")
 
 
-OPENSEA_ART = (
-    "  ___  ___ ___ _  _ ___ ___   _   ",
-    " / _ \\| _ \\ __| \\| / __| __| /_\\  ",
-    "| (_) |  _/ _|| .` \\__ \\ _| / _ \\ ",
-    " \\___/|_| |___|_|\\_|___/___/_/ \\_\\",
+BANNER_WIDE = (
+    r"   ___  ____  _____ _   _ ____  _____    _        __  __ ___ _   _ _____",
+    r"  / _ \|  _ \| ____| \ | / ___|| ____|  / \      |  \/  |_ _| \ | |_   _|",
+    r" | | | | |_) |  _| |  \| \___ \|  _|   / _ \     | |\/| || ||  \| | | |  ",
+    r" | |_| |  __/| |___| |\  |___) | |___ / ___ \    | |  | || || |\  | | |  ",
+    r"  \___/|_|   |_____|_| \_|____/|_____/_/   \_\   |_|  |_|___|_| \_| |_|  ",
 )
-MINTBOT_ART = (
-    " __  __ ___ _  _ _____   ___  ___ _____",
-    "|  \\/  |_ _| \\| |_   _| | _ )/ _ \\_   _|",
-    "| |\\/| || || .` | | |   | _ \\ (_) || |  ",
-    "|_|  |_|___|_|\\_| |_|   |___/\\___/ |_|  ",
+BANNER_STACKED = (
+    "   ___  ____  _____ _   _ ____  _____    _",
+    "  / _ \\|  _ \\| ____| \\ | / ___|| ____|  / " + "\\",
+    " | | | | |_) |  _| |  \\| \\___ \\|  _|   / _ " + "\\",
+    " | |_| |  __/| |___| |\\  |___) | |___ / ___ " + "\\",
+    "  \\___/|_|   |_____|_| \\_|____/|_____/_/   \\_\\",
+    "",
+    "  __  __ ___ _   _ _____",
+    " |  \\/  |_ _| \\ | |_   _|",
+    " | |\\/| || ||  \\| | | |",
+    " | |  | || || |\\  | | |",
+    " |_|  |_|___|_| \\_| |_|",
 )
 
 
 def _ascii_title_lines():
-    paired = [left + "  " + right for left, right in zip(OPENSEA_ART, MINTBOT_ART)]
     try:
         width = shutil.get_terminal_size((120, 24)).columns
     except Exception:
         width = 120
-    if width >= max(len(line) for line in paired) + 14:
-        return paired
-    return list(OPENSEA_ART) + [""] + list(MINTBOT_ART)
+    if width >= max(len(line) for line in BANNER_WIDE) + 12:
+        return list(BANNER_WIDE)
+    return list(BANNER_STACKED)
 
 
 def banner(compact=False):
@@ -131,12 +138,8 @@ def banner(compact=False):
     if compact:
         return "\n" + bold("  OPENSEA MINT BOT") + "  " + credit
     lines = _ascii_title_lines()
-    rows = []
-    for index, line in enumerate(lines):
-        if index == len(lines) - 1:
-            rows.append(white(line.rstrip()) + "  " + credit)
-        else:
-            rows.append(white(line))
+    rows = [white(line) for line in lines]
+    rows.append(dim("  scan · paste a link · mint or arm") + "  " + credit)
     return "\n" + "\n".join(rows)
 
 
@@ -381,6 +384,8 @@ def build_parser(prog=None):
     scan = sub.add_parser("scan", help="scan OpenSea drops")
     scan.add_argument("chain", nargs="?", help="network slug, all, or omit for the picker")
     scan.add_argument("--refresh", action="store_true", help="bypass the drop calendar cache")
+    scan.add_argument("--free", action="store_true", help="only free stages")
+    scan.add_argument("--public", action="store_true", help="only public stages")
 
     sub.add_parser("list", help="show the last scan")
     sub.add_parser("networks", help="show drop counts per network")
@@ -443,6 +448,7 @@ class Operator:
         self.last_shown = []
         self.last_shown_networks = []
         self.last_scan_chain = None
+        self.last_scan_ms = None
 
     def emit(self, text=""):
         self.out(str(text))
@@ -504,7 +510,18 @@ class Operator:
         self.emit("  Wallets")
         for wallet in wallets:
             self.emit(f"    {wallet['label']:<12} {wallet['id']:<12} {wallet['address']}")
-        self.emit(dim("Caps change this process only. Put lasting values in .env."))
+        self.emit(dim("Caps change this process only. Live toggle writes .env."))
+        return 0
+
+    def set_live_enabled(self, enabled):
+        value = "true" if enabled else "false"
+        upsert_env({"ENABLE_LIVE_MINTS": value})
+        os.environ["ENABLE_LIVE_MINTS"] = value
+        load_dotenv(ENV_PATH, override=True)
+        state = "ON" if enabled else "off"
+        self.emit(f"Live minting is {state}. Restart is not required.")
+        if enabled:
+            self.emit(yellow("  Mint and Arm still ask for confirmation."))
         return 0
 
     def cmd_cap(self, args):
@@ -554,21 +571,29 @@ class Operator:
                 chain = chain.lower()
         if chain in {None, "picker", "networks"}:
             return self.cmd_networks(args)
+        self.emit(dim("  Reading OpenSea drop calendar…"))
         (scanned, errors), ms = timed(
             self.service.scan_now,
             None if chain == "all" else chain,
-            force_refresh=bool(args.refresh),
+            force_refresh=bool(getattr(args, "refresh", False)),
         )
+        scanned = self._apply_scan_filters(scanned, args)
         self.context_candidates = []
         self.last_shown = list(scanned)
         self.last_scan_chain = None if chain in {None, "all"} else chain
+        self.last_scan_ms = ms
         label = "every network" if chain == "all" else config.chain_label(chain)
-        self.emit(bold(f"Scan · {label}") + f"  {len(scanned)} window(s)  ·  {format_latency(ms)}")
+        free_n = sum(1 for item in scanned if item.get("is_free") and item.get("is_public"))
+        self.emit(
+            bold(f"Scan · {label}")
+            + f"  {len(scanned)} window(s)  ·  {free_n} free public  ·  {format_latency(ms)}"
+        )
         if scanned:
             self.emit(self._format_scan(scanned, None))
+            self.emit(dim("Next: show 1   ·   info 1   ·   mint 1   ·   schedule 1"))
         else:
             self.emit("No mint windows in the current scan horizon.")
-            self.emit(dim("Try another network, widen DISCOVERY_WINDOW_HOURS, or paste a link into info."))
+            self.emit(dim("Try another network, scan --free, or paste a link into info."))
         if errors:
             self.emit(yellow("Notes: " + "; ".join(errors[:8])))
         return 0
@@ -896,6 +921,14 @@ class Operator:
     def _live_label(self):
         return red("ON") if self.service.live_enabled else green("off")
 
+    def _apply_scan_filters(self, scanned, args):
+        rows = list(scanned or [])
+        if getattr(args, "free", False):
+            rows = [item for item in rows if item.get("is_free") or item.get("price_wei") == 0]
+        if getattr(args, "public", False):
+            rows = [item for item in rows if item.get("is_public")]
+        return rows
+
     def _format_scan(self, candidates, chain_filter, start_index=1):
         rows = []
         for offset, candidate in enumerate(candidates, start_index):
@@ -906,13 +939,13 @@ class Operator:
                 str(offset),
                 candidate.get("name") or candidate.get("slug") or "—",
                 config.chain_label(candidate.get("chain")),
-                candidate.get("stage_label") or candidate.get("access_label") or "—",
+                config.access_tag(candidate),
                 candidate.get("price_display") or "—",
                 window_label(candidate),
             ))
         if not rows:
             return "Nothing to show."
-        return format_table(("#", "Project", "Chain", "Stage", "Price", "Opens"), rows)
+        return format_table(("#", "Project", "Chain", "Access", "Price", "Opens"), rows)
 
     def _format_candidate(self, candidate, heading="Mint"):
         qty = candidate.get("quantity") or config.MINT_QUANTITY
@@ -1017,13 +1050,14 @@ HELP_TEXT = """
 OPENSEA MINT BOT  ·  by Takumi
 
 Run with no arguments for the interactive menu.
-One-shot commands still work:
+One-shot commands:
 
-  scan [chain|all] [--refresh]   Network picker, or scan one/all networks
-  info <n|url>                   Research a scan row or any OpenSea URL
+  scan [chain|all] [--free] [--public] [--refresh]
+  info <n|url>                   Research a scan row or OpenSea URL
   mint <n|url> [--stage N] [--qty N] [--yes]
   schedule <n|url> [--yes]       Arm a one-time mint at the opening second
-  wallet [eth|base|all]          Balance and NFT count for one network, or all
+  wallet [eth|base|all]          Balance and NFT count
+  watch                          Stay online so armed schedules can fire
 
 Live sends need ENABLE_LIVE_MINTS=true plus confirmation.
 Telegram: python telegram_bot.py
@@ -1170,11 +1204,11 @@ class InteractiveApp:
                 self.op.emit("")
                 self.op.emit(f"  {bold('[1]')}  Scan for mints")
                 self.op.emit(f"  {bold('[2]')}  Paste an OpenSea link")
-                self.op.emit(f"  {bold('[3]')}  My wallet")
-                self.op.emit(f"  {bold('[4]')}  Schedules")
+                self.op.emit(f"  {bold('[3]')}  Wallet")
+                self.op.emit(f"  {bold('[4]')}  Armed schedules")
                 self.op.emit(f"  {bold('[5]')}  History")
-                self.op.emit(f"  {bold('[6]')}  Settings / setup")
-                self.op.emit(f"  {bold('[7]')}  Stay online for schedules")
+                self.op.emit(f"  {bold('[6]')}  Settings")
+                self.op.emit(f"  {bold('[7]')}  Stay online")
                 self.op.emit(f"  {bold('[q]')}  Quit")
                 self.op.emit("")
                 choice = self.ask().lower()
@@ -1226,7 +1260,7 @@ class InteractiveApp:
             self.op.emit(yellow("  That is not a network on the list."))
             self.wait()
             return
-        self.op.cmd_scan(SimpleNamespace(chain=chain, refresh=False))
+        self.op.cmd_scan(SimpleNamespace(chain=chain, refresh=False, free=False, public=False))
         self._pick_window(self.op.last_shown)
 
     def _network_from_choice(self, choice):
@@ -1290,10 +1324,22 @@ class InteractiveApp:
             self.wait()
             return
         self.op.emit("")
-        self.op.emit(dim("  Number = inspect that mint   b = back"))
+        self.op.emit(dim("  Number = that window   f = free public only   b = back"))
         choice = self.ask()
         if choice.lower() in {"", "b", "back"}:
             return
+        if choice.lower() in {"f", "free"}:
+            rows = [
+                item for item in rows
+                if item.get("is_free") and item.get("is_public")
+            ]
+            if not rows:
+                self.op.emit("  No free public windows in this scan.")
+                self.wait()
+                return
+            self.op.last_shown = list(rows)
+            self.op.emit(self.op._format_scan(rows, None))
+            return self._pick_window(rows, from_context=from_context)
         if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
             self.op.emit(yellow("  That number is not on the list."))
             self.wait()
@@ -1307,8 +1353,8 @@ class InteractiveApp:
         while True:
             self.op.emit("")
             self.op.emit(f"  {bold('[1]')}  Mint now")
-            self.op.emit(f"  {bold('[2]')}  Schedule this window")
-            self.op.emit(f"  {bold('[3]')}  Change quantity")
+            self.op.emit(f"  {bold('[2]')}  Arm for opening")
+            self.op.emit(f"  {bold('[3]')}  Quantity")
             self.op.emit(f"  {bold('[b]')}  Back")
             choice = self.ask().lower()
             if choice in {"b", "back", ""}:
@@ -1355,9 +1401,10 @@ class InteractiveApp:
     def _settings_menu(self):
         self.op.cmd_settings()
         self.op.emit("")
-        self.op.emit(f"  {bold('[1]')}  Enter / replace API keys and private key")
-        self.op.emit(f"  {bold('[2]')}  Set mint price cap")
-        self.op.emit(f"  {bold('[3]')}  Set buy price cap")
+        self.op.emit(f"  {bold('[1]')}  API keys and wallet")
+        self.op.emit(f"  {bold('[2]')}  Mint price cap")
+        self.op.emit(f"  {bold('[3]')}  Buy price cap")
+        self.op.emit(f"  {bold('[4]')}  Toggle live minting")
         self.op.emit(f"  {bold('[b]')}  Back")
         choice = self.ask().lower()
         if choice == "1":
@@ -1370,6 +1417,14 @@ class InteractiveApp:
             amount = self.ask("  Buy cap in native coin (0 = locked): ")
             if amount:
                 self.op.cmd_cap(SimpleNamespace(kind="buy", amount=amount))
+        elif choice == "4":
+            nxt = not self.op.service.live_enabled
+            word = "ON" if nxt else "off"
+            confirm = self.ask(f"  Type YES to set live minting {word}: ")
+            if confirm.lower() in {"yes", "y"}:
+                self.op.set_live_enabled(nxt)
+            else:
+                self.op.emit("  Cancelled.")
         self.wait()
 
     def _watch(self):

@@ -20,6 +20,9 @@ import uuid
 import httpx
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+import config
+from chain_assets import chain_logo, paste_logo
+
 
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
@@ -305,22 +308,28 @@ def _draw_identity(image, candidate, research, accent):
         y += 50
 
     raw_chain = str(candidate.get("chain") or "unknown")
-    chain = raw_chain.replace("_", " ").replace("-", " ").title()
+    chain = config.chain_label(raw_chain)
     badge = chain_color(raw_chain, accent)
 
-    # A filled chip in the network's own colour, so the chain is identifiable
-    # before the label is read.
     font = _font(19, bold=True)
     label_width = _text_width(draw, chain, font)
     top = y + 4
     height = 34
-    right = 66 + label_width + 46
-    _soft_rect(image, (66, top, right, top + height), height // 2,
+    logo = chain_logo(raw_chain, 28)
+    left = 66
+    chip_left = left + (36 if logo is not None else 0)
+    right = chip_left + label_width + 46
+    _soft_rect(image, (left, top, right, top + height), height // 2,
                fill=_alpha(badge, 58))
-    draw.rounded_rectangle((66, top, right, top + height),
+    draw.rounded_rectangle((left, top, right, top + height),
                            radius=height // 2, outline=badge, width=2)
-    draw.ellipse((84, top + 12, 94, top + 22), fill=badge)
-    draw.text((104, top + 7), chain, font=font, fill=CREAM)
+    if logo is not None:
+        paste_logo(image, logo, (left + 6, top + 3, left + 34, top + 31))
+        draw = ImageDraw.Draw(image)
+        draw.text((left + 40, top + 7), chain, font=font, fill=CREAM)
+    else:
+        draw.ellipse((left + 18, top + 12, left + 28, top + 22), fill=badge)
+        draw.text((left + 38, top + 7), chain, font=font, fill=CREAM)
 
     stage = str(candidate.get("stage_label") or "Stage unknown")
     _soft_text(

@@ -83,23 +83,24 @@ MAX_MINT_PRICE_NATIVE=0
 MAX_BUY_PRICE_NATIVE=0
 ```
 
-You should see an ASCII **OPENSEA MINT BOT** banner and a home menu:
+You should see a full **OPENSEA MINT** ASCII banner and a home menu:
 
 1. Scan for mints — pick a busy network, then a window
 2. Paste an OpenSea link — collection, drop, item, or asset
-3. My wallet — gas and NFT count
-4. Schedules
+3. Wallet
+4. Armed schedules
 5. History
-6. Settings / setup
+6. Settings
 7. Stay online so armed schedules can fire
 
-Scan Base (or Ethereum), open a window, and use **Mint now** or **Schedule**.
+Scan Base (or Ethereum), open a window, and use **Mint now** or **Arm for opening**.
 While live mode is off, that is a preview. Nothing is signed.
 
 Useful one-shots if you would rather not sit in the menu:
 
 ```powershell
 python cli.py scan base
+python cli.py scan base --free --public
 python cli.py wallet eth
 python cli.py wallet base
 python cli.py info https://opensea.io/collection/example
@@ -125,8 +126,10 @@ Create a bot with `@BotFather`, put `TELEGRAM_BOT_TOKEN` and
 python telegram_bot.py
 ```
 
-Send `/start`. Scan, paste a link, schedule, and confirm the same way. Cards
-show artwork when OpenSea has it. Only one process may poll a given bot token.
+Send `/start`. The home screen is Scan, paste a link, Wallet, Armed, Settings.
+Scan shows a numbered logo card; tap the matching number. Mint now or Arm —
+both re-check the live drop before signing. Only one process may poll a given
+bot token.
 
 ### Turning live mode on
 
@@ -235,12 +238,19 @@ duplicate.
 **The schedule did not fire.** The process was not running, the machine slept,
 the wallet lacked gas, or the price cap was still `0`.
 
+## Arc
+
+Arc (Circle's USDC-gas L1) is **not** a live signer network in this build.
+OpenSea has announced day-one support; official mainnet chain ID / RPC / slug
+are still moving. See [ROADMAP.md](ROADMAP.md).
+
 ## Tests
 
 ```powershell
 python -m pytest tests -q
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 Do not commit `.env`, `state/`, or wallet files.
 
 MIT License.

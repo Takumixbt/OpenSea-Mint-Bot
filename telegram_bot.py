@@ -24,13 +24,12 @@ from dotenv import load_dotenv
 import config
 from daily_runner import (
     DailyMintService,
-    is_free_public_candidate,
     quantity_limit,
     redact_secrets,
     same_candidate_stage,
     validate_quantity,
 )
-from chain_picker_card import build_picker_card
+from chain_picker_card import build_picker_card, picker_rows
 from nft_card import (
     PERSISTENT_BACKGROUND,
     build_mint_card,
@@ -1034,17 +1033,27 @@ class TelegramBot:
 
     def scan_job(self, chat_id, chain, target_id):
         scan_chain = None if chain == "all" else chain
+        started = time.perf_counter()
         candidates, errors = self.service.scan_now(scan_chain)
+        ms = (time.perf_counter() - started) * 1000
         self.last_scan_chain = chain
+        speed = f"{ms:.0f} ms" if ms < 1000 else f"{ms / 1000:.2f} s"
         if chain == "all":
             self._present(
                 chat_id,
-                self.render_chain_summary(candidates, errors),
+                self.render_chain_summary(
+                    candidates, errors,
+                    title=f"<b>All OpenSea mints today</b>\n<i>scanned in {esc(speed)}</i>",
+                ),
                 self.chain_summary_keyboard(candidates),
                 target_id,
             )
             return
-        title = f"🎨 <b>OpenSea mints · {esc(pretty_chain(chain))}</b>"
+        free_n = sum(1 for item in candidates if item.get("is_free") and item.get("is_public"))
+        title = (
+            f"<b>OpenSea mints · {esc(pretty_chain(chain))}</b>\n"
+            f"<i>{esc(len(candidates))} windows · {esc(free_n)} free public · {esc(speed)}</i>"
+        )
         self._present(
             chat_id,
             self.render_candidates(
@@ -1674,7 +1683,7 @@ class TelegramBot:
         brand = os.getenv("NFT_CARD_BRAND_NAME", "NFT Mint Bot").strip() or "NFT Mint Bot"
         text = (
             (notice + "\n\n" if notice else "")
-            + "<b>⚙️ More</b>\n\n"
+            + "<b>Settings</b>\n\n"
             f"<b>Live transactions:</b> {'Enabled' if self.service.live_enabled else 'Locked'}\n"
             f"<b>Maximum mint price:</b> {esc(config.MAX_MINT_PRICE_NATIVE)} native coin\n"
             f"<b>Fallback background:</b> {'Custom' if custom else 'Built in'}\n"
@@ -2059,9 +2068,9 @@ class TelegramBot:
                 self.service.last_candidates, scan_chain
             )
             chain_title = (
-                f"🎨 <b>OpenSea mints · {esc(pretty_chain(scan_chain))}</b>"
+                f"<b>OpenSea mints · {esc(pretty_chain(scan_chain))}</b>"
                 if scan_chain in self.service.supported_chains()
-                else "🎨 <b>Today’s mint options</b>"
+                else "<b>Today’s mint options</b>"
             )
             text = self.render_candidates(
                 visible_candidates,
@@ -2097,19 +2106,15 @@ class TelegramBot:
             candidate.get("opensea_url") or candidate.get("url"),
         )
         lines = [
-            "<b>🎨 Project</b>",
-            f"<b>Name:</b> {name}",
-            f"<b>Network:</b> {esc(pretty_chain(candidate.get('chain', 'unknown')))}",
-            f"<b>Mint windows today:</b> {esc(len(options))}",
-            "",
-            "Choose what you want to do:",
+            f"<b>{name}</b>",
+            f"{esc(pretty_chain(candidate.get('chain', 'unknown')))} · {esc(len(options))} window(s)",
             "",
         ]
         for position, (_, option) in enumerate(options, 1):
             timing = self._candidate_time_summary([(position, option)])
             lines.extend([
                 f"<b>{position}. {esc(option.get('stage_label', 'Mint window'))}</b> · {esc(option.get('price_display', 'Price unknown'))}",
-                f"   {esc(option.get('access_label', 'Eligibility unknown'))} · {esc(timing)}",
+                f"   {esc(config.access_tag(option))} · {esc(option.get('access_label', 'Eligibility unknown'))} · {esc(timing)}",
                 "",
             ])
         route_links = self._mint_links_html(candidate)
@@ -2121,7 +2126,7 @@ class TelegramBot:
             ])
         lines.append(
             f"<b>Mint method:</b> {esc(self._mint_method(candidate))}\n"
-            "Mint now and Schedule both refresh the selected window and run the same safety checks."
+            "Mint now and Arm both re-check this window before signing."
         )
         self._present(
             chat_id,
@@ -2445,25 +2450,29 @@ class TelegramBot:
 
     def home_text(self):
         snapshot = self.service.status_snapshot()
+        live = "LIVE" if snapshot["live_enabled"] else "live off"
+        armed = int(snapshot.get("schedule_count", 0) or 0)
+        options = int(snapshot["candidate_count"] or 0)
+        projects = int(snapshot.get("project_count", 0) or 0)
+        wallets = int(snapshot.get("wallet_count") or 1)
         lines = [
-            "<b>\U0001f6f0 Mint Bot</b>",
+            "<b>OpenSea Mint Bot</b>",
+            f"{esc(live)} · {esc(wallets)} wallet · {esc(armed)} armed",
             "",
         ]
-        options = int(snapshot["candidate_count"] or 0)
         if options:
             lines.append(
-                f"<b>{esc(snapshot.get('project_count', 0))}</b> projects \u00b7 "
-                f"<b>{esc(options)}</b> mint windows from the last scan"
+                f"Last scan: <b>{esc(projects)}</b> projects · "
+                f"<b>{esc(options)}</b> windows"
             )
+            lines.append("Open a project, or scan again.")
         else:
-            lines.append("No scan results yet.")
-        armed = int(snapshot.get("schedule_count", 0) or 0)
-        if armed:
-            lines.append(f"<b>{esc(armed)}</b> armed schedule(s)")
+            lines.append("Scan a network, or paste an OpenSea collection / drop URL.")
         if snapshot["mode"] != "stopped":
-            lines.append("Automatic scanning is <b>on</b>")
+            lines.append("Automatic free-public minting is <b>on</b>.")
         if not snapshot["live_enabled"]:
-            lines.append("<i>Live transactions are locked</i>")
+            lines.append("")
+            lines.append("<i>Signing is locked. Enable live minting in Settings when you are ready.</i>")
         return "\n".join(lines)
 
     def status_card(self):
@@ -2517,8 +2526,8 @@ class TelegramBot:
 
     def scan_picker_text(self, coverage=None, errors=None, age=None):
         """Describe what the drop calendar actually holds right now."""
-        live = {chain: count for chain, count in (coverage or {}).items() if count}
-        lines = ["<b>🔎 Pick a network</b>", ""]
+        live = picker_rows(coverage)
+        lines = ["<b>Pick a network</b>", ""]
         if coverage is None:
             lines.append("Choose a network to scan for OpenSea mints.")
             lines.append("")
@@ -2526,7 +2535,7 @@ class TelegramBot:
                 "<i>Per-network drop counts are unavailable right now.</i>"
             )
         elif live:
-            total = sum(live.values())
+            total = sum(count for _chain, count in live)
             word = "network" if len(live) == 1 else "networks"
             lines.append(
                 f"<b>{esc(total)}</b> drops across <b>{esc(len(live))}</b> {word} "
@@ -2534,8 +2543,8 @@ class TelegramBot:
             )
             lines.append("")
             lines.append(
-                "<i>Counts come from OpenSea's own drop calendar. A network that is "
-                "not listed has nothing scheduled.</i>"
+                "<i>Tap the matching number. Counts are OpenSea's calendar, "
+                "not a guarantee the wallet can mint.</i>"
             )
         else:
             lines.append("<b>OpenSea has no drops scheduled on any network.</b>")
@@ -2544,6 +2553,11 @@ class TelegramBot:
                 "<i>This is OpenSea's calendar, not a failed scan. Tap Refresh "
                 "in a few minutes.</i>"
             )
+        if age is not None:
+            try:
+                lines.append(f"<i>Calendar {esc(int(age))}s old.</i>")
+            except (TypeError, ValueError):
+                pass
         for error in (errors or [])[:2]:
             lines.append(f"⚠️ <i>{esc(error)}</i>")
         return "\n".join(lines).rstrip()
@@ -2616,7 +2630,7 @@ class TelegramBot:
                 ordered.append(chain)
         return [(chain, grouped.get(chain, [])) for chain in ordered]
 
-    def render_chain_summary(self, candidates, errors, title="🎨 <b>All OpenSea mints today</b>"):
+    def render_chain_summary(self, candidates, errors, title="<b>All OpenSea mints today</b>"):
         candidates = list(candidates or [])
         groups = self._chain_candidate_groups(candidates)
         project_count = len(project_groups(candidates))
@@ -3811,21 +3825,25 @@ class TelegramBot:
         return {"inline_keyboard": rows}
 
     def home_keyboard(self):
-        return self.markup([
-            [self.button("\U0001f50e Scan for mints", "chains")],
-            [
-                self.button("\U0001f517 Paste a link", "research:new"),
-                self.button("\u23f0 Schedule", "schedule:new"),
-            ],
-            [
-                self.button("\U0001f3a8 Last scan", "candidates"),
-                self.button("\U0001f4bc Wallet", "wallet"),
-            ],
-            [
-                self.button("\U0001f4cb Schedules", "schedules"),
-                self.button("\u2699\ufe0f More", "settings"),
-            ],
-        ])
+        snapshot = self.service.status_snapshot()
+        armed = int(snapshot.get("schedule_count") or 0)
+        windows = int(snapshot.get("candidate_count") or 0)
+        armed_label = f"Armed · {armed}" if armed else "Armed"
+        last_label = "Last scan"
+        chain = str(self.last_scan_chain or "").strip().lower()
+        if windows and chain and chain not in {"", "all"}:
+            last_label = f"Last scan · {pretty_chain(chain)} · {windows}"
+        elif windows:
+            last_label = f"Last scan · {windows}"
+        rows = [
+            [self.button("Scan", "chains")],
+            [self.button("Paste OpenSea link", "research:new")],
+            [self.button("Wallet", "wallet"), self.button(armed_label, "schedules")],
+        ]
+        if windows:
+            rows.append([self.button(last_label, "candidates")])
+        rows.append([self.button("Settings", "settings")])
+        return self.markup(rows)
 
     def status_keyboard(self):
         return self.markup([
@@ -3835,72 +3853,47 @@ class TelegramBot:
         ])
 
     def chain_keyboard(self, coverage=None, show_empty=False):
-        """Network picker ordered by how many drops each network actually has.
-
-        Listing every supported network as equally clickable was the main
-        reason /scan felt broken: most have no OpenSea drop on a given day, so
-        an honest empty result looked like a failure. Counts come from the
-        cached drop calendar and cost no extra API call.
-        """
+        """Numbered picker. Button n matches row n on the logo card."""
         chains = self.service.supported_chains()
         if coverage is None:
-            # Counts could not be read. That is not the same as "no drops", so
-            # fall back to the plain list rather than hiding every network.
-            rows = [[self.button("\U0001f310 Scan all networks", "scan:all")]]
-            for position in range(0, len(chains), 2):
-                rows.append([
-                    self.button(
-                        f"{config.chain_icon(chain)} {pretty_chain(chain)}",
-                        f"scan:{chain}",
-                    )
-                    for chain in chains[position:position + 2]
-                ])
+            rows = []
+            for chain in chains:
+                rows.append([self.button(pretty_chain(chain), f"scan:{chain}")])
+            rows.append([self.button("Scan every network", "scan:all")])
             rows.append([
-                self.button("\U0001f504 Refresh", "chains:refresh"),
-                self.button("\U0001f3e0 Home", "home"),
+                self.button("Refresh", "chains:refresh"),
+                self.button("Home", "home"),
             ])
             return self.markup(rows)
 
-        counts = {
+        live = picker_rows({
             str(chain).strip().lower(): int(count)
             for chain, count in coverage.items()
-        }
-        live = sorted(
-            (chain for chain in chains if counts.get(chain)),
-            key=lambda chain: (-counts[chain], chain),
-        )
-        empty = [chain for chain in chains if not counts.get(chain)]
+        })
+        live = [(chain, count) for chain, count in live if chain in set(chains)]
+        empty = [chain for chain in chains if chain not in {item[0] for item in live}]
 
         rows = []
+        for index, (chain, count) in enumerate(live, 1):
+            rows.append([self.button(
+                f"{index}  {pretty_chain(chain)} · {count}",
+                f"scan:{chain}",
+            )])
         if live:
-            total = sum(counts[chain] for chain in live)
-            rows.append([self.button(f"\U0001f310 All networks \u00b7 {total}", "scan:all")])
-            for position in range(0, len(live), 2):
-                rows.append([
-                    self.button(
-                        f"{config.chain_icon(chain)} {pretty_chain(chain)} \u00b7 {counts[chain]}",
-                        f"scan:{chain}",
-                    )
-                    for chain in live[position:position + 2]
-                ])
+            total = sum(count for _chain, count in live)
+            rows.append([self.button(f"Scan every network · {total}", "scan:all")])
         else:
-            rows.append([self.button("\U0001f310 Scan all networks", "scan:all")])
+            rows.append([self.button("Scan every network", "scan:all")])
 
         if show_empty:
-            for position in range(0, len(empty), 3):
-                rows.append([
-                    self.button(
-                        f"{config.chain_icon(chain)} {pretty_chain(chain)}",
-                        f"scan:{chain}",
-                    )
-                    for chain in empty[position:position + 3]
-                ])
+            for chain in empty:
+                rows.append([self.button(pretty_chain(chain), f"scan:{chain}")])
         elif empty:
-            rows.append([self.button(f"\u2795 Other networks ({len(empty)})", "chains:all")])
+            rows.append([self.button(f"Other networks ({len(empty)})", "chains:all")])
 
         rows.append([
-            self.button("\U0001f504 Refresh", "chains:refresh"),
-            self.button("\U0001f3e0 Home", "home"),
+            self.button("Refresh", "chains:refresh"),
+            self.button("Home", "home"),
         ])
         return self.markup(rows)
 
@@ -3954,9 +3947,10 @@ class TelegramBot:
             candidate = group["candidate"]
             label = short_text(candidate.get("name", candidate.get("slug", "Candidate")), 30)
             option_count = len(group["options"])
-            icon = "🟢" if any(is_free_public_candidate(item) for _, item in group["options"]) else "🎨"
+            tag = config.access_tag(candidate)
+            suffix = f" · {option_count}" if option_count > 1 else ""
             rows.append([self.button(
-                f"{icon} {label} · {option_count}",
+                f"{tag}  {label}{suffix}",
                 f"project:{project_token(candidate)}",
             )])
         if total_pages > 1:
@@ -3977,29 +3971,27 @@ class TelegramBot:
                 navigation.append(self.button("Next ➡️", callback))
             rows.append(navigation)
         if scan_chain == "all":
-            scan_button = self.button("🔄 Scan all networks again", "scan:all")
+            scan_button = self.button("Scan all again", "scan:all")
         elif scan_chain in self.service.supported_chains():
-            scan_button = self.button(f"🔄 Scan {pretty_chain(scan_chain)} again", f"scan:{scan_chain}")
+            scan_button = self.button(f"Scan {pretty_chain(scan_chain)} again", f"scan:{scan_chain}")
         else:
-            scan_button = self.button("🔎 Scan another network", "chains")
+            scan_button = self.button("Scan another network", "chains")
         rows.append([scan_button])
-        rows.append([self.button("⛓ Change network", "chains"), self.button("🏠 Home", "home")])
+        rows.append([self.button("Change network", "chains"), self.button("Home", "home")])
         return self.markup(rows)
 
     def project_keyboard(self, group):
         rows = []
         project_ref = project_token(group["candidate"])
         multiple = len(group["options"]) > 1
-        for _, candidate in group["options"]:
+        for position, (_, candidate) in enumerate(group["options"], 1):
             candidate_ref = candidate_token(candidate)
-            stage = short_text(candidate.get("stage_label", "Mint"), 14)
-            price = short_text(candidate.get("price_display", "Unknown"), 12)
             if multiple:
-                mint_label = f"🚀 Mint {stage} · {price}"
-                schedule_label = f"⏰ Schedule {stage} · {price}"
+                mint_label = f"Mint {position}"
+                schedule_label = f"Arm {position}"
             else:
-                mint_label = "🚀 Mint now"
-                schedule_label = "⏰ Schedule"
+                mint_label = "Mint now"
+                schedule_label = "Arm"
             rows.append([
                 self.button(mint_label, f"project:mint:{project_ref}:{candidate_ref}"),
                 self.button(schedule_label, f"project:schedule:{project_ref}:{candidate_ref}"),
@@ -4008,20 +4000,17 @@ class TelegramBot:
         collection_url = candidate.get("opensea_url") or candidate.get("url")
         explicit_mint_url = candidate.get("mint_url")
         if safe_http_url(explicit_mint_url):
-            rows.append([self.url_button("🚀 Open mint page", explicit_mint_url)])
+            rows.append([self.url_button("Mint page", explicit_mint_url)])
         if safe_http_url(collection_url):
-            rows.append([self.url_button("🌊 OpenSea drop page", collection_url)])
-        project_url = candidate.get("project_url")
-        if safe_http_url(project_url) and str(project_url).strip() != str(collection_url or "").strip():
-            rows.append([self.url_button("🌐 Project site", project_url)])
+            rows.append([self.url_button("OpenSea", collection_url)])
         chain = str(candidate.get("chain") or "").strip().lower()
         page = self._project_group_page(group)
         back = (
-            self.button(f"↩️ {pretty_chain(chain)} projects", f"candidates:chain:{chain}:page:{page}")
+            self.button(f"{pretty_chain(chain)} list", f"candidates:chain:{chain}:page:{page}")
             if chain in self.service.supported_chains()
-            else self.button("↩️ All projects", "candidates")
+            else self.button("Results", "candidates")
         )
-        rows.append([back, self.button("🏠 Home", "home")])
+        rows.append([back, self.button("Home", "home")])
         return self.markup(rows)
 
     def candidate_detail_keyboard(self, index, candidate=None, page=None):
@@ -4035,16 +4024,12 @@ class TelegramBot:
         if candidate.get("is_sold_out") is not True:
             rows.extend([
                 [
-                    self.button("🚀 Mint now", f"mint:{index}:{token}:live"),
-                    self.button("⏰ Schedule", f"schedule:candidate:{index}:{token}"),
+                    self.button("Mint now", f"mint:{index}:{token}:live"),
+                    self.button("Arm", f"schedule:candidate:{index}:{token}"),
                 ],
-                [self.button(f"📦 Quantity: {quantity}", f"quantity:candidate:{index}:{token}"),
-                 self.button(f"👛 Wallets: {wallet_count}", f"wallets:candidate:{index}:{token}")],
+                [self.button(f"Qty {quantity}", f"quantity:candidate:{index}:{token}"),
+                 self.button(f"Wallets {wallet_count}", f"wallets:candidate:{index}:{token}")],
             ])
-        rows.append([
-            self.button("ℹ️ Mint info", f"info:candidate:{index}:{token}"),
-            self.button("🖼 Mint card", f"card:candidate:{index}:{token}"),
-        ])
         chain = str(candidate.get("chain") or "").strip().lower()
         back_callback = (
             f"candidates:chain:{chain}:page:{page}"
@@ -4052,8 +4037,8 @@ class TelegramBot:
             else f"candidates:page:{page}"
         )
         rows.append([
-            self.button("↩️ Back to results", back_callback),
-            self.button("🏠 Home", "home"),
+            self.button("Back", back_callback),
+            self.button("Home", "home"),
         ])
         return self.markup(rows)
 
@@ -4065,29 +4050,30 @@ class TelegramBot:
         ])
 
     def settings_keyboard(self, custom_background=False):
-        """Everything the home screen no longer shows lives one tap in here."""
+        """Secondary controls. Home stays four actions."""
         rows = [
             [
-                self.button("\U0001f4ca Status", "status"),
-                self.button("\U0001f9fe Mint history", "wallet:mints"),
+                self.button("Status", "status"),
+                self.button("History", "wallet:mints"),
             ],
             [
-                self.button("\U0001f916 Automatic mode", "daily"),
-                self.button("\u2753 Help", "help"),
+                self.button("Auto mint", "daily"),
+                self.button("Help", "help"),
             ],
-            [self.button("\U0001f4b0 Maximum mint price", "settings:cap")],
+            [self.button("Mint price cap", "settings:cap")],
+            [self.button("Buy price cap", "settings:buycap")],
             [
-                self.button("\U0001f441 Preview card", "settings:preview"),
-                self.button("\U0001f5bc Card background", "settings:bg"),
+                self.button("Card preview", "settings:preview"),
+                self.button("Card look", "settings:bg"),
             ],
             [
-                self.button("\U0001f3a8 Accent color", "settings:accent"),
-                self.button("\u270f\ufe0f Card brand", "settings:brand"),
+                self.button("Accent", "settings:accent"),
+                self.button("Brand", "settings:brand"),
             ],
         ]
         if custom_background:
-            rows.append([self.button("\u21a9\ufe0f Reset card background", "settings:bg:reset")])
-        rows.append([self.button("\U0001f3e0 Home", "home")])
+            rows.append([self.button("Reset card background", "settings:bg:reset")])
+        rows.append([self.button("Home", "home")])
         return self.markup(rows)
 
     def schedule_input_keyboard(self):
@@ -4140,27 +4126,23 @@ class TelegramBot:
         if candidate.get("is_sold_out") is not True:
             rows.extend([
                 [
-                    self.button("✅ Schedule mint", f"schedule:live:{token}"),
-                    self.button("🚀 Mint now", f"schedule:mint:live:{token}"),
+                    self.button("Arm this window", f"schedule:live:{token}"),
+                    self.button("Mint now", f"schedule:mint:live:{token}"),
                 ],
-                [self.button(f"📦 Quantity: {quantity}", f"quantity:schedule:{token}"),
-                 self.button(f"👛 Wallets: {wallet_count}", f"wallets:schedule:{token}")],
+                [self.button(f"Qty {quantity}", f"quantity:schedule:{token}"),
+                 self.button(f"Wallets {wallet_count}", f"wallets:schedule:{token}")],
             ])
-        rows.append([
-            self.button("ℹ️ Mint info", f"info:schedule:{token}"),
-            self.button("🖼 Mint card", f"card:schedule:{token}"),
-        ])
         rows.extend([
-            [self.button("↩️ Choose another mint", "schedule:stages")],
-            [self.button("📋 My schedules", "schedules"), self.button("🏠 Home", "home")],
+            [self.button("Choose another window", "schedule:stages")],
+            [self.button("Armed", "schedules"), self.button("Home", "home")],
         ])
         return self.markup(rows)
 
     def confirm_schedule_keyboard(self, candidate):
         token = candidate_token(candidate)
         return self.markup([
-            [self.button("✅ Confirm schedule", f"schedule:live:confirm:{token}")],
-            [self.button("↩️ Back", f"schedule:stage:{token}")],
+            [self.button("Confirm arm", f"schedule:live:confirm:{token}")],
+            [self.button("Back", f"schedule:stage:{token}")],
         ])
 
     def schedules_keyboard(self, schedules):
@@ -4197,8 +4179,8 @@ class TelegramBot:
         candidate = candidate or self._candidate_at(index)
         token = candidate_token(candidate)
         return self.markup([
-            [self.button("✅ Confirm mint now", f"mint:{index}:{token}:live:confirm")],
-            [self.button("↩️ Back", f"candidate:{index}:{token}")],
+            [self.button("Confirm mint", f"mint:{index}:{token}:live:confirm")],
+            [self.button("Back", f"candidate:{index}:{token}")],
         ])
 
     def candidate_card_keyboard(self, index, candidate):
@@ -4219,20 +4201,13 @@ class TelegramBot:
         candidate = self._research_candidate(research)
         rows = []
         collection_url = (candidate or {}).get("opensea_url") or research.get("opensea_url")
-        if safe_http_url(collection_url):
-            rows.append([self.url_button("🌊 OpenSea drop page", collection_url)])
         if candidate and candidate.get("is_sold_out") is not True:
-            rows.append([
-                self.button("🖼 Mint card", f"research:card:{token}"),
-                self.button("📦 Quantity", f"quantity:schedule:{candidate_token(candidate)}"),
-            ])
-            rows.append([
-                self.button("👛 Wallets", f"wallets:schedule:{candidate_token(candidate)}")
-            ])
-            rows.append([self.button("🚀 Mint now", f"research:live:{token}")])
+            rows.append([self.button("Mint now", f"research:live:{token}")])
         if research.get("mint_candidates"):
-            rows.append([self.button("📌 Choose a mint", f"research:stages:{token}")])
-        rows.append([self.button("ℹ️ New mint info", "research:new"), self.button("🏠 Home", "home")])
+            rows.append([self.button("Arm a window", f"research:stages:{token}")])
+        if safe_http_url(collection_url):
+            rows.append([self.url_button("OpenSea", collection_url)])
+        rows.append([self.button("Paste another link", "research:new"), self.button("Home", "home")])
         return self.markup(rows)
 
     def research_card_keyboard(self, token, candidate, research):
@@ -4248,42 +4223,30 @@ class TelegramBot:
     @staticmethod
     def command_menu():
         return [
-            {"command": "start", "description": "open the control center"},
-            {"command": "status", "description": "show safe runner status"},
-            {"command": "wallet", "description": "balances, NFT counts, and mint status"},
-            {"command": "mints", "description": "show recent mint transactions"},
-            {"command": "scan", "description": "choose a network and scan OpenSea mints"},
-            {"command": "candidates", "description": "review scan results"},
-            {"command": "info", "description": "show concise OpenSea hosted-mint info"},
-            {"command": "schedule", "description": "arm a one-time mint schedule"},
-            {"command": "schedules", "description": "view or cancel schedules"},
-            {"command": "daily", "description": "open daily runner controls"},
-            {"command": "mint", "description": "review one candidate"},
-            {"command": "settings", "description": "mint cap, wallet, and card controls"},
-            {"command": "stop", "description": "stop the daily runner"},
-            {"command": "help", "description": "show command help"},
+            {"command": "start", "description": "home"},
+            {"command": "scan", "description": "pick a network and scan"},
+            {"command": "info", "description": "paste an OpenSea URL"},
+            {"command": "wallet", "description": "balances and NFT counts"},
+            {"command": "schedules", "description": "armed mints"},
+            {"command": "settings", "description": "caps, live switch, help"},
+            {"command": "help", "description": "how this bot works"},
         ]
 
     @staticmethod
     def help_text():
         return (
-            "<b>\u2753 How this bot works</b>\n\n"
-            "<b>1. Scan</b> \u2014 <code>/scan</code> shows which networks have OpenSea "
-            "drops right now, with a count each. Pick one.\n\n"
-            "<b>2. Review</b> \u2014 tap a project to see its mint windows, price, "
-            "eligibility, and wallet limit.\n\n"
-            "<b>3. Mint or schedule</b> \u2014 mint now, or arm a window that has not "
-            "opened yet. Both re-check the live drop before signing.\n\n"
-            "<b>Have a link already?</b> <code>/info &lt;OpenSea URL&gt;</code> jumps "
-            "straight to a drop.\n\n"
-            "<b>Other commands</b>\n"
-            "<code>/wallet</code> \u00b7 <code>/mints</code> \u00b7 "
-            "<code>/schedules</code> \u00b7 <code>/status</code> \u00b7 "
-            "<code>/settings</code> \u00b7 <code>/stop</code>\n\n"
-            "<i>Live transactions need ENABLE_LIVE_MINTS=true plus a confirmation tap. "
-            "Automatic mode only ever attempts free public stages. Schedules run only "
-            "while this process is online. The same mint engine is also available from "
-            "the terminal with python cli.py.</i>"
+            "<b>How this bot works</b>\n\n"
+            "<b>1. Scan</b> — pick a numbered network. The picture and the "
+            "buttons use the same numbers.\n\n"
+            "<b>2. Open a project</b> — each window shows FREE PUB / GATED / SOLD.\n\n"
+            "<b>3. Mint now or Arm</b> — Arm fires at the opening second. Both "
+            "re-check the live drop before signing.\n\n"
+            "<b>Have a link?</b> Paste an OpenSea collection or drop URL, or "
+            "<code>/info &lt;url&gt;</code>.\n\n"
+            "<b>Arc</b> is on the roadmap for OpenSea day-one support. It is not "
+            "a live signer network in this build.\n\n"
+            "<i>Live sends need ENABLE_LIVE_MINTS=true plus a confirmation tap. "
+            "The same engine runs in the terminal: python cli.py</i>"
         )
 
 

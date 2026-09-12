@@ -21,9 +21,14 @@ class SecureDnsTests(unittest.TestCase):
         probe.assert_not_called()
 
     def test_install_routes_getaddrinfo_through_doh(self):
-        resolver._installed = False
         original = socket.getaddrinfo
+        previous_flag = resolver._installed
+        previous_orig = resolver._orig_getaddrinfo
         try:
+            if previous_orig is not None:
+                socket.getaddrinfo = previous_orig
+            resolver._installed = False
+            resolver._orig_getaddrinfo = None
             with patch.object(resolver, "_doh_a_record", return_value=("8.8.8.8", 60)):
                 resolver.install()
                 result = socket.getaddrinfo("eth-mainnet.g.alchemy.com", 443, socket.AF_INET, socket.SOCK_STREAM)
@@ -31,5 +36,5 @@ class SecureDnsTests(unittest.TestCase):
             self.assertEqual(result[0][4][0], "8.8.8.8")
         finally:
             socket.getaddrinfo = original
-            resolver._installed = False
-            resolver._orig_getaddrinfo = None
+            resolver._installed = previous_flag
+            resolver._orig_getaddrinfo = previous_orig

@@ -107,6 +107,8 @@ class FakeTelegramService:
             "daily_gas_cap": "0.05",
             "worker_alive": False,
             "stop_requested": False,
+            "schedule_count": 0,
+            "wallet_count": 1,
         }
 
     def start_daily(self):
@@ -311,6 +313,21 @@ class TelegramSafetyTests(unittest.TestCase):
         args, _kwargs = api.sent[-1]
         return args[1], args[2]
 
+    def test_home_keyboard_is_four_primary_actions(self):
+        bot = TelegramBot(FakeAPI(), FakeTelegramService(), 123)
+        labels = [
+            button["text"]
+            for row in bot.home_keyboard()["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(labels[0], "Scan")
+        self.assertIn("Paste OpenSea link", labels)
+        self.assertIn("Wallet", labels)
+        self.assertTrue(any(label.startswith("Armed") for label in labels))
+        self.assertIn("Settings", labels)
+        self.assertFalse(any("More" == label for label in labels))
+        self.assertFalse(any(label == "Schedule" for label in labels))
+
     def test_scan_opens_a_network_picker_and_all_scan_is_grouped(self):
         api = FakeAPI()
         service = FakeTelegramService()
@@ -361,9 +378,9 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertEqual(len(api.photos), 1)
 
         self.assertIn("9", text)
-        # Busiest network first, each carrying its real count.
-        self.assertTrue(any("Ethereum" in label and "7" in label for label in labels))
-        self.assertTrue(any("Base" in label and "2" in label for label in labels))
+        # Numbered 1:1 with the logo card. Busiest network first.
+        self.assertTrue(any(label.startswith("1") and "Ethereum" in label and "7" in label for label in labels))
+        self.assertTrue(any(label.startswith("2") and "Base" in label and "2" in label for label in labels))
         # Zora has nothing scheduled, so it sits behind the overflow button.
         self.assertNotIn("scan:zora", callbacks)
         self.assertIn("chains:all", callbacks)
@@ -816,7 +833,7 @@ class TelegramSafetyTests(unittest.TestCase):
         self.assertIn("<b>Public</b>", text)
         self.assertIn("Free · Public", text)
         self.assertFalse(any(button.get("callback_data") == "research:view:token" for button in buttons))
-        self.assertTrue(any(button.get("text") == "🌊 OpenSea drop page" for button in buttons))
+        self.assertTrue(any(button.get("text") == "OpenSea" for button in buttons))
         self.assertFalse(any(button.get("text") == "🌐 Project site" for button in buttons))
 
     def test_project_screen_labels_collection_and_drop_page(self):
@@ -830,9 +847,9 @@ class TelegramSafetyTests(unittest.TestCase):
         bot.show_project(123, project_token(service.last_candidates[0]))
         payload = api.sent[-1][0][1] if api.sent else api.edited[-1][0][1]
 
-        self.assertIn("<b>🎨 Project</b>", payload)
-        self.assertIn("Mint windows today", payload)
+        self.assertIn("window(s)", payload)
         self.assertIn("Mint method", payload)
+        self.assertIn("Mint now and Arm", payload)
         self.assertNotIn("mint option(s) today", payload)
 
     def test_public_drop_info_reads_live_supply_and_schedule(self):
@@ -877,8 +894,8 @@ class TelegramSafetyTests(unittest.TestCase):
             for button in row
             if "callback_data" in button
         ]
-        self.assertTrue(any(value.startswith("info:candidate:1:") for value in callbacks))
-        self.assertTrue(any(value.startswith("card:candidate:1:") for value in callbacks))
+        self.assertTrue(any(value.startswith("mint:1:") for value in callbacks))
+        self.assertTrue(any("schedule:candidate:1:" in value for value in callbacks))
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
 
     def test_mint_card_generates_a_telegram_ready_jpeg(self):

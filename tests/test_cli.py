@@ -252,10 +252,28 @@ class CliOperatorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Demo & Drop", text)
         self.assertIn("Base", text)
+        self.assertIn("FREE PUB", text)
+        self.assertIn("Access", text)
         self.assertEqual(service.last_scan["chain"], "base")
         code, listed, _ = run(service, ["list"])
         self.assertEqual(code, 0)
         self.assertIn("Demo & Drop", listed)
+
+    def test_scan_free_filter_hides_paid_windows(self):
+        service = FakeCliService()
+        paid = dict(CANDIDATE, slug="paid-drop", name="Paid Drop", is_free=False, price_wei=10**16, price_display="0.01 ETH")
+        service.last_candidates = [dict(CANDIDATE), paid]
+
+        def scan_now(chain_slug=None, force_refresh=False):
+            service.last_scan = {"chain": chain_slug, "refresh": force_refresh}
+            return [dict(CANDIDATE), paid], []
+
+        service.scan_now = scan_now
+        code, text, operator = run(service, ["scan", "base", "--free"])
+        self.assertEqual(code, 0)
+        self.assertIn("Demo & Drop", text)
+        self.assertNotIn("Paid Drop", text)
+        self.assertEqual(len(operator.last_shown), 1)
 
     def test_networks_hides_empty_chains_from_the_busy_table(self):
         code, text, _ = run(FakeCliService(), ["networks"])
@@ -361,6 +379,7 @@ class CliInteractiveTests(unittest.TestCase):
         text = cli.banner()
         self.assertIn("Takumi", text)
         self.assertIn("___", text)
+        self.assertIn("scan · paste a link", text)
         compact = cli.banner(compact=True)
         self.assertIn("OPENSEA MINT BOT", compact)
         self.assertIn("Takumi", compact)
@@ -433,7 +452,7 @@ class CliInteractiveTests(unittest.TestCase):
         self.assertIn("OPENSEA MINT BOT", text)
         self.assertIn("Scan for mints", text)
         self.assertIn("Demo & Drop", text)
-        self.assertIn("Schedule this window", text)
+        self.assertIn("Arm for opening", text)
         self.assertEqual(service.schedule_calls, [])
         self.assertIn("Live minting is disabled", text)
 

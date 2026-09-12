@@ -49,7 +49,7 @@ def check_config():
     if slug:
         add("OK", "Target collection", f"configured as {slug!r}")
     else:
-        add("INFO", "Target collection", "not configured; use Telegram /scan or set a drop in config.py")
+        add("INFO", "Target collection", "optional one-drop leftover; use python cli.py scan or paste a link")
 
     target_chain = config.chain_slug_for_id(config.TARGET_CHAIN_ID)
     if target_chain is None:

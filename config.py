@@ -483,6 +483,25 @@ def chain_label(chain_slug):
     return slug.replace("_", " ").replace("-", " ").title()
 
 
+def access_tag(candidate):
+    """Short access column used by the CLI table and Telegram lists."""
+    if not isinstance(candidate, dict):
+        return "—"
+    if candidate.get("is_sold_out") is True:
+        return "SOLD"
+    free = candidate.get("is_free") is True or candidate.get("price_wei") == 0
+    public = candidate.get("is_public") is True
+    if free and public:
+        return "FREE PUB"
+    label = str(candidate.get("access_label") or candidate.get("stage_label") or "").strip()
+    generic = label.lower() in {"", "free", "unknown", "public", "mint"}
+    if free:
+        return label if not generic else "FREE GATE"
+    if public:
+        return "PAID PUB"
+    return label if not generic else "GATED"
+
+
 CHAIN_ALIASES = {
     "eth": "ethereum",
     "ether": "ethereum",

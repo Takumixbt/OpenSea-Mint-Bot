@@ -328,8 +328,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # `python main.py` is the operator CLI. The older config.py fire path
-    # remains available when --confirm-live is the only kind of argument.
+    # python main.py is the operator CLI. The old one-drop fire path is still
+    # available only when --confirm-live is passed with no CLI verb.
     cli_verbs = {
         "help", "status", "settings", "cap", "networks", "scan", "list", "show",
         "info", "research", "wallet", "history", "mints", "mint", "schedule",
@@ -338,6 +338,11 @@ if __name__ == "__main__":
     if any(arg in cli_verbs for arg in sys.argv[1:]) or "--confirm-live" not in sys.argv:
         from cli import main as cli_main
         raise SystemExit(cli_main())
+    print(
+        "legacy --confirm-live still works, but python cli.py mint <url> --yes "
+        "is the supported path.",
+        flush=True,
+    )
     try:
         from resolver import install as install_secure_dns
         install_secure_dns()
