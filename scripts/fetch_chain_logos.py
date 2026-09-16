@@ -104,6 +104,11 @@ CHAIN_URLS = {
         "https://github.com/somnia-network.png?size=256",
         "https://icons.llamao.fi/icons/chains/rsz_somnia.jpg",
     ],
+    "arc": [
+        "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/arc/info/logo.png",
+        "https://github.com/circlefin.png?size=256",
+        "https://icons.llamao.fi/icons/chains/rsz_arc.jpg",
+    ],
     "b3": [
         "https://github.com/b3-fun.png?size=256",
         "https://github.com/b3dotfun.png?size=256",

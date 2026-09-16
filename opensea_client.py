@@ -23,6 +23,7 @@ OPEN_SEA_CHAIN_ALIASES = {
     "matic": "polygon",
     "arb": "arbitrum",
     "op": "optimism",
+    "arc": "arc",
 }
 
 
