@@ -22,6 +22,7 @@ Trust Wallet / the chain's GitHub org avatar / Llama icons, in that order.
 | `megaeth` | Llama chain icon |
 | `robinhood` | Robinhood GitHub org |
 | `somnia` | Llama chain icon |
+| `arc` | Trust Wallet (Circle Arc) |
 | `b3` | Llama chain icon |
 | `base` | Official Base mark (blue circle `#0052FF`) |
 | `ape_chain` | Llama chain icon |

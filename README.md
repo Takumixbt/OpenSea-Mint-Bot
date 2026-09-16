@@ -240,9 +240,14 @@ the wallet lacked gas, or the price cap was still `0`.
 
 ## Arc
 
-Arc (Circle's USDC-gas L1) is **not** a live signer network in this build.
-OpenSea has announced day-one support; official mainnet chain ID / RPC / slug
-are still moving. See [ROADMAP.md](ROADMAP.md).
+[Arc](https://www.arc.network/) (Circle's USDC-gas L1) is a live signer network in
+this build. OpenSea slug: `arc` (chain ID **5042**, RPC
+`https://rpc.mainnet.arc.io`, explorer `https://explorer.arc.io`).
+
+Gas, wallet balances, fee envelopes, and safety caps on Arc are labeled **USDC**,
+not ETH. Fund the mint wallet with native USDC before arming live mints there.
+Scan and mint with `scan arc`, `wallet arc`, or include `arc` in
+`MONITORED_CHAINS`.
 
 ## Tests
 

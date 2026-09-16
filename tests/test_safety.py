@@ -1307,7 +1307,7 @@ class DiscoverySafetyTests(unittest.TestCase):
         with patch.dict(os.environ, {"MONITORED_CHAINS": ""}, clear=False):
             chains = config.monitored_chain_slugs()
         self.assertEqual(chains, list(config.CHAIN_CONFIGS))
-        self.assertEqual(len(chains), 27)
+        self.assertEqual(len(chains), 28)
         self.assertTrue({"avalanche", "shape", "somnia", "b3", "gunzilla"} <= set(chains))
 
     def test_stage_uuid_survives_calendar_detail_reordering(self):

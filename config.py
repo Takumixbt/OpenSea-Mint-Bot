@@ -129,9 +129,9 @@ FIRE_TIMEOUT_SECONDS = 30
 # GAS (how much you are willing to pay the network to include your transaction)
 # ---------------------------------------------------------------------------
 # For a FREE mint you still pay a small network fee ("gas") in the chain's coin
-# (ETH on Ethereum/Base/etc). To win a race you usually bid a bit above the
-# going rate. These knobs control that bid. They are deliberately capped so a
-# weird network spike can't drain your wallet.
+# (ETH on Ethereum/Base, USDC on Arc, POL on Polygon, etc.). To win a race you
+# usually bid a bit above the going rate. These knobs control that bid. They are
+# deliberately capped so a weird network spike can't drain your wallet.
 
 # We take the current going tip and multiply it by this to bid a little higher
 # and jump the queue. 1.0 = match everyone else. 1.5 = bid 50% over. 2.0 = double.
@@ -154,13 +154,14 @@ GAS_LIMIT_FALLBACK = 250000
 
 # An ABSOLUTE ceiling on the gas amount, whatever the estimate says. Your
 # worst-case total network fee is roughly GAS_LIMIT_MAX x MAX_FEE_CAP_GWEI
-# (with the defaults: 500000 gas x 50 gwei = 0.025 ETH). If an estimate ever
-# comes back above this, the bot clamps it rather than authorize a surprise.
+# (with the defaults: 500000 gas x 50 gwei = 0.025 of the chain's native coin,
+# e.g. 0.025 ETH on Base or 0.025 USDC on Arc). If an estimate ever comes back
+# above this, the bot clamps it rather than authorize a surprise.
 GAS_LIMIT_MAX = 500000
 
 # Maximum amount of the chain's native coin the bot may send as the mint price.
 # Use a human-readable value here: "0" means free-only; "0.02" allows a paid
-# mint up to 0.02 ETH/MATIC/etc. Free mints (value 0) still pass automatically.
+# mint up to 0.02 ETH/USDC/POL/etc. Free mints (value 0) still pass automatically.
 # This is deliberately a cap, never an instruction to spend that amount.
 MAX_MINT_PRICE_NATIVE = os.getenv("MAX_MINT_PRICE_NATIVE", "0").strip() or "0"
 
@@ -354,6 +355,13 @@ CHAIN_CONFIGS = {
     "megaeth": {"chain_id": 4326, "rpc_subdomain": "megaeth-mainnet", "native": "ETH", "explorer": "https://mega.etherscan.io"},
     "robinhood": {"chain_id": 4663, "rpc_subdomain": "robinhood-mainnet", "native": "ETH", "explorer": "https://robinhoodchain.blockscout.com"},
     "somnia": {"chain_id": 5031, "rpc_url": "https://api.infra.mainnet.somnia.network", "native": "SOMI", "explorer": "https://explorer.somnia.network"},
+    "arc": {
+        "chain_id": 5042,
+        "rpc_subdomain": "arc-mainnet",
+        "rpc_url": "https://rpc.mainnet.arc.io",
+        "native": "USDC",
+        "explorer": "https://explorer.arc.io",
+    },
     "b3": {"chain_id": 8333, "rpc_url": "https://mainnet-rpc.b3.fun", "native": "ETH", "explorer": "https://explorer.b3.fun"},
     "base": {
         "chain_id": 8453,
@@ -441,6 +449,7 @@ CHAIN_ICONS = {
     "megaeth": "\u26a1",
     "robinhood": "\U0001fab6",
     "somnia": "\U0001f31b",
+    "arc": "\U0001f4b2",
     "b3": "\U0001f3ae",
     "base": "\U0001f535",
     "ape_chain": "\U0001f9a7",
@@ -464,6 +473,7 @@ CHAIN_DISPLAY_NAMES = {
     "bera_chain": "Berachain",
     "animechain": "AnimeChain",
     "stablechain": "Stable",
+    "arc": "Arc",
     "b3": "B3",
     "sei": "Sei",
 }
@@ -532,6 +542,8 @@ CHAIN_ALIASES = {
     "megaeth": "megaeth",
     "stable": "stablechain",
     "stablechain": "stablechain",
+    "arc": "arc",
+    "arc_chain": "arc",
     "gun": "gunzilla",
     "gunzilla": "gunzilla",
     "uni": "unichain",
@@ -664,6 +676,20 @@ def monitored_chain_slugs():
 def chain_config(chain_slug):
     """Return EVM chain settings or None for an unsupported OpenSea slug."""
     return CHAIN_CONFIGS.get((chain_slug or "").strip().lower())
+
+
+USDC_NATIVE_CHAIN_SLUGS = frozenset({"arc"})
+
+
+def chain_native_symbol(chain_slug):
+    """Return the human symbol for gas, mint value, and caps on a chain."""
+    settings = chain_config(chain_slug) or {}
+    return str(settings.get("native") or "native coin").strip() or "native coin"
+
+
+def is_usdc_native_chain(chain_slug):
+    """True when gas and safety caps are denominated in USDC, not ETH."""
+    return chain_native_symbol(chain_slug) == "USDC"
 
 
 def _http_rpc_urls(settings):

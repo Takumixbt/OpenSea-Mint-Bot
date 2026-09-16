@@ -1752,7 +1752,7 @@ class TelegramBot:
             chat_id,
             "<b>💰 Maximum mint price</b>\n\n"
             "Send the maximum native coin the bot may spend as mint value in one transaction.\n\n"
-            "Examples: <code>0</code> for free-only, <code>0.02</code> for up to 0.02 ETH/POL/AVAX. "
+            "Examples: <code>0</code> for free-only, <code>0.02</code> for up to 0.02 ETH/POL/USDC. "
             "This does not include gas.",
             self.markup([[self.button("↩️ Cancel", "settings")]]),
             message_id,
